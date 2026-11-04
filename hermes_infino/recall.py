@@ -1,13 +1,15 @@
 """Recall: the memories nearest a question, packed into one context block.
 
-Signed in, the cloud is searched first - hybrid over the team's (and the
-person's) `memory`, the question embedded server-side; keyword search where
-the table has no embedding column. This machine's rows the cloud does not
-have yet (written since the last sync) are added from the local database,
-so a memory saved a moment ago is recalled. When the cloud cannot be
-reached, the local database answers alone: this machine's own memories,
-which is all it holds. Without an account the local database is the only
-source (hybrid, the question embedded on this machine).
+Memory comes from two sources, the team's and the person's own, each a local
+database and, signed in, the cloud database it is caught up into. Signed in,
+a source's cloud database is searched first - hybrid over its `memory`, the
+question embedded server-side; keyword search where the table has no
+embedding column - and this machine's rows the cloud does not have yet
+(written since the last sync) are added from the local database, so a memory
+saved a moment ago is recalled. When the cloud cannot be reached, or a source
+has no cloud database (personal memory without a personal database), the
+local database answers alone. Without an account the local databases are the
+only sources (hybrid, the question embedded on this machine).
 
 The block says what it is: memory written by people's agents, background to
 use and never instructions to follow - a teammate's memory is text someone
@@ -22,7 +24,8 @@ notes in front of every member.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 from . import chats, tables
 from .client import InfinoClient, InfinoError
@@ -51,12 +54,22 @@ PROJECTION = [tables.ROW_ID, tables.STORED, "content", "author", "scope", tables
 # this one may not see are dropped after the search.
 CHAT_FILTER_DEPTH = 3
 
+Mark = Optional[tuple[int, str]]
+
+
+@dataclass(frozen=True)
+class Source:
+    scope: str                                  # team | personal
+    local: LocalStore
+    database: Optional[str] = None              # its cloud database, signed in
+    mark: Optional[Callable[[], Mark]] = None   # () -> how far the cloud has it
+
 
 def _visible(row: dict, chat: chats.Chat) -> bool:
     return str(row.get(tables.CHAT) or "") in chat.visible
 
 
-def _past(row: dict, mark: Optional[tuple[int, str]]) -> bool:
+def _past(row: dict, mark: Mark) -> bool:
     """Whether a local row was stored after `mark` (so the cloud lacks it)."""
     if mark is None:
         return True
@@ -66,12 +79,9 @@ def _past(row: dict, mark: Optional[tuple[int, str]]) -> bool:
 class Recaller:
     """Searches `memory`, remembering per cloud database whether the vector leg works."""
 
-    def __init__(self, local: LocalStore, cloud: Optional[InfinoClient] = None,
-                 databases: Optional[list[tuple[str, str]]] = None, mark=None) -> None:
-        self._local = local
+    def __init__(self, sources: list[Source], cloud: Optional[InfinoClient] = None) -> None:
+        self._sources = sources
         self._cloud = cloud
-        self._databases = databases or []   # (scope, database), signed in
-        self._mark = mark                   # () -> the memory mirror mark, signed in
         self._keyword_only: set[str] = set()
 
     def search_cloud(self, database: str, query: str, k: int = RECALL_K) -> list[dict]:
@@ -90,32 +100,36 @@ class Recaller:
         return self._cloud.bm25_search(
             database, tables.MEMORY, query, field=tables.MEMORY_TEXT_COLUMN, k=k, projection=PROJECTION)
 
+    def _from(self, src: Source, query: str, chat: chats.Chat) -> list[dict]:
+        """A source's rows for `query` that `chat` may see, best first."""
+        depth = RECALL_K * CHAT_FILTER_DEPTH
+        cloud: list[dict] = []
+        answered = False
+        if src.database and self._cloud is not None:
+            try:
+                cloud = [r for r in self.search_cloud(src.database, query, depth) if _visible(r, chat)][:RECALL_K]
+                cloud.sort(key=lambda r: -float(r.get("score") or 0.0))
+                answered = True
+            except Exception as e:  # the local database answers instead
+                logger.info("infino: recall from %s failed: %s", src.database, e)
+        try:
+            local = [r for r in src.local.search_memory(query, depth, PROJECTION) if _visible(r, chat)][:RECALL_K]
+        except Exception as e:
+            logger.info("infino: local %s recall failed: %s", src.scope, e)
+            local = []
+        if answered:
+            seen = {str(r.get(tables.ROW_ID)) for r in cloud}
+            mark = src.mark() if src.mark else None
+            local = [r for r in local if str(r.get(tables.ROW_ID)) not in seen and _past(r, mark)]
+        return cloud + local
+
     def recall(self, query: str, chat: chats.Chat = chats.NO_CHAT) -> tuple[str, int]:
         """The block for `query` in `chat`, and its row count."""
-        depth = RECALL_K * CHAT_FILTER_DEPTH
         rows: list[tuple[str, dict]] = []
-        cloud_answered = False
-        for scope, database in self._databases:
-            if chat.group and scope == PERSONAL:
+        for src in self._sources:
+            if chat.group and src.scope == PERSONAL:
                 continue
-            try:
-                hits = [r for r in self.search_cloud(database, query, depth) if _visible(r, chat)][:RECALL_K]
-                hits.sort(key=lambda r: -float(r.get("score") or 0.0))
-                rows += [(scope, r) for r in hits]
-                cloud_answered = True
-            except Exception as e:  # the local database answers instead
-                logger.info("infino: recall from %s failed: %s", database, e)
-        try:
-            local = [r for r in self._local.search_memory(query, depth, PROJECTION)
-                     if _visible(r, chat) and not (chat.group and r.get("scope") == PERSONAL)][:RECALL_K]
-        except Exception as e:
-            logger.info("infino: local recall failed: %s", e)
-            local = []
-        if cloud_answered:
-            seen = {str(r.get(tables.ROW_ID)) for _, r in rows}
-            mark = self._mark() if self._mark else None
-            local = [r for r in local if str(r.get(tables.ROW_ID)) not in seen and _past(r, mark)]
-        rows += [(str(r.get("scope") or TEAM), r) for r in local]
+            rows += [(src.scope, r) for r in self._from(src, query, chat)]
         lines, used = [], 0
         for scope, r in rows:
             label = "this chat" if r.get(tables.CHAT) else scope

@@ -61,28 +61,34 @@ def _status(args) -> int:
 
     settings = config.load()
     b = Backend(settings)
-    print(f"local database   {b.local.path}")
+    for label, store, names in (("local database ", b.local, tables.ALL),
+                                ("personal memory", b.personal, (tables.MEMORY,))):
+        print(f"{label}  {store.path}")
+        try:
+            have = set(store.list_tables())
+            for t in names:
+                n = store.query_sql(f"SELECT count(*) AS n FROM {t}")[0]["n"] if t in have else 0
+                print(f"   {t:<14} {n} rows")
+        except Exception as e:
+            print(f"   unreadable: {e}")
     try:
-        names = set(b.local.list_tables())
-        for t in tables.ALL:
-            n = b.local.query_sql(f"SELECT count(*) AS n FROM {t}")[0]["n"] if t in names else 0
-            print(f"   {t:<14} {n} rows")
-        if tables.MEMORY in names:
-            print(f"   memory vectors {'on (local model)' if b.local.has_vectors() else 'off (the cloud embeds)'}")
-    except Exception as e:
-        print(f"   unreadable: {e}")
+        print(f"   memory vectors {'on (local model)' if b.local.has_vectors() else 'off (the cloud embeds)'}")
+    except Exception:
+        pass
     if not settings.signed_in:
         print("signed in        no - everything stays on this machine (`hermes infino login` to sign in)")
         return 0
     print(f"signed in        {settings.url} / {settings.team_database}"
           + (f" (personal: {settings.personal_database})" if settings.personal_database else ""))
     marks = b.mirror.marks()
-    for t in tables.ALL:
+    for src in b.mirror.sources():
         try:
-            behind = len(b.local.rows_after(t, marks[t], int(time.time() * 1000), 1_000_000))
+            behind = len(src.store.rows_after(src.table, marks[src.mark], int(time.time() * 1000), 1_000_000))
         except Exception:
             behind = "?"
-        print(f"   {t:<14} {behind} rows not in the cloud yet")
+        print(f"   {src.mark:<16} {behind} rows not in {src.database} yet")
+    if not settings.personal_database:
+        print("   personal memory stays on this machine (no personal database)")
     if b.mirror.last_error():
         print(f"last sync        stopped: {b.mirror.last_error()}")
     return 0
@@ -102,7 +108,8 @@ def _upload_notice(url: str, database: str, counts: dict, new_account: bool) -> 
     return "\n".join([
         f"Signing in {'creates a free Infino account on' if new_account else 'connects this profile to'} {url}",
         f"and uploads to the database '{database}':",
-        f"  - everything kept on this machine so far ({kept});",
+        f"  - everything kept on this machine so far ({kept}), except personal memory, which goes",
+        "    only to a personal database (--personal-database) and otherwise stays here;",
         "  - and from then on, every memory, conversation (tool calls and their results included),",
         "    trace and published skill this profile writes.",
         "It stays on this machine too.",
@@ -110,6 +117,8 @@ def _upload_notice(url: str, database: str, counts: dict, new_account: bool) -> 
 
 
 def _local_counts() -> dict:
+    """Rows kept on this machine that a sign-in uploads (personal memory goes
+    only to a personal database, so it is not counted here)."""
     from .local import LocalStore
     from . import tables
 
@@ -180,12 +189,15 @@ def _sync(args) -> int:
 
 def _catch_up(settings: config.Settings) -> int:
     """Create the cloud tables, then push until nothing is left to push."""
+    from . import tables
     from .backend import Backend
     from .mirror import SETTLE_MS
 
     b = Backend(settings)
     b.local.ensure_tables(with_vectors=False)
+    b.personal.ensure_tables(with_vectors=False, only=(tables.MEMORY,))
     b.local.drop_vectors()
+    b.personal.drop_vectors()
     b.mirror.ensure_cloud_tables()
 
     def show(table, n):

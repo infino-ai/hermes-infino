@@ -28,7 +28,11 @@ In a group chat on the gateway, memory is the chat's, as Hermes keeps it with ch
 
 ## Where it keeps them
 
-**Without an account**, everything goes to the local database at `$HERMES_HOME/infino/db`, through the Infino engine's Python binding. Each memory is embedded on this machine with all-MiniLM-L6-v2 (384 dimensions, full precision), and recall fuses keyword and vector search. Nothing leaves the machine.
+**Personal memory is kept apart.** It lives in its own database, which the Infino tools never read, so no chat and no tool call can reach it: locally `$HERMES_HOME/infino/personal`, and signed in, the personal database (`--personal-database`). Without a personal database it stays on this machine; it never goes to the team's database.
+
+**The team's tables are shared.** Everything in the team database - conversations and every group chat's notes included - is readable by the team's agents through the Infino tools. Recall before a turn keeps each group chat to its own notes and the team's; reads by one chat of another chat's rows would need per-chat permissions, which this version does not have.
+
+**Without an account**, everything goes to the local databases under `$HERMES_HOME/infino/`, through the Infino engine's Python binding. Each memory is embedded on this machine with all-MiniLM-L6-v2 (384 dimensions, full precision), and recall fuses keyword and vector search. Nothing leaves the machine.
 
 **Signed in**, every row is still written locally first, then pushed to the cloud by a sync that runs a moment after each write and at the end of each session:
 - The sync pushes rows in the order they were stored and resumes where it stopped, so an outage or a refused push loses nothing and duplicates nothing. `hermes infino status` shows how far behind the cloud is and why a sync stopped.

@@ -1,5 +1,11 @@
-"""Where a profile's rows go and come from: the local database always, and the
-cloud database once signed in, caught up by the mirror.
+"""Where a profile's rows go and come from: the local databases always, and
+the cloud databases once signed in, caught up by the mirror.
+
+Two local databases: the team's tables (`infino/db`), which the Infino tools
+read, and the person's own memory (`infino/personal`), which only the plugin
+opens. A personal memory is never in a database a tool or a group chat can
+reach: locally it is in its own, and in the cloud in the personal database,
+or nowhere when the person has none.
 
 One backend per profile home, shared by the memory provider, the trace hooks
 and the skills loader. Writes land locally and return; when signed in they
@@ -17,8 +23,8 @@ from typing import Any, Optional
 
 from . import config, recall, tables
 from .client import InfinoClient
-from .local import LocalStore
-from .mirror import SETTLE_MS, Mirror
+from .local import PERSONAL_DB_DIR, LocalStore
+from .mirror import PERSONAL_MEMORY, SETTLE_MS, Mirror
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +38,10 @@ FLUSH_TIMEOUT_S = 30.0
 class Backend:
     def __init__(self, settings: config.Settings):
         self.settings = settings
-        self.local = LocalStore.under(config.state_dir(settings.home))
-        self.mirror = Mirror(settings, self.local) if settings.signed_in else None
+        state = config.state_dir(settings.home)
+        self.local = LocalStore.under(state)
+        self.personal = LocalStore.under(state, PERSONAL_DB_DIR)
+        self.mirror = Mirror(settings, self.local, self.personal) if settings.signed_in else None
         self._timer: Optional[threading.Timer] = None
         self._timer_lock = threading.Lock()
         self._last_write = 0.0
@@ -46,14 +54,32 @@ class Backend:
         """Create what is missing: the local tables (with local vectors only
         in local mode) and, signed in, the cloud tables; then catch up."""
         self.local.ensure_tables(with_vectors=not self.signed_in)
+        self.personal.ensure_tables(with_vectors=not self.signed_in, only=(tables.MEMORY,))
+        self._move_personal_memory()
         if self.mirror is not None:
             self.local.drop_vectors()
+            self.personal.drop_vectors()
             self.mirror.ensure_cloud_tables()
             self.schedule_sync(delay_s=0)
+
+    def _move_personal_memory(self) -> None:
+        """Personal memories an older version kept in the team's local
+        database (where the tools read) move to the personal one."""
+        found = self.local.query_sql(f"SELECT * FROM {tables.MEMORY} WHERE scope = 'personal'")
+        if not found:
+            return
+        keep = {f["name"] for f in tables.MEMORY_SCHEMA if f["type"] != "embedding"}
+        self.personal.append(tables.MEMORY, [{k: v for k, v in r.items() if k in keep} for r in found])
+        self.local.delete(tables.MEMORY, "scope = 'personal'")
+        logger.info("infino: moved %d personal memories out of the team's local database", len(found))
 
     # -- writes --------------------------------------------------------------
 
     def append(self, table: str, rows: list[dict[str, Any]]) -> None:
+        if table == tables.MEMORY:
+            personal = [r for r in rows if r.get("scope") == recall.PERSONAL]
+            rows = [r for r in rows if r.get("scope") != recall.PERSONAL]
+            self.personal.append(tables.MEMORY, personal)
         self.local.append(table, rows)
         self._last_write = time.monotonic()
         self.schedule_sync()
@@ -65,17 +91,18 @@ class Backend:
         predicate = f"content = {tables.sql_string(content)} AND {tables.chat_predicate(visible)}"
         if scope:
             predicate += f" AND scope = {tables.sql_string(scope)}"
-        deleted = self.local.delete(tables.MEMORY, predicate, (tables.ROW_ID, "scope"))
-        if self.mirror is not None and deleted:
-            # Each row is deleted from the database its scope put it in.
-            by_db: dict[str, list[str]] = {}
-            for r in deleted:
-                by_db.setdefault(self.mirror.database_for(tables.MEMORY, str(r.get("scope") or "")), []).append(
-                    str(r[tables.ROW_ID]))
-            for database, ids in by_db.items():
-                self.mirror.forget(tables.MEMORY, database, ids)
+        team = self.local.delete(tables.MEMORY, predicate) if scope != recall.PERSONAL else []
+        # A group chat never reaches the person's own memory (`visible` holds a chat).
+        reaches_personal = scope in (None, recall.PERSONAL) and visible == ("",)
+        personal = self.personal.delete(tables.MEMORY, predicate) if reaches_personal else []
+        if self.mirror is not None:
+            # Each row is deleted from the cloud database its source went to.
+            s = self.settings
+            self.mirror.forget(tables.MEMORY, s.team_database, [str(r[tables.ROW_ID]) for r in team])
+            if s.personal_database:
+                self.mirror.forget(tables.MEMORY, s.personal_database, [str(r[tables.ROW_ID]) for r in personal])
             self.schedule_sync()
-        return len(deleted)
+        return len(team) + len(personal)
 
     # -- sync ----------------------------------------------------------------
 
@@ -128,14 +155,18 @@ class Backend:
 
     def recaller(self) -> recall.Recaller:
         if self.mirror is None:
-            return recall.Recaller(self.local)
+            return recall.Recaller([recall.Source(recall.TEAM, self.local), recall.Source(recall.PERSONAL, self.personal)])
         s = self.settings
-        databases = [(recall.TEAM, s.team_database)]
-        if s.personal_database:
-            databases.append((recall.PERSONAL, s.personal_database))
+        mirror = self.mirror
+        sources = [recall.Source(recall.TEAM, self.local, s.team_database,
+                                 lambda: mirror.unsynced_after(tables.MEMORY))]
+        # Without a personal database, personal memory stays on this machine:
+        # its local copy is all there is, so it is searched whole.
+        sources.append(recall.Source(recall.PERSONAL, self.personal, s.personal_database or None,
+                                     (lambda: mirror.unsynced_after(PERSONAL_MEMORY)) if s.personal_database else None))
         # Recall is waited on by the turn: a short timeout and no retries.
         cloud = InfinoClient(s.api_key, s.url, timeout=recall.RECALL_TIMEOUT_S, retries=0)
-        return recall.Recaller(self.local, cloud, databases, mark=lambda: self.mirror.unsynced_after(tables.MEMORY))
+        return recall.Recaller(sources, cloud)
 
     def query(self, sql: str, timeout_s: Optional[float] = None) -> list[dict]:
         """SQL over the team's tables: the cloud's when signed in, else local."""

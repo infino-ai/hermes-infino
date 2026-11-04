@@ -1,9 +1,12 @@
 """Catching the cloud up with the local database, once signed in.
 
-Every row is written to the local database first (`local.py`). A sync pushes
-to the cloud the rows of each table past a mark - the (stored_ms, row_id) of
+Every row is written to a local database first (`local.py`). A sync pushes
+to the cloud the rows of each source past a mark - the (stored_ms, row_id) of
 the last row the cloud accepted - in that order, and moves the mark only
-after each batch is accepted. The same sync is the push of everything kept
+after each batch is accepted. A source is one local table and the one cloud
+database it goes to: each of the team's tables to the team's database, and
+the person's own memory to their personal database - or nowhere, when they
+have none: personal memory never goes to the team's database. The same sync is the push of everything kept
 before sign-up, live mirroring after it, and catching up after an outage, and
 it misses no row whichever process wrote it: a Hermes process that started
 before the sign-up keeps writing the local database, and the next sync from
@@ -30,7 +33,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Iterator, Optional
 
 from . import config, tables
@@ -49,39 +52,40 @@ SETTLE_MS = 2_000
 PUSH_BATCH = 200
 # Row ids per cloud delete.
 FORGET_BATCH = 100
+# The mark of the personal memory source (the team's are their tables' names).
+PERSONAL_MEMORY = "personal_memory"
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _runs(rows: list[dict], key) -> list[tuple[str, list[dict]]]:
-    """`rows` split into consecutive runs with the same key, in order."""
-    out: list[tuple[str, list[dict]]] = []
-    for r in rows:
-        k = key(r)
-        if out and out[-1][0] == k:
-            out[-1][1].append(r)
-        else:
-            out.append((k, [r]))
-    return out
+@dataclass(frozen=True)
+class Source:
+    mark: str            # the key its progress is kept under
+    store: LocalStore
+    table: str
+    database: str        # the cloud database it goes to
 
 
 class Mirror:
     """The cloud side of one signed-in profile."""
 
-    def __init__(self, settings: config.Settings, local: LocalStore, client: Optional[InfinoClient] = None):
+    def __init__(self, settings: config.Settings, local: LocalStore, personal: LocalStore,
+                 client: Optional[InfinoClient] = None):
         self.settings = settings
         self.local = local
+        self.personal = personal
         self.client = client or InfinoClient(settings.api_key, settings.url)
         self.dir = config.state_dir(settings.home)
 
     # -- where rows go -------------------------------------------------------
 
-    def database_for(self, table: str, scope: str = "") -> str:
-        if table == tables.MEMORY and scope == "personal" and self.settings.personal_database:
-            return self.settings.personal_database
-        return self.settings.team_database
+    def sources(self) -> list[Source]:
+        out = [Source(t, self.local, t, self.settings.team_database) for t in tables.ALL]
+        if self.settings.personal_database:
+            out.append(Source(PERSONAL_MEMORY, self.personal, tables.MEMORY, self.settings.personal_database))
+        return out
 
     def ensure_cloud_tables(self) -> None:
         tables.ensure_all(self.client, self.settings.team_database)
@@ -99,7 +103,7 @@ class Mirror:
 
     def marks(self) -> dict[str, Optional[tuple[int, str]]]:
         raw = self._state().get("marks", {})
-        return {t: (tuple(raw[t]) if raw.get(t) else None) for t in tables.ALL}
+        return {k: (tuple(raw[k]) if raw.get(k) else None) for k in (*tables.ALL, PERSONAL_MEMORY)}
 
     def last_error(self) -> str:
         """Why the last sync stopped, or empty when it finished."""
@@ -130,7 +134,7 @@ class Mirror:
 
     def sync(self, wait: bool = False, progress=None) -> dict[str, int]:
         """Push every settled local row past the marks, then apply queued
-        forgets. Rows pushed per table; {} when another sync holds the lock.
+        forgets. Rows pushed per source; {} when another sync holds the lock.
         Raises on a cloud failure, with the marks left at the last batch
         the cloud accepted."""
         with self._lock(wait) as held:
@@ -140,23 +144,20 @@ class Mirror:
             until = _now_ms() - SETTLE_MS
             pushed = {}
             try:
-                for table in tables.ALL:
-                    pushed[table] = 0
+                for src in self.sources():
+                    pushed[src.mark] = 0
                     while True:
-                        rows = self.local.rows_after(table, marks[table], until, PUSH_BATCH)
+                        rows = src.store.rows_after(src.table, marks[src.mark], until, PUSH_BATCH)
                         if not rows:
                             break
-                        # Consecutive rows bound for one database go in one append,
-                        # and the mark moves after each, so a refused append never
-                        # sends the rows before it again.
-                        for database, run in _runs(rows, lambda r: self.database_for(
-                                table, str(r.get("scope") or ""))):
-                            self.client.append(database, table, run)
-                            marks[table] = (int(run[-1][tables.STORED]), str(run[-1][tables.ROW_ID]))
-                            self._save_marks(marks)
-                            pushed[table] += len(run)
+                        # The mark moves after each accepted batch, so a refused
+                        # append never sends the rows before it again.
+                        self.client.append(src.database, src.table, rows)
+                        marks[src.mark] = (int(rows[-1][tables.STORED]), str(rows[-1][tables.ROW_ID]))
+                        self._save_marks(marks)
+                        pushed[src.mark] += len(rows)
                         if progress:
-                            progress(table, pushed[table])
+                            progress(src.mark, pushed[src.mark])
                 self._apply_forgets()
             except Exception as e:
                 # The rows stay local and the mark where the cloud stopped
@@ -166,9 +167,9 @@ class Mirror:
             self._save_marks(marks)
             return pushed
 
-    def unsynced_after(self, table: str) -> Optional[tuple[int, str]]:
-        """The mark local rows must be past to be missing from the cloud."""
-        return self.marks()[table]
+    def unsynced_after(self, mark: str) -> Optional[tuple[int, str]]:
+        """The mark a source's local rows must be past to be missing from the cloud."""
+        return self.marks()[mark]
 
     # -- forgets -------------------------------------------------------------
 

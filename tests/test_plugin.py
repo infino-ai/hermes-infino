@@ -556,6 +556,45 @@ def test_a_local_table_from_an_older_version_gains_the_new_column(home, tmp_path
     assert [r[tables.CHAT] for r in store.query_sql("SELECT chat FROM memory")] == ["telegram:-100"]
 
 
+# -- personal memory ----------------------------------------------------------
+
+def personal_rows(tmp_path) -> list[dict]:
+    return LocalStore.under(config.state_dir(tmp_path), "personal").query_sql("SELECT * FROM memory")
+
+
+def test_personal_memory_is_never_in_the_database_the_tools_read(home, tmp_path, monkeypatch):
+    mgr, provider = make_manager(tmp_path, platform="telegram")
+    in_session(monkeypatch, DM)
+    mgr.handle_tool_call("infino_remember", {"content": "my staging credentials expire Friday", "scope": "personal"})
+    provider._drain()
+    assert local_rows(tmp_path, tables.MEMORY) == []  # the tool server's database
+    assert [r["content"] for r in personal_rows(tmp_path)] == ["my staging credentials expire Friday"]
+    assert "credentials" in provider.prefetch("staging credentials")
+    in_session(monkeypatch, GROUP)
+    assert "credentials" not in provider.prefetch("staging credentials")
+
+
+def test_without_a_personal_database_personal_memory_stays_on_this_machine(env, platform, tmp_path):
+    mgr, provider = make_manager(tmp_path)
+    mgr.handle_tool_call("infino_remember", {"content": "my staging credentials expire Friday", "scope": "personal"})
+    mgr.handle_tool_call("infino_remember", {"content": "the deploy freeze starts December 20", "scope": "team"})
+    provider.on_session_end([])
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["the deploy freeze starts December 20"]
+    assert "credentials" in provider.prefetch("staging credentials")
+    out = json.loads(mgr.handle_tool_call("infino_forget", {"content": "my staging credentials expire Friday"}))
+    assert out["matched"] == 1 and personal_rows(tmp_path) == []
+
+
+def test_personal_memories_an_older_version_kept_with_the_teams_move_out(home, tmp_path):
+    old = local(tmp_path)
+    old.ensure_tables(with_vectors=False)
+    old.append(tables.MEMORY, [{"content": "my staging credentials expire Friday", "scope": "personal"},
+                               {"content": "the deploy freeze starts December 20", "scope": "team"}])
+    make_manager(tmp_path)
+    assert [r["content"] for r in local_rows(tmp_path, tables.MEMORY)] == ["the deploy freeze starts December 20"]
+    assert [r["content"] for r in personal_rows(tmp_path)] == ["my staging credentials expire Friday"]
+
+
 # -- local mode ---------------------------------------------------------------
 
 def test_local_mode_keeps_everything_on_this_machine(home, platform, tmp_path):

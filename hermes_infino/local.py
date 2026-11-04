@@ -39,8 +39,11 @@ from . import embed, tables
 
 logger = logging.getLogger(__name__)
 
-# The local folder under the profile's state directory.
+# The local databases under the profile's state directory: the team's tables,
+# which the Infino tools read, and the person's own memory, which nothing but
+# the plugin opens - so no chat, and no tool call, can reach it.
 DB_DIR = "db"
+PERSONAL_DB_DIR = "personal"
 # Times a write is reissued when another process won the commit race.
 CONFLICT_RETRIES = 5
 # Seconds before the first reissue; doubled each time.
@@ -93,19 +96,19 @@ class LocalStore:
         self.path = Path(path)
 
     @classmethod
-    def under(cls, state_dir: Path) -> "LocalStore":
-        return cls(Path(state_dir) / DB_DIR)
+    def under(cls, state_dir: Path, folder: str = DB_DIR) -> "LocalStore":
+        return cls(Path(state_dir) / folder)
 
     def _connect(self):
         self.path.mkdir(parents=True, exist_ok=True)
         return infino.connect(str(self.path))
 
-    def ensure_tables(self, with_vectors: bool) -> None:
-        """Create the tables that are missing, and `memory_vectors` when
-        `with_vectors` (local mode)."""
+    def ensure_tables(self, with_vectors: bool, only: tuple[str, ...] = tables.ALL) -> None:
+        """Create the tables of `only` that are missing, and `memory_vectors`
+        when `with_vectors` (local mode)."""
         db = self._connect()
         existing = set(db.list_tables())
-        for table in tables.ALL + ((VECTORS,) if with_vectors else ()):
+        for table in only + ((VECTORS,) if with_vectors else ()):
             if table in existing:
                 self._add_missing_columns(db, table)
                 continue
