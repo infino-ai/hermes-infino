@@ -79,7 +79,8 @@ def _status(args) -> int:
         print("signed in        no - everything stays on this machine (`hermes infino login` to sign in)")
         return 0
     print(f"signed in        {settings.url} / {settings.team_database}"
-          + (f" (personal: {settings.personal_database})" if settings.personal_database else ""))
+          + (f" (personal: {settings.personal_database})" if settings.personal_database else "")
+          + f", from the {settings.source}")
     marks = b.mirror.marks()
     for src in b.mirror.sources():
         try:

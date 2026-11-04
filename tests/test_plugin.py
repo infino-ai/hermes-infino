@@ -4,6 +4,7 @@ the local database, and a fake platform for the cloud."""
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import io
 import json
 import math
@@ -11,13 +12,19 @@ import os
 import re
 import stat
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
+import hermes_cli
 import infino
 import pyarrow as pa
 import pytest
 
 from agent.memory_manager import MemoryManager
+from hermes_cli.config import cfg_get, load_config
+from plugins.config_backends import remote as remote_config
+from plugins.config_backends.remote import backend as remote_backend, credentials as remote_credentials
+from plugins.config_backends.remote.values import secret_literal_path
 
 from hermes_infino import backend, chats, cli, config, embed, instructions, mirror, recall, skills, tables, traces
 from hermes_infino.client import InfinoClient
@@ -28,6 +35,8 @@ from .fake_platform import FakePlatform
 
 TEAM_DB = "team-test"
 PERSONAL_DB = "person-test"
+# Hermes's own stand-in for the Remote Config service, which its tests ship.
+REMOTE_CONFIG_STUB = Path(hermes_cli.__file__).resolve().parent.parent / "tests" / "plugins" / "config_backends" / "stub_plane.py"
 # Seconds a test waits for a background write to land.
 WRITE_WAIT_S = 5.0
 # How long a scheduled sync waits in these tests (the settle window is off).
@@ -690,3 +699,80 @@ def test_login_creates_an_account_and_stores_the_key_privately(home, platform, t
     mode = stat.S_IMODE(os.stat(config.state_dir(tmp_path) / config.CREDENTIALS_FILE).st_mode)
     assert mode == config.CREDENTIALS_MODE
     assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["Kept before the account existed"]
+
+
+# -- settings from config (config.yaml or Remote Config) -----------------------
+
+def tools_block(platform, team=TEAM_DB) -> dict:
+    """The Infino tools' entry as a fleet configures it: the key as a reference."""
+    return {"command": "python", "args": ["mcp_launch.py"],
+            "env": {"INFINO_TEAM_DATABASE": team, "INFINO_URL": platform.url, "INFINO_API_KEY": "${INFINO_API_KEY}"}}
+
+
+def write_config(home_dir, doc: dict) -> None:
+    (home_dir / "config.yaml").write_text(json.dumps(doc))  # JSON is YAML
+
+
+def test_settings_come_from_the_tools_config_block(home, platform, tmp_path):
+    write_config(tmp_path, {"mcp_servers": {"infino": tools_block(platform)}})
+    home.setenv("INFINO_API_KEY", "test-key")
+    home.setenv("INFINO_TEAM_DATABASE", "a-different-team")  # the block is the tools' env: it wins
+    settings = config.load(tmp_path)
+    assert settings.signed_in and settings.source == "config"
+    assert (settings.api_key, settings.team_database) == ("test-key", TEAM_DB)
+    # The launcher is started with that block as its environment, so it does not read the config.
+    assert config.load(tmp_path, from_config=False).team_database == "a-different-team"
+    make_manager(tmp_path)
+    assert set(platform.databases[TEAM_DB]) == set(tables.ALL)
+
+
+def test_an_unset_key_reference_keeps_the_profile_local(home, platform, tmp_path):
+    write_config(tmp_path, {"mcp_servers": {"infino": tools_block(platform)}})
+    settings = config.load(tmp_path)  # INFINO_API_KEY is not set anywhere
+    assert settings.api_key == "" and not settings.signed_in
+    assert settings.team_database == TEAM_DB
+
+
+def test_another_profiles_config_is_not_read(home, platform, tmp_path):
+    other = tmp_path / "other"
+    other.mkdir()
+    write_config(other, {"mcp_servers": {"infino": tools_block(platform)}})
+    home.setenv("INFINO_API_KEY", "test-key")
+    assert config.load(other).team_database == ""  # Hermes has tmp_path loaded, not `other`
+
+
+@pytest.fixture
+def remote(home, tmp_path):
+    """Hermes on Remote Config, served by Hermes's own stand-in service."""
+    spec = importlib.util.spec_from_file_location("hermes_remote_config_stub", REMOTE_CONFIG_STUB)
+    stub = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(stub)
+    with stub.StubPlane() as plane:
+        for k, v in stub.remote_env(plane).items():
+            home.setenv(k, v)
+        home.setattr(remote_backend, "BOOT_RETRY_DELAYS", (0.0, 0.0))
+        remote_config._reset_for_tests()
+        remote_credentials._IDP_CACHE.clear()
+        plane.home = tmp_path
+        yield plane
+        remote_config._reset_for_tests()
+        remote_credentials._IDP_CACHE.clear()
+
+
+def test_remote_config_signs_the_plugin_in(remote, home, platform, tmp_path):
+    remote.upper = {"memory": {"provider": "infino"}, "mcp_servers": {"infino": tools_block(platform)}}
+    home.setenv("INFINO_API_KEY", "test-key")  # in the profile's .env, as Remote Config asks
+    key_path = ("mcp_servers", "infino", "env", "INFINO_API_KEY")
+    assert secret_literal_path(key_path, "test-key") is not None  # the service refuses the key itself
+    assert secret_literal_path(key_path, "${INFINO_API_KEY}") is None  # and takes the reference
+    assert cfg_get(load_config(), "memory", "provider") == "infino"
+
+    settings = config.load(tmp_path)
+    assert settings.signed_in and settings.source == "config"
+    assert (settings.api_key, settings.team_database, settings.url) == ("test-key", TEAM_DB, platform.url)
+    mgr, provider = make_manager(tmp_path)
+    mgr.handle_tool_call("infino_remember", {"content": "Deploys freeze on December 20"})
+    provider.on_session_end([])
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["Deploys freeze on December 20"]
+    assert [r for r in remote.requests if r["method"] == "GET"]  # read from the service
+    assert not (tmp_path / "config.yaml").exists()  # never from a local file

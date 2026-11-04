@@ -1,7 +1,17 @@
-"""Settings, read from the active profile's environment (`.env`) through
-Hermes's secret scope, so each profile on a multiplexed gateway reads its own,
-and from the profile's sign-in (`credentials.json`, written by
-`hermes infino login`).
+"""Settings, read from three places, first found wins:
+
+1. the `env` block of the Infino tools' entry in the profile's config
+   (`mcp_servers.infino.env`), through Hermes's own config loader, so a fleet's
+   Remote Config sets them the way it sets everything else. The key is a
+   `${INFINO_API_KEY}` reference there (Remote Config refuses a secret
+   written out), which the loader resolves from the profile's environment;
+2. the active profile's environment (`.env`) through Hermes's secret scope, so
+   each profile on a multiplexed gateway reads its own;
+3. the profile's sign-in (`credentials.json`, written by `hermes infino login`).
+
+The config block comes first because it is also the tools' environment: Hermes
+starts the tools with that block, so the plugin and its tools always read the
+same team. A `${VAR}` reference that resolves to nothing counts as unset.
 
 Without a key and a team database the plugin runs on the local database
 alone. With both it is signed in: the cloud database is written too, and read
@@ -16,7 +26,8 @@ first.
                              gateway user); defaults to the profile name
 - INFINO_MCP_SERVER          the Infino client's name under `mcp_servers`
                              (default `infino`), whose instructions this plugin
-                             hands the model
+                             hands the model; read from the environment only,
+                             since it names the config block
 
 A variable that is set wins over the sign-in, so a deployment's `.env` is
 never overridden by a file on the machine.
@@ -25,7 +36,9 @@ never overridden by a file on the machine.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -37,6 +50,8 @@ try:  # Hermes's profile-scoped secret lookup; plain env outside Hermes.
 except ImportError:  # pragma: no cover - only outside a Hermes install
     _get_secret = None
 
+logger = logging.getLogger(__name__)
+
 KEY_ENV = "INFINO_API_KEY"
 TEAM_DB_ENV = "INFINO_TEAM_DATABASE"
 PERSONAL_DB_ENV = "INFINO_PERSONAL_DATABASE"
@@ -45,6 +60,8 @@ AUTHOR_ENV = "INFINO_AUTHOR"
 MCP_SERVER_ENV = "INFINO_MCP_SERVER"
 
 DEFAULT_MCP_SERVER = "infino"
+# A `${VAR}` reference Hermes left as written: its variable is not set.
+UNRESOLVED_REF = re.compile(r"^\$\{[^}]*\}$")
 
 # The plugin's state under the profile's home: the local database, the
 # sign-in, the queue of cloud writes not yet made, and the push's progress.
@@ -62,11 +79,40 @@ def state_dir(home_dir: Optional[Path] = None) -> Path:
     return (home_dir or home()) / STATE_DIR
 
 
+def _set(value) -> str:
+    """`value` as a setting, or "" when it is empty or an unresolved `${VAR}`."""
+    value = str(value or "").strip()
+    return "" if UNRESOLVED_REF.match(value) else value
+
+
 def _read(name: str) -> str:
     value = _get_secret(name) if _get_secret else None
     if value is None:
         value = os.environ.get(name)
-    return (value or "").strip()
+    return _set(value)
+
+
+def tools_env(server: str, home_dir: Path) -> dict:
+    """The `env` block of `mcp_servers.<server>` in the profile's config, with
+    `${VAR}` references resolved; {} outside Hermes, or for a home that is not
+    the profile Hermes has loaded (its config is not this one's).
+
+    Hermes's loader is imported here, not at the top: inside Hermes it is
+    loaded already, and a process outside it never pays for it (or starts
+    Remote Config by importing it)."""
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+        from hermes_constants import get_hermes_home
+    except ImportError:
+        return {}
+    try:
+        if Path(get_hermes_home()).resolve() != Path(home_dir).resolve():
+            return {}
+        env = cfg_get(load_config_readonly(), "mcp_servers", server, "env")
+    except Exception as e:  # an unreadable config must not take memory down with it
+        logger.warning("infino: could not read mcp_servers.%s.env from the config: %s", server, e)
+        return {}
+    return env if isinstance(env, dict) else {}
 
 
 def read_credentials(home_dir: Optional[Path] = None) -> dict:
@@ -99,6 +145,9 @@ class Settings:
     author: str = ""
     mcp_server: str = DEFAULT_MCP_SERVER
     home: Path = Path(".")
+    # Where the key and team database came from: "config", "environment",
+    # "sign-in", or "" when there are none.
+    source: str = ""
 
     @property
     def signed_in(self) -> bool:
@@ -106,17 +155,33 @@ class Settings:
         return bool(self.api_key and self.team_database)
 
 
-def load(home_dir: Optional[Path] = None) -> Settings:
+def load(home_dir: Optional[Path] = None, *, from_config: bool = True) -> Settings:
+    """This profile's settings. `from_config=False` skips the config block: the
+    tools' launcher is started with that block as its environment already, and
+    a process Hermes did not start must not open Remote Config itself."""
     home_dir = home_dir or home()
     creds = read_credentials(home_dir)
+    server = _read(MCP_SERVER_ENV) or DEFAULT_MCP_SERVER
+    block = tools_env(server, home_dir) if from_config else {}
+
+    def pick(env_name: str, cred_key: str = "") -> tuple[str, str]:
+        for value, where in ((_set(block.get(env_name)), "config"), (_read(env_name), "environment"),
+                             (_set(creds.get(cred_key)) if cred_key else "", "sign-in")):
+            if value:
+                return value, where
+        return "", ""
+
+    api_key, key_from = pick(KEY_ENV, "api_key")
+    team_database, team_from = pick(TEAM_DB_ENV, "team_database")
     return Settings(
-        api_key=_read(KEY_ENV) or str(creds.get("api_key") or ""),
-        team_database=_read(TEAM_DB_ENV) or str(creds.get("team_database") or ""),
-        personal_database=_read(PERSONAL_DB_ENV) or creds.get("personal_database") or None,
-        url=_read(URL_ENV) or str(creds.get("url") or "") or DEFAULT_URL,
-        author=_read(AUTHOR_ENV),
-        mcp_server=_read(MCP_SERVER_ENV) or DEFAULT_MCP_SERVER,
+        api_key=api_key,
+        team_database=team_database,
+        personal_database=pick(PERSONAL_DB_ENV, "personal_database")[0] or None,
+        url=pick(URL_ENV, "url")[0] or DEFAULT_URL,
+        author=pick(AUTHOR_ENV)[0],
+        mcp_server=server,
         home=home_dir,
+        source=team_from if team_from == key_from else "+".join(w for w in (team_from, key_from) if w),
     )
 
 

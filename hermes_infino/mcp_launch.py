@@ -16,8 +16,9 @@ signing in moves the agent's tools to the cloud at the next start with no
 config to edit. The key reaches the client in its environment
 (INFINO_API_KEY), never on its command line, where any process could read it.
 Hermes hands an MCP server only an allowlist of its environment plus the
-entry's `env`, so a deployment signed in through INFINO_API_KEY /
-INFINO_TEAM_DATABASE (rather than `hermes infino login`) names them there too.
+entry's `env`, so a deployment that signs in through config names
+INFINO_TEAM_DATABASE and `INFINO_API_KEY: ${INFINO_API_KEY}` in that block,
+which the plugin reads too (config.py).
 
 Before the client starts, the local tables are created: the client opens the
 local database's tables once, at its start, and a first session's plugin may
@@ -76,7 +77,9 @@ def main() -> None:
     here = str(Path(__file__).resolve().parent)
     sys.path[:] = [p for p in sys.path if Path(p or ".").resolve() != Path(here)]
     config, local = _load_plugin()
-    settings = config.load()
+    # Hermes started this process with the config's `env` block as its
+    # environment, so the block is read from there, not from the config again.
+    settings = config.load(from_config=False)
     store = local.LocalStore.under(config.state_dir(settings.home))
     store.ensure_tables(with_vectors=not settings.signed_in)
     client_js = os.environ.get("INFINO_CLIENT") or ""

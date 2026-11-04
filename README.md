@@ -138,9 +138,45 @@ Before creating anything or sending anything, `login` tells you exactly what wil
 
 Recall uses the cloud from the next turn. The Infino tools switch to the cloud when Hermes restarts. Until then they search the copy on your machine, which has everything too.
 
+## Fleets: settings from config or Remote Config
+
+A fleet doesn't run `login` on each machine. It puts the team's settings in the `env` block of the Infino tools' entry in `config.yaml`, and the plugin and its tools both read them from there:
+
+```yaml
+memory:
+  provider: infino
+mcp_servers:
+  infino:
+    command: /path/to/hermes/venv/bin/python
+    args: [/path/to/.hermes/plugins/infino/mcp_launch.py]
+    env:
+      HERMES_HOME: /path/to/.hermes
+      INFINO_CLIENT: /path/to/client/dist/cli.js
+      INFINO_TEAM_DATABASE: support-team
+      INFINO_API_KEY: ${INFINO_API_KEY}    # a reference; the key itself is in the profile's .env
+    connect_timeout: 120
+```
+
+With Hermes's [Remote Config](https://github.com/NousResearch/hermes-agent/pull/122509), the same keys come from the config service instead of a file, so an administrator sets the team database once, at the team (group) level, and every agent on the team starts with it. Remote Config refuses a key written out in full, so `INFINO_API_KEY` stays a `${INFINO_API_KEY}` reference, and the key goes in each profile's `.env`. `hermes infino status` says where the settings came from ("from the config").
+
+```mermaid
+flowchart LR
+  RC[Remote Config<br/>team level] -- "memory.provider: infino<br/>mcp_servers.infino.env" --> A[Each agent's Hermes]
+  ENV[".env: INFINO_API_KEY"] -- "resolves ${INFINO_API_KEY}" --> A
+  A --> P[hermes-infino]
+  A --> C[Infino tools]
+  P --> T[(Team database)]
+  C --> T
+```
+
 ## Settings
 
-A deployment can sign a profile in with environment variables instead of `login`. A variable that is set overrides the saved sign-in. Hermes passes only part of its environment to MCP servers, so a deployment that signs in this way must also list `INFINO_API_KEY` and `INFINO_TEAM_DATABASE` under `mcp_servers.infino.env`.
+Settings are read from three places; the first that has a value wins:
+1. the `env` block of `mcp_servers.infino` in the profile's config (a file or Remote Config);
+2. the profile's environment (`.env`);
+3. the sign-in `hermes infino login` saved.
+
+The config block comes first because Hermes starts the Infino tools with that block as their environment, so the plugin and its tools always use the same team. A `${VAR}` reference whose variable isn't set counts as not set.
 
 | Variable | What it is |
 | --- | --- |
@@ -148,7 +184,7 @@ A deployment can sign a profile in with environment variables instead of `login`
 | `INFINO_TEAM_DATABASE` | The team's database |
 | `INFINO_PERSONAL_DATABASE` | This person's database. Leave it unset for bots and shared profiles. |
 | `INFINO_AUTHOR` | Who this profile's messages and memories are from, when Hermes doesn't say. In a chat, the sender is always the author, and a message with no sender is saved without one. |
-| `INFINO_MCP_SERVER` | The client's name under `mcp_servers` (default `infino`) |
+| `INFINO_MCP_SERVER` | The client's name under `mcp_servers` (default `infino`). Environment only, since it names the config block. |
 | `INFINO_URL` | The Infino Cloud URL (default `https://api.platform.infino.ws`) |
 
 ## Development
