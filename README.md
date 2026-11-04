@@ -94,7 +94,7 @@ flowchart LR
 
 ## The Infino tools
 
-Hermes runs the Infino client as an MCP server, started by the plugin's `mcp_launch.py`. Each time it starts, it checks whether you are signed in:
+Hermes runs the Infino client as an MCP server, started by `hermes infino mcp` (from `mcp_servers.infino` in `config.yaml`). Each time it starts, it checks whether you are signed in:
 - **Not signed in:** the tools (`find`, `search`, `sql`, `read`) search the database on your machine.
 - **Signed in:** the same tools search the team's database in the cloud, plus anything else the cloud offers.
 
@@ -102,27 +102,41 @@ The API key is passed to the client in its environment, never on its command lin
 
 ## Install
 
-1. Build the Infino client (needs Node.js 22.19 or newer): the `client/` folder of `infino-ai/ask-bench`, branch `feat/local-database-mode`.
-2. Copy `hermes_infino/` to `$HERMES_HOME/plugins/infino/`. Hermes installs the Python dependencies listed in `plugin.yaml`. The engine is pinned to `infino==0.11.15`, the version the client uses to read the local database.
-3. Add this to `config.yaml`:
+These steps were run as written on a fresh machine with Hermes's own installer.
 
-```yaml
-memory:
-  provider: infino
-mcp_servers:
-  infino:
-    command: /path/to/hermes/venv/bin/python   # the Python Hermes runs with, which has the dependencies
-    args: [/path/to/.hermes/plugins/infino/mcp_launch.py]
-    env:
-      HERMES_HOME: /path/to/.hermes
-      INFINO_CLIENT: /path/to/client/dist/cli.js
-      INFINO_NODE: /path/to/node          # optional; otherwise `node` on PATH
-    connect_timeout: 120
-tool_budget:
-  mcp_result_size_chars: 60000   # the client returns up to 60,000 characters; Hermes's default limit is 50,000
+**Before you start:**
+- Hermes, installed with its installer: `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`.
+- Access to the two private repositories, `infino-ai/hermes-infino` and `infino-ai/ask-bench`. Hermes clones the plugin with your GitHub sign-in: run `gh auth login` first, or put `GITHUB_TOKEN=<a token that can read the repos>` in `~/.hermes/.env`.
+
+**1. Build the Infino client.** It needs Node.js 22.19 or newer; Hermes's installer already put one in `~/.hermes/tools/`.
+
+```bash
+git clone -b feat/local-database-mode https://github.com/infino-ai/ask-bench.git
+cd ask-bench/client
+export PATH="$(ls -d ~/.hermes/tools/node-*/bin | head -n 1):$PATH"
+npm ci && npm run build
 ```
 
-The first time a memory is saved or searched, the embedding model is downloaded from Hugging Face (about 90 MB, once).
+This makes `ask-bench/client/dist/cli.js`.
+
+**2. Install the plugin.** Hermes installs its Python dependencies and makes it the memory provider (`memory.provider: infino`):
+
+```bash
+hermes plugins install https://github.com/infino-ai/hermes-infino/tree/main/hermes_infino --enable --yes-deps
+```
+
+**3. Add the Infino tools,** with the full path to the client you built in step 1:
+
+```bash
+hermes config set mcp_servers.infino.command hermes
+hermes config set mcp_servers.infino.args '["infino", "mcp"]'
+hermes config set mcp_servers.infino.env.INFINO_CLIENT /full/path/to/ask-bench/client/dist/cli.js
+hermes config set mcp_servers.infino.connect_timeout 120
+```
+
+Hermes starts the tools with `hermes infino mcp`, inside its own environment, where the plugin's dependencies are, and on the Node its installer keeps (`INFINO_NODE` in the same `env` block picks another).
+
+**4. Use it.** Start `hermes` as usual. Everything is kept on your machine until you sign in. The first time a memory is saved or searched, the embedding model is downloaded from Hugging Face (about 90 MB, once).
 
 ## Signing in
 
@@ -132,6 +146,12 @@ hermes infino login --api-key-file KEY \
   --team-database TEAM [--personal-database ME]   # join a team with a key someone gave you
 hermes infino status                         # how far behind the cloud is
 hermes infino sync                           # send what the cloud doesn't have yet, now
+```
+
+To use a different Infino platform, such as staging, add `--url`:
+
+```bash
+hermes infino login --url https://api.platform.staging.infino.ai --api-key-file KEY --team-database TEAM --yes
 ```
 
 Before creating anything or sending anything, `login` tells you exactly what will be uploaded and asks you to confirm. Only a person at a terminal can agree to create an account: with no terminal, it refuses, and no flag can answer for you. When you sign in with a key someone gave you, `--yes` confirms the upload. The key is saved in `$HERMES_HOME/infino/credentials.json`, which only you can read.
@@ -147,10 +167,9 @@ memory:
   provider: infino
 mcp_servers:
   infino:
-    command: /path/to/hermes/venv/bin/python
-    args: [/path/to/.hermes/plugins/infino/mcp_launch.py]
+    command: hermes
+    args: [infino, mcp]
     env:
-      HERMES_HOME: /path/to/.hermes
       INFINO_CLIENT: /path/to/client/dist/cli.js
       INFINO_TEAM_DATABASE: support-team
       INFINO_API_KEY: ${INFINO_API_KEY}    # a reference; the key itself is in the profile's .env
