@@ -1,0 +1,83 @@
+"""The local embedding model: all-MiniLM-L6-v2, 384 dimensions, on this machine.
+
+Used in local mode only, for the `memory` table's vectors; once signed in, the
+platform embeds with its own model. The Infino client embeds its queries over
+the same local table with the same model file through transformers.js, so the
+two must agree: they do exactly with the full-precision file (`model.onnx`),
+and differ in the third decimal with the 8-bit one, whose integer kernels are
+not the same in the two ONNX runtimes. Hence fp32, here and in the client.
+
+The model is downloaded from Hugging Face on first use and cached there; it
+loads once per process, on the first text embedded.
+"""
+
+from __future__ import annotations
+
+import threading
+from typing import Callable, Optional
+
+MODEL = "Xenova/all-MiniLM-L6-v2"
+MODEL_FILE = "onnx/model.onnx"
+TOKENIZER_FILE = "tokenizer.json"
+DIM = 384
+# The model's longest input, in tokens; longer text is cut, as transformers.js does.
+MAX_TOKENS = 512
+# Texts per model call.
+BATCH = 32
+
+Embedder = Callable[[list[str]], list[list[float]]]
+
+_lock = threading.Lock()
+_model: Optional[Embedder] = None
+
+
+def _load() -> Embedder:
+    import numpy as np
+    import onnxruntime as ort
+    from huggingface_hub import hf_hub_download
+    from tokenizers import Tokenizer
+
+    tokenizer = Tokenizer.from_file(hf_hub_download(MODEL, TOKENIZER_FILE))
+    tokenizer.enable_truncation(MAX_TOKENS)
+    session = ort.InferenceSession(hf_hub_download(MODEL, MODEL_FILE), providers=["CPUExecutionProvider"])
+    inputs = {i.name for i in session.get_inputs()}
+
+    def embed_batch(texts: list[str]) -> list[list[float]]:
+        encoded = tokenizer.encode_batch(texts)
+        width = max(len(e.ids) for e in encoded)
+        ids = np.array([e.ids + [0] * (width - len(e.ids)) for e in encoded], dtype=np.int64)
+        mask = np.array([e.attention_mask + [0] * (width - len(e.ids)) for e in encoded], dtype=np.int64)
+        feeds = {"input_ids": ids, "attention_mask": mask}
+        if "token_type_ids" in inputs:
+            feeds["token_type_ids"] = np.zeros_like(ids)
+        hidden = session.run(None, feeds)[0]
+        # Mean over the real tokens, then unit length: transformers.js's
+        # feature-extraction with {pooling: "mean", normalize: true}.
+        weights = mask[..., None].astype(np.float32)
+        pooled = (hidden * weights).sum(1) / np.clip(weights.sum(1), 1e-9, None)
+        pooled /= np.clip(np.linalg.norm(pooled, axis=1, keepdims=True), 1e-12, None)
+        return pooled.astype(np.float32).tolist()
+
+    def embed(texts: list[str]) -> list[list[float]]:
+        out: list[list[float]] = []
+        for start in range(0, len(texts), BATCH):
+            out += embed_batch([t or " " for t in texts[start:start + BATCH]])
+        return out
+
+    return embed
+
+
+def embedder() -> Embedder:
+    """The process's model, loaded on first use."""
+    global _model
+    with _lock:
+        if _model is None:
+            _model = _load()
+        return _model
+
+
+def use(model: Optional[Embedder]) -> None:
+    """Replace the model (tests), or None to load the real one again."""
+    global _model
+    with _lock:
+        _model = model

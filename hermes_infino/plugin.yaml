@@ -1,0 +1,43 @@
+name: infino
+version: 0.4.0
+description: "Infino as the backend for Hermes: memory, conversations, traces and skills in an Infino database on this machine, and in the team's Infino Cloud database once signed in (`hermes infino login`), read by the Infino client's MCP tools."
+author: "Infino"
+homepage: "https://github.com/infino-ai/hermes-infino"
+# The local database (the Infino engine) and its embedding model. The engine
+# is pinned: the Infino client reads the same local folder with its own copy of
+# the engine (@infino-ai/infino), and the two move together.
+python_dependencies:
+  - "infino==0.11.15"
+  - "pyarrow>=24,<25"
+  - "numpy>=2.5,<3"
+  - "onnxruntime>=1.31,<2"
+  - "tokenizers>=0.23,<1"
+  - "huggingface_hub>=1.33,<2"
+optional_env:
+  - name: INFINO_API_KEY
+    description: "Infino API key (a deployment's; people sign in with `hermes infino login`)"
+    password: true
+  - name: INFINO_TEAM_DATABASE
+    description: "The team's Infino database"
+    password: false
+  - name: INFINO_PERSONAL_DATABASE
+    description: "This person's database (personal scope); leave unset for bots and shared profiles"
+    password: false
+  - name: INFINO_URL
+    description: "Infino platform URL (default https://api.platform.infino.ws)"
+    password: false
+  - name: INFINO_AUTHOR
+    description: "Who this profile's turns and memories are from on this machine, when Hermes does not say"
+    password: false
+  - name: INFINO_MCP_SERVER
+    description: "The Infino client's name under mcp_servers (default infino)"
+    password: false
+hooks:
+  - prefetch
+  - sync_turn
+  - on_memory_write
+  - on_session_end
+  - on_session_switch
+  - system_prompt_block
+  - post_api_request
+  - post_tool_call

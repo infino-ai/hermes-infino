@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-infino"
+version = "0.1.0"
+description = "Infino as the backend for Hermes Agent: team memory, conversations and traces in the customer's bucket."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+# The local database and its embedding model; kept in step with plugin.yaml.
+dependencies = [
+    "infino==0.11.15",
+    "pyarrow>=24,<25",
+    "numpy>=2.5,<3",
+    "onnxruntime>=1.31,<2",
+    "tokenizers>=0.23,<1",
+    "huggingface_hub>=1.33,<2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+# Hermes loads the plugin as a directory (`hermes_infino/`, installed as
+# `$HERMES_HOME/plugins/infino/`), not through entry points: on managed Hermes
+# installs, entry-point packages are not part of the locked environment.
+# This file is for development and tests only.
+
+[tool.setuptools.packages.find]
+include = ["hermes_infino*"]
