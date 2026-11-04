@@ -13,15 +13,39 @@ from __future__ import annotations
 
 import logging
 
-try:  # Hermes's MCP client: its live connections, by server name (`_servers`).
+try:  # Hermes's MCP client: its live connections (`_servers`), and how it keys them.
     from tools import mcp_tool as _mcp_tool
 except ImportError:  # pragma: no cover - only outside a Hermes install
     _mcp_tool = None
+try:
+    from tools import mcp_tool_scope as _mcp_scope
+except ImportError:  # an older Hermes keys connections by name alone
+    _mcp_scope = None
 
 logger = logging.getLogger(__name__)
 
 # The heading the instructions go under in the system prompt.
 HEADING = "## Infino tools"
+
+
+def _connection(server_name: str):
+    """Hermes's live connection to the named server, or None.
+
+    Under a profile scope (a gateway turn) Hermes keys a connection by
+    (scope, name), not by name, so the key comes from Hermes's own resolver.
+    When that misses (a prompt built outside the scope), the one connection
+    of that name is used; with several, one per profile, none is guessed."""
+    servers = getattr(_mcp_tool, "_servers", {})
+    key = server_name
+    if _mcp_scope is not None:
+        try:
+            key = _mcp_scope._resolve_server_key(server_name)
+        except Exception:  # a Hermes whose resolver differs: fall back to the name
+            key = server_name
+    if key in servers:
+        return servers[key]
+    named = [s for k, s in list(servers.items()) if (k[1] if isinstance(k, tuple) else k) == server_name]
+    return named[0] if len(named) == 1 else None
 
 
 def server_instructions(server_name: str) -> str:
@@ -30,7 +54,7 @@ def server_instructions(server_name: str) -> str:
     or failed)."""
     if _mcp_tool is None:
         return ""
-    server = getattr(_mcp_tool, "_servers", {}).get(server_name)
+    server = _connection(server_name)
     result = getattr(server, "initialize_result", None)
     text = getattr(result, "instructions", None)
     return text.strip() if isinstance(text, str) else ""
