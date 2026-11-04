@@ -56,10 +56,12 @@ LOCAL_PLATFORMS = ("cli", "tui", "local", "")
 
 SYSTEM_PROMPT = (
     "Team memory is kept in Infino. Relevant memories are added to your context before each turn. "
-    "Use infino_remember to save something the team should know (decisions, fixes, owners, conventions) "
-    "with scope 'team', or only for this person with scope 'personal'; infino_forget deletes a memory by "
-    "its exact text. infino_publish_skill shares one of your skills with the team. Everything the team's "
-    "agents remembered, said and did is in the team's Infino database, read with the Infino tools below."
+    "Use infino_remember to save what is worth keeping. Memory is the team's unless it is about one person: "
+    "work knowledge (decisions, conventions, fixes, owners, how things are set up) is team memory, saved "
+    "without asking; a person's preferences, credentials, schedule or private matters are personal "
+    "(scope 'personal'). infino_forget deletes a memory by its exact text. infino_publish_skill shares one of "
+    "your skills with the team. Everything the team's agents remembered, said and did is in the team's "
+    "Infino database, read with the Infino tools below."
 )
 # Teammates read every memory, so it names people: "the user" would mean whoever reads it.
 SYSTEM_PROMPT_PERSON = (
@@ -206,9 +208,11 @@ class InfinoMemoryProvider(MemoryProvider):
             self._writer = spawn_context_thread(chained, name="infino-write")
             self._writer.start()
 
-    def _default_scope(self) -> str:
-        assert self._settings is not None
-        return PERSONAL if self._settings.personal_database else TEAM
+    @staticmethod
+    def _default_scope() -> str:
+        """Memory is the team's unless it is about one person: team memory that
+        waits for someone to say "team" stays empty."""
+        return TEAM
 
     def _memory_row(self, content: str, scope: str, origin: str, chat: chats.Chat = chats.NO_CHAT,
                     author: str = "") -> dict:
@@ -253,8 +257,10 @@ class InfinoMemoryProvider(MemoryProvider):
                 self._run_write(self._append, tables.MEMORY,
                                 [self._memory_row(about + content, TEAM, f"builtin:{target}", chat, sender)])
             return
-        # Built-in USER.md is about this person; MEMORY.md follows the profile's default scope.
-        scope = PERSONAL if target == "user" and self._settings.personal_database else self._default_scope()
+        # Built-in USER.md is about this person: personal (kept on this machine
+        # when there is no personal database). MEMORY.md is what the agent learns
+        # about the work: the team's.
+        scope = PERSONAL if target == "user" else self._default_scope()
         origin = f"builtin:{target}"
         about = ABOUT_PERSON.format(author=self._author) if target == "user" and self._author else ""
         previous = (metadata or {}).get("previous_content")
@@ -332,12 +338,15 @@ class InfinoMemoryProvider(MemoryProvider):
     # -- tools ---------------------------------------------------------------
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        scope = {"type": "string", "enum": [TEAM, PERSONAL], "description": "team (shared) or personal"}
+        scope = {"type": "string", "enum": [TEAM, PERSONAL],
+                 "description": "team (the default: work knowledge) or personal (about one person)"}
         return [
             {
                 "name": "infino_remember",
-                "description": "Save a memory to Infino. Use scope 'team' for what the whole team should know. "
-                               "Teammates read it as written: name people, never 'the user', 'I' or 'me'.",
+                "description": "Save a memory to Infino. It is the team's unless it is about one person: "
+                               "decisions, conventions, fixes, owners and how things work are team memory; "
+                               "a person's preferences, credentials, schedule or private matters take scope "
+                               "'personal'. Teammates read it as written: name people, never 'the user', 'I' or 'me'.",
                 "parameters": {
                     "type": "object",
                     "properties": {"content": {"type": "string"}, "scope": scope},

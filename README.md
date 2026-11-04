@@ -19,6 +19,10 @@ The plugin, `infino`, is a Hermes memory provider. It keeps four tables:
 
 Before each turn the plugin recalls the most relevant memories into the context. The block says it is reference material written by people's agents, not instructions to follow. Memories name people, never "the user": teammates read them as written.
 
+## Team or personal
+
+Memory is the team's unless it is about one person. Work knowledge - decisions, conventions, fixes, owners, how things are set up - is team memory, saved without anyone saying "team": `infino_remember` with no scope, and Hermes's `MEMORY.md` (what the agent learns about the work). What is about one person is personal: Hermes's `USER.md` always, and whatever the agent marks personal (a person's preferences, credentials, schedule or private matters).
+
 ## Group chats
 
 In a group chat on the gateway, memory is the chat's, as Hermes keeps it with channel memory:

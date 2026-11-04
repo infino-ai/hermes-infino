@@ -304,14 +304,18 @@ def test_traces_carry_the_turns_author(env, platform, tmp_path):
     assert [(r["turn_id"], r["author"], r["profile"]) for r in rows] == [("t1", "alice", "ops"), ("t2", "bob", "ops")]
 
 
-def test_user_profile_memories_name_the_person(env, platform, tmp_path):
+def test_user_profile_memories_are_personal_and_name_the_person(env, platform, tmp_path):
     env.setenv("INFINO_AUTHOR", "priya")
     mgr, provider = make_manager(tmp_path)
     provider.on_memory_write("add", "user", "Prefers short answers")
     provider.on_memory_write("replace", "user", "Prefers bullet points",
                              {"previous_content": "Prefers short answers"})
+    provider.on_memory_write("add", "memory", "The staging deploy needs the VPN")
     provider.on_session_end([])
-    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["About priya: Prefers bullet points"]
+    # USER.md is about the person: personal, kept here without a personal database.
+    assert [r["content"] for r in personal_rows(tmp_path)] == ["About priya: Prefers bullet points"]
+    # MEMORY.md is what the agent learns about the work: the team's.
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["The staging deploy needs the VPN"]
 
 
 def test_prompt_tokens_include_the_prompt_cache():
