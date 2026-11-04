@@ -96,6 +96,8 @@ class FakePlatform:
         tables = self.databases.setdefault(db, {})
         if op == "list_tables":
             return 200, list(tables), None
+        if op == "schema":
+            return 200, self.schemas.get((db, body["table_name"]), []), None
         if op == "create_table":
             if body["table_name"] in tables:
                 return 409, {"error": "exists"}, None

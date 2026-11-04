@@ -96,6 +96,12 @@ class InfinoClient:
                 return
             raise
 
+    def column_names(self, database: str, table: str) -> list[str]:
+        """`POST /v1/schema/{db}`: the table's column names."""
+        out = self._request("POST", f"/v1/schema/{_q(database)}", body={"table_name": table})
+        fields = out.get("fields", out.get("schema", [])) if isinstance(out, dict) else out
+        return [f.get("name", "") for f in fields or [] if isinstance(f, dict)]
+
     def drop_table(self, database: str, table: str) -> None:
         self._request("POST", f"/v1/drop_table/{_q(database)}", body={"table_name": table})
 

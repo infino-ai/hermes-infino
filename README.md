@@ -19,6 +19,13 @@ The plugin, `infino`, is a Hermes memory provider. It keeps four tables:
 
 Before each turn the plugin recalls the most relevant memories into the context. The block says it is reference material written by people's agents, not instructions to follow. Memories name people, never "the user": teammates read them as written.
 
+## Group chats
+
+In a group chat on the gateway, memory is the chat's, as Hermes keeps it with channel memory:
+- What the group's members ask the agent to remember is kept for that chat and the team, never in one person's memory, and is credited to whoever said it.
+- A recall in the group shows that chat's notes and the team's, never a person's own memory and never another chat's notes. Outside the group, its notes stay out of recall.
+- Which chat a turn comes from, and whether it is a group, is Hermes's call: with channel memory, its binding for the turn decides, including whether the sender may write the owner's own memory from the group; without it, every chat but a DM is a group.
+
 ## Where it keeps them
 
 **Without an account**, everything goes to the local database at `$HERMES_HOME/infino/db`, through the Infino engine's Python binding. Each memory is embedded on this machine with all-MiniLM-L6-v2 (384 dimensions, full precision), and recall fuses keyword and vector search. Nothing leaves the machine.

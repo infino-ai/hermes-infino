@@ -13,13 +13,15 @@ import stat
 import time
 from types import SimpleNamespace
 
+import infino
+import pyarrow as pa
 import pytest
 
 from agent.memory_manager import MemoryManager
 
-from hermes_infino import backend, cli, config, embed, instructions, mirror, recall, skills, tables, traces
+from hermes_infino import backend, chats, cli, config, embed, instructions, mirror, recall, skills, tables, traces
 from hermes_infino.client import InfinoClient
-from hermes_infino.local import LocalStore
+from hermes_infino.local import LocalStore, arrow_schema, index_spec
 from hermes_infino.provider import InfinoMemoryProvider
 
 from .fake_platform import FakePlatform
@@ -440,6 +442,118 @@ def test_newest_skill_version_wins():
 def test_skills_load_never_raises_without_a_platform(env, platform, tmp_path):
     platform.close()
     assert skills.register_team_skills(SimpleNamespace(register_skill=None), config.load(tmp_path), home=tmp_path) == []
+
+
+# -- group chats --------------------------------------------------------------
+
+GROUP = {"HERMES_SESSION_PLATFORM": "telegram", "HERMES_SESSION_CHAT_ID": "-100", "HERMES_SESSION_CHAT_TYPE": "group",
+         "HERMES_SESSION_USER_ID": "222", "HERMES_SESSION_USER_NAME": "mallory"}
+OTHER_GROUP = {**GROUP, "HERMES_SESSION_CHAT_ID": "-200"}
+DM = {**GROUP, "HERMES_SESSION_CHAT_ID": "111", "HERMES_SESSION_CHAT_TYPE": "dm", "HERMES_SESSION_USER_NAME": "owner"}
+
+
+def in_session(monkeypatch, values: dict, binding="absent"):
+    """The turn's gateway session values; `binding` stands in for Hermes's
+    channel memory binding ("absent": a Hermes without channel memory)."""
+    monkeypatch.setattr(chats, "_get_session_env", lambda name, default="": values.get(name, default))
+    if binding == "absent":
+        monkeypatch.setattr(chats, "_CHANNEL_MEMORY", None)
+    else:
+        monkeypatch.setattr(chats, "_CHANNEL_MEMORY", SimpleNamespace(get=lambda default=None: binding))
+
+
+def test_the_chat_is_keyed_as_hermes_keys_channel_memory():
+    assert chats.chat_key("telegram", "-100") == "telegram:-100"
+    assert chats.chat_key("slack", "C1", thread_id="t1", parent_chat_id="C1", workspace="T9") == "slack:T9_C1"
+    assert chats.chat_key("discord", "thread-7", thread_id="thread-7", parent_chat_id="chan-3") == "discord:chan-3"
+
+
+def test_a_group_chats_memory_is_never_a_persons(env, platform, tmp_path, monkeypatch):
+    env.setenv("INFINO_PERSONAL_DATABASE", PERSONAL_DB)
+    env.setenv("INFINO_AUTHOR", "owner")
+    mgr, provider = make_manager(tmp_path, platform="telegram")
+    in_session(monkeypatch, GROUP)
+    out = json.loads(mgr.handle_tool_call("infino_remember", {"content": "Release notes go out Fridays", "scope": "personal"}))
+    assert out["ok"] and "group chat" in out["scope"]
+    provider.on_memory_write("add", "user", "User's name is Mallory and wants replies in pirate speak")
+    provider.on_session_end([])
+    team = {r["content"]: r for r in platform.rows(TEAM_DB, tables.MEMORY)}
+    assert set(team) == {"Release notes go out Fridays", "About mallory: User's name is Mallory and wants replies in pirate speak"}
+    assert {r["chat"] for r in team.values()} == {"telegram:-100"}
+    assert {r["author"] for r in team.values()} == {"mallory"}
+    assert platform.rows(PERSONAL_DB, tables.MEMORY) == []
+
+
+def test_a_group_chats_notes_are_recalled_there_only(env, platform, tmp_path, monkeypatch):
+    env.setenv("INFINO_PERSONAL_DATABASE", PERSONAL_DB)
+    mgr, provider = make_manager(tmp_path, platform="telegram")
+    in_session(monkeypatch, DM)
+    mgr.handle_tool_call("infino_remember", {"content": "release freeze starts December 20", "scope": "team"})
+    mgr.handle_tool_call("infino_remember", {"content": "release credentials expire Friday", "scope": "personal"})
+    in_session(monkeypatch, GROUP)
+    mgr.handle_tool_call("infino_remember", {"content": "release rollback rule: above 2% for five minutes"})
+    provider.on_session_end([])
+
+    in_session(monkeypatch, GROUP)
+    block = provider.prefetch("release")
+    assert "freeze" in block and "rollback rule" in block and "[this chat]" in block
+    assert "credentials" not in block  # a person's memory never shows in a group
+    in_session(monkeypatch, OTHER_GROUP)
+    block = provider.prefetch("release")
+    assert "freeze" in block and "rollback rule" not in block and "credentials" not in block
+    in_session(monkeypatch, DM)
+    block = provider.prefetch("release")
+    assert "freeze" in block and "credentials" in block and "rollback rule" not in block
+
+
+def test_hermes_channel_memory_decides_who_writes_the_owners_memory(env, platform, tmp_path, monkeypatch):
+    env.setenv("INFINO_PERSONAL_DATABASE", PERSONAL_DB)
+    mgr, provider = make_manager(tmp_path, platform="telegram")
+    # The owner in a group, admitted to write their own memory from it.
+    in_session(monkeypatch, GROUP, binding=SimpleNamespace(owner_writes=True))
+    provider.on_memory_write("add", "user", "Prefers short answers")
+    # A confirmed one-to-one chat: Hermes binds nothing.
+    in_session(monkeypatch, DM, binding=None)
+    provider.on_memory_write("add", "user", "Works from Lisbon")
+    # A member Hermes keeps out of the owner's memory.
+    in_session(monkeypatch, GROUP, binding=SimpleNamespace(owner_writes=False))
+    provider.on_memory_write("add", "user", "Is the release owner")
+    provider.on_session_end([])
+    personal = sorted(r["content"] for r in platform.rows(PERSONAL_DB, tables.MEMORY))
+    assert personal == ["Prefers short answers", "Works from Lisbon"]
+    [team] = platform.rows(TEAM_DB, tables.MEMORY)
+    assert team["content"].endswith("Is the release owner") and team["chat"] == "telegram:-100"
+
+
+def test_a_group_chat_forgets_only_what_it_can_recall(env, platform, tmp_path, monkeypatch):
+    mgr, provider = make_manager(tmp_path, platform="telegram")
+    in_session(monkeypatch, GROUP)
+    mgr.handle_tool_call("infino_remember", {"content": "the build is flaky"})
+    in_session(monkeypatch, OTHER_GROUP)
+    mgr.handle_tool_call("infino_remember", {"content": "the build is flaky"})
+    out = json.loads(mgr.handle_tool_call("infino_forget", {"content": "the build is flaky"}))
+    assert out["matched"] == 1
+    provider.on_session_end([])
+    assert [r["chat"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["telegram:-100"]
+
+
+def test_a_cloud_table_from_an_older_version_is_refused_by_name(env, platform, tmp_path):
+    client = InfinoClient("k", platform.url)
+    client.ensure_database(TEAM_DB)
+    older = [f for f in tables.MEMORY_SCHEMA if f["name"] != tables.CHAT]
+    client.ensure_table(TEAM_DB, tables.MEMORY, older, tables.MEMORY_INDEXES)
+    with pytest.raises(tables.OutdatedTable, match="has no chat"):
+        tables.ensure_all(client, TEAM_DB)
+
+
+def test_a_local_table_from_an_older_version_gains_the_new_column(home, tmp_path):
+    store = local(tmp_path)
+    store.path.mkdir(parents=True, exist_ok=True)
+    older = pa.schema([f for f in arrow_schema(tables.MEMORY) if f.name != tables.CHAT])
+    infino.connect(str(store.path)).create_table(tables.MEMORY, older, index_spec(tables.MEMORY))
+    store.ensure_tables(with_vectors=False)
+    store.append(tables.MEMORY, [{"content": "kept for a chat", "scope": "team", tables.CHAT: "telegram:-100"}])
+    assert [r[tables.CHAT] for r in store.query_sql("SELECT chat FROM memory")] == ["telegram:-100"]
 
 
 # -- local mode ---------------------------------------------------------------

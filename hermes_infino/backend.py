@@ -58,9 +58,11 @@ class Backend:
         self._last_write = time.monotonic()
         self.schedule_sync()
 
-    def forget_memory(self, content: str, scope: Optional[str] = None) -> int:
-        """Delete memories with exactly this text (in `scope` when given)."""
-        predicate = f"content = {tables.sql_string(content)}"
+    def forget_memory(self, content: str, scope: Optional[str] = None, visible: tuple[str, ...] = ("",)) -> int:
+        """Delete memories with exactly this text, of the chats in `visible`
+        ("" is no chat), in `scope` when given: a chat forgets only what it
+        can recall."""
+        predicate = f"content = {tables.sql_string(content)} AND {tables.chat_predicate(visible)}"
         if scope:
             predicate += f" AND scope = {tables.sql_string(scope)}"
         deleted = self.local.delete(tables.MEMORY, predicate, (tables.ROW_ID, "scope"))

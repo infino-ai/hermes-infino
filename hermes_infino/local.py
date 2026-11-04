@@ -107,12 +107,25 @@ class LocalStore:
         existing = set(db.list_tables())
         for table in tables.ALL + ((VECTORS,) if with_vectors else ()):
             if table in existing:
+                self._add_missing_columns(db, table)
                 continue
             try:
                 db.create_table(table, arrow_schema(table), index_spec(table))
             except infino.InfinoError:
                 if table not in self._connect().list_tables():  # another process made it first
                     raise
+
+    def _add_missing_columns(self, db, table: str) -> None:
+        """Columns a newer version writes, added to a table an older one made
+        (its rows read them as null)."""
+        if table == VECTORS:
+            return
+        schema, _ = tables.TEAM_TABLES[table]
+        have = {f.get("name") for f in db.schema(table).get("fields", [])}
+        missing = [{"name": f["name"], "type": f["type"], "nullable": True}
+                   for f in schema if f["type"] != "embedding" and f["name"] not in have]
+        if missing:
+            db.schema(table, {"fields": missing})
 
     def list_tables(self) -> list[str]:
         return list(self._connect().list_tables())

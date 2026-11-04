@@ -44,6 +44,8 @@ EMBEDDING_COLUMN = "embedding"
 MEMORY_TEXT_COLUMN = "content"
 ROW_ID = "row_id"
 STORED = "stored_ms"
+# A memory's group chat (chats.py): kept for that chat and recalled only there.
+CHAT = "chat"
 
 MEMORY_SCHEMA = [
     {"name": ROW_ID, "type": "utf8"},
@@ -54,6 +56,7 @@ MEMORY_SCHEMA = [
     {"name": "profile", "type": "utf8"},        # the Hermes profile that wrote it
     {"name": "session_id", "type": "utf8"},
     {"name": "origin", "type": "utf8"},         # remember | builtin:memory | builtin:user
+    {"name": CHAT, "type": "utf8"},             # the group chat it is kept for ("" or null: the team's or the person's)
     {"name": "created_ms", "type": "i64"},
     {"name": EMBEDDING_COLUMN, "type": "embedding", "source": [MEMORY_TEXT_COLUMN], "nullable": False},
 ]
@@ -135,9 +138,24 @@ def sql_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def chat_predicate(visible: tuple[str, ...]) -> str:
+    """Rows of the chats in `visible`, "" standing for no chat (null or empty)."""
+    terms = [f"{CHAT} IS NULL OR {CHAT} = ''" if c == "" else f"{CHAT} = {sql_string(c)}" for c in visible]
+    return "(" + " OR ".join(terms) + ")"
+
+
+class OutdatedTable(Exception):
+    """A cloud table lacks a column this version writes; the platform cannot add one."""
+
+
 def ensure_all(client: InfinoClient, database: str, personal: bool = False) -> None:
     """Create the database and its tables unless they exist. Where the
-    account has no embedding server, `memory` is created keyword-only."""
+    account has no embedding server, `memory` is created keyword-only.
+
+    A table that exists must have every column this version writes: the
+    platform adds no column to an existing table, and a row pushed without
+    its `chat` would read as the whole team's memory, so an older table is
+    refused by name rather than written around."""
     client.ensure_database(database)
     for table, (schema, indexes) in (PERSONAL_TABLES if personal else TEAM_TABLES).items():
         try:
@@ -146,3 +164,8 @@ def ensure_all(client: InfinoClient, database: str, personal: bool = False) -> N
             if table != MEMORY or e.status != 403 or "embedding" not in e.message:
                 raise
             client.ensure_table(database, MEMORY, MEMORY_SCHEMA_KEYWORD_ONLY, MEMORY_INDEXES)
+        have = set(client.column_names(database, table))
+        missing = [f["name"] for f in schema if f["type"] != "embedding" and f["name"] not in have]
+        if missing:
+            raise OutdatedTable(f"{database}.{table} has no {', '.join(missing)}: it was created by an older "
+                                f"hermes-infino; drop it (its rows are kept on each machine and pushed again)")
