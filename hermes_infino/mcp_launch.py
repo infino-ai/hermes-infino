@@ -1,14 +1,19 @@
 """The Infino client as Hermes's MCP server, reading what this profile reads.
 
-Hermes starts one command for `mcp_servers.infino`; this is it:
+Hermes starts one command for `mcp_servers.infino`:
 
     mcp_servers:
       infino:
-        command: <the Python Hermes runs>
-        args: [<HERMES_HOME>/plugins/infino/mcp_launch.py]
+        command: hermes
+        args: [infino, mcp]
         env:
-          HERMES_HOME: <HERMES_HOME>
           INFINO_CLIENT: <path to the client's dist/cli.js>
+
+`hermes infino mcp` (cli.py) runs `launch` inside Hermes's own environment,
+where the plugin's dependencies are installed; a standard Hermes install keeps
+that environment at a path that changes with its dependencies, so no fixed
+Python path could name it. This file also runs as a script, under a Python
+that has the dependencies (a development checkout's venv).
 
 At each start it reads the profile's sign-in and runs the client over the
 local database (no account) or the team's cloud database (signed in), so
@@ -33,6 +38,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -70,13 +76,19 @@ def client_command(settings, client_js: str, node: str, empty_root: str) -> tupl
     return argv, env
 
 
-def main() -> None:
-    # Run as a script, this folder is first on the import path, where its
-    # modules (config, client, local...) would shadow any library's of the
-    # same name; the plugin's are reached through PACKAGE instead.
-    here = str(Path(__file__).resolve().parent)
-    sys.path[:] = [p for p in sys.path if Path(p or ".").resolve() != Path(here)]
-    config, local = _load_plugin()
+def node_command() -> str:
+    """INFINO_NODE, else the Node Hermes's installer keeps, else `node` on PATH."""
+    if os.environ.get("INFINO_NODE"):
+        return os.environ["INFINO_NODE"]
+    try:  # inside Hermes only; a script run outside it has no hermes_constants
+        from hermes_constants import with_hermes_node_path
+    except ImportError:
+        return "node"
+    return shutil.which("node", path=with_hermes_node_path({"PATH": ""})["PATH"]) or "node"
+
+
+def launch(config, local) -> None:
+    """Create the local tables, then become the client (never returns)."""
     # Hermes started this process with the config's `env` block as its
     # environment, so the block is read from there, not from the config again.
     settings = config.load(from_config=False)
@@ -85,12 +97,21 @@ def main() -> None:
     client_js = os.environ.get("INFINO_CLIENT") or ""
     if not client_js:
         sys.exit("INFINO_CLIENT is not set: the path to the Infino client's dist/cli.js")
-    node = os.environ.get("INFINO_NODE") or "node"
     # A folder the client may take as its root; nothing is indexed in it.
     empty_root = str(config.state_dir(settings.home) / "client-root")
     os.makedirs(empty_root, exist_ok=True)
-    argv, env = client_command(settings, client_js, node, empty_root)
+    argv, env = client_command(settings, client_js, node_command(), empty_root)
+    sys.stdout.flush()
     os.execvpe(argv[0], argv, {**os.environ, **env})
+
+
+def main() -> None:
+    # Run as a script, this folder is first on the import path, where its
+    # modules (config, client, local...) would shadow any library's of the
+    # same name; the plugin's are reached through PACKAGE instead.
+    here = str(Path(__file__).resolve().parent)
+    sys.path[:] = [p for p in sys.path if Path(p or ".").resolve() != Path(here)]
+    launch(*_load_plugin())
 
 
 if __name__ == "__main__":

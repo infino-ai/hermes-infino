@@ -4,6 +4,8 @@
     hermes infino login     create a free account, or use a key you were given,
                             then push everything kept on this machine
     hermes infino sync      push what the cloud does not have yet, now
+    hermes infino mcp       the Infino tools' server; Hermes starts it from
+                            `mcp_servers.infino` (not a command for people)
 
 Signing in uploads this machine's memories, conversations (tool results
 included), traces and skills, and from then on everything new. So `login`
@@ -42,12 +44,13 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     login.add_argument("--personal-database", default="", help="your personal database (optional)")
     login.add_argument("--yes", action="store_true", help="agree to the upload when using --api-key-file")
     sub.add_parser("sync", help="push what the cloud does not have yet")
+    sub.add_parser("mcp", help="the Infino tools' MCP server, which Hermes starts (mcp_servers.infino)")
 
 
 def infino_command(args: argparse.Namespace) -> int:
     action = getattr(args, "infino_action", None) or "status"
     try:
-        return {"status": _status, "login": _login, "sync": _sync}[action](args)
+        return {"status": _status, "login": _login, "sync": _sync, "mcp": _mcp}[action](args)
     except InfinoError as e:
         print(f"infino: the platform refused: {e}", file=sys.stderr)
         return 1
@@ -176,6 +179,16 @@ def _login(args) -> int:
     print("Recall reads the cloud from the next turn. The agent's Infino tools read it once Hermes restarts; "
           "until then they read this machine's copy, which has everything too.")
     return status
+
+
+# -- mcp ----------------------------------------------------------------------
+
+def _mcp(args) -> int:
+    """Become the Infino client, in Hermes's own environment (mcp_launch.py)."""
+    from . import local, mcp_launch
+
+    mcp_launch.launch(config, local)
+    return 0  # not reached: launch execs the client
 
 
 # -- sync ---------------------------------------------------------------------

@@ -3,6 +3,7 @@ the local database, and a fake platform for the cloud."""
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import importlib.util
 import io
@@ -667,6 +668,22 @@ def test_the_tool_server_follows_the_sign_in(home, platform, tmp_path):
     assert argv[:5] == ["node", "/c/cli.js", "mcp", "--db", f"{platform.url}/{TEAM_DB}"]
     assert "secret-key" not in " ".join(argv)  # the key is never on a command line
     assert env["INFINO_API_KEY"] == "secret-key" and "CX_LOCAL_DB" not in env
+
+
+def test_hermes_infino_mcp_starts_the_tools_inside_hermes(home, tmp_path, monkeypatch):
+    from hermes_infino import mcp_launch
+
+    parser = argparse.ArgumentParser()
+    cli.register_cli(parser)
+    started = {}
+    monkeypatch.setattr(mcp_launch, "launch", lambda config_mod, local_mod: started.update(config=config_mod))
+    assert cli.infino_command(parser.parse_args(["mcp"])) == 0
+    assert started["config"] is config
+    # Without INFINO_NODE, the Node Hermes's installer keeps (or `node` on PATH).
+    monkeypatch.delenv("INFINO_NODE", raising=False)
+    assert mcp_launch.node_command()
+    monkeypatch.setenv("INFINO_NODE", "/opt/node/bin/node")
+    assert mcp_launch.node_command() == "/opt/node/bin/node"
 
 
 def test_login_asks_and_refuses_without_a_terminal(home, platform, tmp_path, monkeypatch):
