@@ -8,7 +8,8 @@ person's, in a personal profile) once signed in (`backend.py`):
 - memory: Hermes's built-in MEMORY.md / USER.md writes and the
   `infino_remember` tool append to `memory`; `infino_forget` deletes;
 - conversations: the messages of each completed turn, tool calls and
-  results included, to `conversations`;
+  results included, to `conversations` - the person's own, not the team's,
+  for a personal session (privacy.py);
 - skills: `infino_publish_skill` shares one of the profile's skills with the
   team (`skills`).
 
@@ -111,13 +112,6 @@ def _clip(text: Any) -> str:
     return s if len(s) <= MAX_CELL_CHARS else s[:MAX_CELL_CHARS]
 
 
-def _text(content: Any) -> str:
-    """A message's text: the string, or its text parts joined."""
-    if isinstance(content, list):
-        return "\n".join(p.get("text", "") for p in content if isinstance(p, dict))
-    return content if isinstance(content, str) else ""
-
-
 def _scope(value: Any) -> Optional[str]:
     """A tool's `scope`: "" when none was given, the scope in its canonical
     spelling, or None when it names neither (a private memory must never land
@@ -139,7 +133,7 @@ def _turn_messages(messages: list[dict[str, Any]], user_content: str) -> list[di
             continue
         if latest_user is None:
             latest_user = i
-        if key and key in _text(messages[i].get("content")):
+        if key and key in privacy.message_text(messages[i].get("content")):
             return messages[i:]
     return messages[latest_user:] if latest_user is not None else messages
 
@@ -252,8 +246,9 @@ class InfinoMemoryProvider(MemoryProvider):
             logger.info("infino: could not re-read the settings: %s", e)
             return
         old = self._settings
-        if (new.api_key, new.team_database, new.personal_database, new.url) == (
-                old.api_key, old.team_database, old.personal_database, old.url):
+        if (new.api_key, new.team_database, new.personal_database, new.url, new.personal_profile,
+                new.personal_jobs) == (old.api_key, old.team_database, old.personal_database, old.url,
+                                       old.personal_profile, old.personal_jobs):
             return
         logger.info("infino: the sign-in changed; using %s", new.team_database or "this machine alone")
         self._caught_up.clear()
@@ -347,9 +342,9 @@ class InfinoMemoryProvider(MemoryProvider):
             "created_ms": _now_ms(),
         }
 
-    def _append(self, table: str, rows: list[dict]) -> None:
+    def _append(self, table: str, rows: list[dict], personal: bool = False) -> None:
         assert self._backend is not None
-        self._backend.append(table, rows)
+        self._backend.append(table, rows, personal)
 
     def _forget(self, content: str, scope: Optional[str], chat: chats.Chat = chats.NO_CHAT,
                 person: Optional[str] = None, about_prefix: str = "") -> int:
@@ -427,27 +422,36 @@ class InfinoMemoryProvider(MemoryProvider):
                 for i, m in enumerate(new) if m.get("role") in ("user", "assistant", "tool")]
         rows = [r for r in rows if r["content"] or r["tool_name"]]
         if rows:
-            self._run_write(self._append, tables.CONVERSATIONS, rows)
+            # Decided from the whole session: a personal job's output delivered
+            # into the chat comes before the turn that answers it.
+            self._ready.wait(READY_WAIT_S)
+            personal = self._backend.transcript_personal(session, messages or new)
+            self._run_write(self._append, tables.CONVERSATIONS, rows, personal)
 
     def _stored_next_seq(self, session: str) -> int:
         """The next `seq` of a session this process has not stored yet: one
-        past the highest this machine kept for it (0 for a new session)."""
+        past the highest this machine kept for it, in the team's tables or
+        the person's own (0 for a new session)."""
         assert self._backend is not None
         self._ready.wait(READY_WAIT_S)
-        try:
-            found = self._backend.local.query_sql(
-                f"SELECT max(seq) AS top FROM {tables.CONVERSATIONS} WHERE session_id = {tables.sql_string(session)}")
-        except Exception as e:  # unreadable: count from the start, as a new session does
-            logger.warning("infino: could not read session %s's stored messages: %s", session, e)
-            return 0
-        top = found[0]["top"] if found else None
-        return 0 if top is None else int(top) + 1
+        top = None
+        for store in (self._backend.local, self._backend.personal):
+            try:
+                found = store.query_sql(f"SELECT max(seq) AS top FROM {tables.CONVERSATIONS} "
+                                        f"WHERE session_id = {tables.sql_string(session)}")
+            except Exception as e:  # unreadable: count from what the other holds, or the start
+                logger.warning("infino: could not read session %s's stored messages: %s", session, e)
+                continue
+            if found and found[0]["top"] is not None:
+                highest = int(found[0]["top"])
+                top = highest if top is None else max(top, highest)
+        return 0 if top is None else top + 1
 
     def _conversation_row(self, session: str, turn: str, seq: int, m: dict, author: str,
                           called: dict[str, dict]) -> dict:
         role = str(m.get("role") or "")
         tool_name = tool_args = tool_result = ""
-        content = _text(m.get("content"))
+        content = privacy.message_text(m.get("content"))
         if role == "assistant" and m.get("tool_calls"):
             calls = [c.get("function") or {} for c in m["tool_calls"]]
             tool_name = ",".join(str(c.get("name", "")) for c in calls)

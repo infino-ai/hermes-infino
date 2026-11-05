@@ -5,8 +5,9 @@ to the cloud the rows of each source past a mark - the (stored_ms, row_id) of
 the last row the cloud accepted - in that order, and moves the mark only
 after each batch is accepted. A source is one local table and the one cloud
 database it goes to: each of the team's tables to the team's database, and
-the person's own memory to their personal database - or nowhere, when they
-have none: personal memory never goes to the team's database. The same sync is the push of everything kept
+each of the person's own tables (their memory, and the conversations and
+traces kept personal) to their personal database - or nowhere, when they
+have none: nothing personal ever goes to the team's database. The same sync is the push of everything kept
 before sign-up, live mirroring after it, and catching up after an outage, and
 it misses no row whichever process wrote it: a Hermes process that started
 before the sign-up keeps writing the local database, and the next sync from
@@ -83,8 +84,11 @@ PUSH_BATCH = 200
 PUSH_MAX_BYTES = 2_000_000
 # Row ids per cloud delete.
 FORGET_BATCH = 100
-# The personal memory source (the team's are named by their tables).
-PERSONAL_MEMORY = "personal_memory"
+# The person's own sources, one per personal table: the team's are named by
+# their tables, these by the table after this prefix.
+PERSONAL_SOURCE_PREFIX = "personal_"
+PERSONAL_SOURCES = {PERSONAL_SOURCE_PREFIX + t: t for t in tables.PERSONAL}
+PERSONAL_MEMORY = PERSONAL_SOURCE_PREFIX + tables.MEMORY
 # What each team table's mark was called before marks named their database.
 LEGACY_MARKS = (*tables.ALL, PERSONAL_MEMORY)
 
@@ -125,16 +129,16 @@ class Mirror:
     # -- where rows go -------------------------------------------------------
 
     def mark_of(self, source: str) -> str:
-        """The mark of a source: a team table's name, or PERSONAL_MEMORY."""
-        if source == PERSONAL_MEMORY:
-            return f"{self.settings.personal_database}/{PERSONAL_MEMORY}"
+        """The mark of a source: a team table's name, or one of PERSONAL_SOURCES."""
+        if source in PERSONAL_SOURCES:
+            return f"{self.settings.personal_database}/{source}"
         return f"{self.settings.team_database}/{source}"
 
     def sources(self) -> list[Source]:
         out = [Source(self.mark_of(t), self.local, t, self.settings.team_database) for t in tables.ALL]
         if self.settings.personal_database:
-            out.append(Source(self.mark_of(PERSONAL_MEMORY), self.personal, tables.MEMORY,
-                              self.settings.personal_database))
+            out += [Source(self.mark_of(name), self.personal, table, self.settings.personal_database)
+                    for name, table in PERSONAL_SOURCES.items()]
         return out
 
     def ensure_cloud_tables(self) -> None:
@@ -372,7 +376,7 @@ class Mirror:
 
     def unsynced_after(self, source: str) -> Optional[tuple[int, str]]:
         """The mark a source's local rows must be past to be missing from the
-        cloud; `source` is a team table's name or PERSONAL_MEMORY."""
+        cloud; `source` is a team table's name or one of PERSONAL_SOURCES."""
         return self.marks().get(self.mark_of(source))
 
     # -- forgets -------------------------------------------------------------

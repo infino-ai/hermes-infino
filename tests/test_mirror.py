@@ -28,7 +28,7 @@ def make_mirror(tmp_path, settings) -> Mirror:
     state = config.state_dir(tmp_path)
     team, personal = LocalStore.under(state), LocalStore.under(state, PERSONAL_DB_DIR)
     team.ensure_tables(with_vectors=False)
-    personal.ensure_tables(with_vectors=False, only=(tables.MEMORY,))
+    personal.ensure_tables(with_vectors=False, only=tables.PERSONAL)
     m = Mirror(settings, team, personal)
     m.ensure_cloud_tables()
     return m
@@ -48,11 +48,34 @@ def test_the_sources_are_the_teams_tables(m):
                                                                     for t in tables.ALL]
 
 
-def test_a_personal_database_adds_the_personal_source(home, platform, tmp_path):
+def test_a_personal_database_adds_the_personal_sources(home, platform, tmp_path):
     m = make_mirror(tmp_path, sign_in(tmp_path, platform, personal_database=PERSONAL_DB))
-    assert (f"{PERSONAL_DB}/{mirror.PERSONAL_MEMORY}", tables.MEMORY, PERSONAL_DB) in [
-        (s.mark, s.table, s.database) for s in m.sources()]
-    assert set(platform.databases[PERSONAL_DB]) == {tables.MEMORY}
+    sources = [(s.mark, s.store, s.table, s.database) for s in m.sources()]
+    for table in tables.PERSONAL:
+        assert (f"{PERSONAL_DB}/personal_{table}", m.personal, table, PERSONAL_DB) in sources
+    assert f"{PERSONAL_DB}/{mirror.PERSONAL_MEMORY}" in [s[0] for s in sources]  # the mark kept since before
+    # The person's database holds their memory and the conversations and traces kept personal.
+    assert set(platform.databases[PERSONAL_DB]) == set(tables.PERSONAL)
+    # Nothing in the person's own tables has a source that goes to the team's database.
+    assert all(s.database == PERSONAL_DB for s in m.sources() if s.store is m.personal)
+
+
+def test_personal_transcripts_go_to_the_personal_database_only(home, platform, tmp_path):
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform, personal_database=PERSONAL_DB))
+    m.personal.append(tables.CONVERSATIONS, [{"session_id": "mine", "seq": 0, "role": "user", "content": "private"}])
+    m.personal.append(tables.TRACES, [{"session_id": "mine", "kind": "model", "result": "private"}])
+    m.local.append(tables.CONVERSATIONS, conversation_rows(1))
+    m.sync(wait=True)
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.CONVERSATIONS)] == ["m0"]
+    assert platform.rows(TEAM_DB, tables.TRACES) == []
+    assert [r["content"] for r in platform.rows(PERSONAL_DB, tables.CONVERSATIONS)] == ["private"]
+    assert [r["result"] for r in platform.rows(PERSONAL_DB, tables.TRACES)] == ["private"]
+
+
+def test_without_a_personal_database_personal_transcripts_go_nowhere(m, platform):
+    m.personal.append(tables.TRACES, [{"session_id": "mine", "kind": "model", "result": "private"}])
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.TRACES) == [] and set(platform.databases) == {TEAM_DB}
 
 
 def test_rows_go_in_batches_and_the_mark_moves_with_each(m, platform, monkeypatch):

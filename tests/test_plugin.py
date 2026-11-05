@@ -37,10 +37,11 @@ def test_team_tables_are_created(env, platform, tmp_path):
     assert local(tmp_path).has_vectors() is False
 
 
-def test_personal_database_holds_memory_only(env, platform, tmp_path):
+def test_personal_database_holds_the_personal_tables_only(env, platform, tmp_path):
+    # Personal memory, and personal conversations and traces; never skills.
     env.setenv("INFINO_PERSONAL_DATABASE", PERSONAL_DB)
     make_manager(tmp_path)
-    assert set(platform.databases[PERSONAL_DB]) == {tables.MEMORY}
+    assert set(platform.databases[PERSONAL_DB]) == {tables.MEMORY, tables.CONVERSATIONS, tables.TRACES}
 
 
 def test_account_at_its_database_limit_still_gets_its_tables(env, platform, tmp_path):

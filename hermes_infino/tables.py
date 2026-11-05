@@ -29,6 +29,9 @@ binding, under the profile's home), always; and the team's cloud database,
 once signed in. They differ in one column: locally, `memory.embedding` is a
 384-dimension vector this machine computes (`embed.py`); in the cloud it is
 the platform's embedding column, which the platform fills from `content`.
+
+A person's own database, on this machine and in the cloud, has `PERSONAL`
+of them: their memory, and the conversations and traces kept personal.
 """
 
 from .client import InfinoClient, InfinoError
@@ -129,8 +132,11 @@ TEAM_TABLES = {
     TRACES: (TRACES_SCHEMA, TRACES_INDEXES),
     SKILLS: (SKILLS_SCHEMA, SKILLS_INDEXES),
 }
-# A person's own database holds their personal memory only.
-PERSONAL_TABLES = {MEMORY: (MEMORY_SCHEMA, MEMORY_INDEXES)}
+# A person's own database holds their personal memory, and the conversations
+# and traces kept personal (privacy.py): a personal profile's, a personal
+# scheduled job's, a chat a personal job's output went to.
+PERSONAL = (MEMORY, CONVERSATIONS, TRACES)
+PERSONAL_TABLES = {t: TEAM_TABLES[t] for t in PERSONAL}
 
 
 def sql_string(value: str) -> str:

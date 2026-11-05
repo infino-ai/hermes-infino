@@ -10,14 +10,15 @@ import pytest
 from plugins.config_backends import remote as remote_config
 from plugins.config_backends.remote import backend as remote_backend, credentials as remote_credentials
 
-from hermes_infino import backend, embed, mirror, skills
+from hermes_infino import backend, embed, mirror, privacy, skills
 
 from .fake_platform import FakePlatform
 from .helpers import REMOTE_CONFIG_STUB, TEAM_DB, TEST_SYNC_DELAY_S, fake_embed
 
 # Every setting the plugin reads from the environment.
 INFINO_ENV = ("INFINO_API_KEY", "INFINO_TEAM_DATABASE", "INFINO_URL", "INFINO_PERSONAL_DATABASE",
-              "INFINO_AUTHOR", "INFINO_MCP_SERVER", "INFINO_NODE", "INFINO_CLIENT")
+              "INFINO_AUTHOR", "INFINO_MCP_SERVER", "INFINO_NODE", "INFINO_CLIENT",
+              "INFINO_PERSONAL_PROFILE", "INFINO_PERSONAL_JOBS")
 
 
 @pytest.fixture(autouse=True)
@@ -28,9 +29,11 @@ def quick(monkeypatch):
     monkeypatch.setattr(backend, "SYNC_DELAY_S", TEST_SYNC_DELAY_S)
     backend._backends.clear()
     skills._loaded_at.clear()
+    privacy._sessions.clear()  # what one test noted about its sessions is not another's
     yield
     embed.use(None)
     backend._backends.clear()
+    privacy._sessions.clear()
 
 
 @pytest.fixture

@@ -1,6 +1,11 @@
 """Trace hooks: every model call and tool call, as rows in the `traces`
 table (locally, and in the team's cloud database once signed in), next to
-the conversation they belong to.
+the conversation they belong to. A personal session's traces (privacy.py) go
+to the person's own database instead, as its conversation does: which
+scheduled job a run belongs to is noted from each of its calls, a chat a job's
+output was delivered into from the turn's history before its first model call
+(`pre_llm_call`), and a subagent follows the session that started it
+(`subagent_start`).
 
 Rows are buffered per session and written once per turn (Hermes's plugin
 `on_session_end` hook fires at each turn's end), so a turn with ten tool
@@ -136,10 +141,23 @@ class TraceRecorder:
         self._lock = threading.Lock()
 
     def _add(self, session_id: str, row: dict) -> None:
+        # Read in the call's own context: a scheduled job's run says which job it is.
+        privacy.note_cron_job(session_id or "")
         with self._lock:
             self._buffers.setdefault(session_id or "", []).append(row)
         if row["turn_id"]:
             _turn.set((session_id or "", row["turn_id"]))
+
+    def on_llm_call(self, **kw: Any) -> None:
+        """Before a turn's first model call: note any job output delivered
+        into this chat, which the turn's history holds."""
+        history = list(kw.get("conversation_history") or [])
+        history.append({"role": "user", "content": kw.get("user_message")})
+        privacy.note_deliveries(str(kw.get("session_id") or ""), history)
+
+    def on_subagent(self, **kw: Any) -> None:
+        """A subagent's session is as personal as the session that started it."""
+        privacy.note_parent(str(kw.get("child_session_id") or ""), str(kw.get("parent_session_id") or ""))
 
     def on_api(self, **kw: Any) -> None:
         inp, out, cached = _tokens(kw.get("usage"))
@@ -202,7 +220,8 @@ class TraceRecorder:
 
         def flush() -> None:
             try:
-                backend.for_settings(settings).append(tables.TRACES, rows)
+                b = backend.for_settings(settings)
+                b.append(tables.TRACES, rows, b.transcript_personal(session))
             except Exception as e:
                 logger.warning("infino-traces: %d trace rows not written: %s", len(rows), e)
 
@@ -211,6 +230,8 @@ class TraceRecorder:
 
 def register_hooks(ctx) -> None:
     recorder = TraceRecorder()
+    ctx.register_hook("pre_llm_call", recorder.on_llm_call)
     ctx.register_hook("post_api_request", recorder.on_api)
     ctx.register_hook("post_tool_call", recorder.on_tool)
+    ctx.register_hook("subagent_start", recorder.on_subagent)
     ctx.register_hook("on_session_end", recorder.on_turn_end)

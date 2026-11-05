@@ -30,6 +30,12 @@ first.
                              since it names the config block
 - INFINO_TEAM_SKILLS         `off` stops this profile loading the skills its
                              teammates publish (default on)
+- INFINO_PERSONAL_PROFILE    `on` makes this profile's conversations and traces
+                             personal: kept in the personal database, or on
+                             this machine, never the team's (default off)
+- INFINO_PERSONAL_JOBS       the scheduled jobs (ids or names, comma-separated)
+                             whose runs, and the chats their output is
+                             delivered into, are personal the same way
 
 A variable that is set wins over the sign-in, so a deployment's `.env` is
 never overridden by a file on the machine.
@@ -66,10 +72,16 @@ URL_ENV = "INFINO_URL"
 AUTHOR_ENV = "INFINO_AUTHOR"
 MCP_SERVER_ENV = "INFINO_MCP_SERVER"
 TEAM_SKILLS_ENV = "INFINO_TEAM_SKILLS"
+PERSONAL_PROFILE_ENV = "INFINO_PERSONAL_PROFILE"
+PERSONAL_JOBS_ENV = "INFINO_PERSONAL_JOBS"
 
 DEFAULT_MCP_SERVER = "infino"
 # Values of INFINO_TEAM_SKILLS that turn the team's skills off.
 OFF_VALUES = ("off", "false", "no", "0")
+# Values of INFINO_PERSONAL_PROFILE that make the profile personal.
+ON_VALUES = ("on", "true", "yes", "1")
+# What separates the jobs INFINO_PERSONAL_JOBS names.
+JOBS_SEPARATOR = ","
 # A `${VAR}` reference Hermes left as written: its variable is not set.
 UNRESOLVED_REF = re.compile(r"^\$\{[^}]*\}$")
 
@@ -164,6 +176,10 @@ class Settings:
     source: str = ""
     # Whether the skills teammates publish load in this profile.
     team_skills: bool = True
+    # Whether every conversation and trace of this profile is personal.
+    personal_profile: bool = False
+    # The scheduled jobs (ids or names) whose runs and delivered output are personal.
+    personal_jobs: tuple[str, ...] = ()
 
     @property
     def signed_in(self) -> bool:
@@ -199,6 +215,8 @@ def load(home_dir: Optional[Path] = None, *, from_config: bool = True) -> Settin
         home=home_dir,
         source=team_from if team_from == key_from else "+".join(w for w in (team_from, key_from) if w),
         team_skills=pick(TEAM_SKILLS_ENV)[0].lower() not in OFF_VALUES,
+        personal_profile=pick(PERSONAL_PROFILE_ENV)[0].lower() in ON_VALUES,
+        personal_jobs=tuple(j.strip() for j in pick(PERSONAL_JOBS_ENV)[0].split(JOBS_SEPARATOR) if j.strip()),
     )
 
 
@@ -245,5 +263,18 @@ def config_schema() -> list[dict]:
             "description": "Load the skills teammates publish (off: only this profile's own)",
             "default": "on",
             "env_var": TEAM_SKILLS_ENV,
+        },
+        {
+            "key": "personal_profile",
+            "description": "on: this profile's conversations and traces are personal (your personal database, "
+                           "or this machine), never the team's",
+            "default": "off",
+            "env_var": PERSONAL_PROFILE_ENV,
+        },
+        {
+            "key": "personal_jobs",
+            "description": "Scheduled jobs (ids or names, comma-separated) whose runs and delivered output are "
+                           "personal, never the team's",
+            "env_var": PERSONAL_JOBS_ENV,
         },
     ]

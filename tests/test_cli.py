@@ -54,8 +54,9 @@ def test_status_counts_what_is_kept_here(home, tmp_path, capsys):
     m.handle_tool_call("infino_remember", {"content": "my dentist is Tuesday", "scope": "personal"})
     assert run("status") == 0
     out = capsys.readouterr().out
-    assert "memory         1 rows" in out.split("personal memory")[0]
-    assert "memory         1 rows" in out.split("personal memory")[1]
+    team, personal = out.split("\npersonal ", 1)  # the person's own tables come second
+    assert "memory         1 rows" in team
+    assert "memory         1 rows" in personal and "conversations  0 rows" in personal
     assert "memory vectors on (local model)" in out
 
 
@@ -143,7 +144,7 @@ def test_login_keeps_a_personal_database(home, platform, tmp_path, terminal):
     terminal("yes")
     assert run("login", "--url", platform.url, "--team-database", TEAM_DB, "--personal-database", "me") == 0
     assert config.read_credentials(tmp_path)["personal_database"] == "me"
-    assert set(platform.databases["me"]) == {tables.MEMORY}
+    assert set(platform.databases["me"]) == set(tables.PERSONAL)
 
 
 def test_the_upload_notice_says_what_goes_and_what_stays():
