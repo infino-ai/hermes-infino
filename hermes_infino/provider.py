@@ -68,6 +68,13 @@ LOCAL_PLATFORMS = ("cli", "tui", "local", "")
 SETTINGS_RECHECK_S = 30.0
 # How much of the user's message finds the turn's start in the message list.
 TURN_KEY_CHARS = 200
+# The run Hermes starts a provider in: a person's own session. The others are
+# "subagent", "cron" and "flush".
+PRIMARY_CONTEXT = "primary"
+# The runs the memory tools write from. The agent calls a tool on purpose, so a
+# subagent or a scheduled job saving what it found writes like a session does.
+# A flush run is Hermes saving its own memory before compaction: not here.
+TOOL_WRITE_CONTEXTS = (PRIMARY_CONTEXT, "subagent", "cron")
 
 SYSTEM_PROMPT = (
     "Team memory is kept in Infino. Relevant memories are added to your context before each turn. "
@@ -158,6 +165,7 @@ class InfinoMemoryProvider(MemoryProvider):
         self._ready = threading.Event()        # the local tables exist: writes may go
         self._caught_up = threading.Event()    # the start's cloud (or model) work is done
         self._writes_enabled = False
+        self._agent_context = PRIMARY_CONTEXT
         self._profile = ""
         self._platform = ""
         self._author = ""
@@ -202,8 +210,10 @@ class InfinoMemoryProvider(MemoryProvider):
         self._author = str((self._settings.author if local else "") or kwargs.get("user_name")
                            or kwargs.get("user_id") or (self._profile if local else ""))
         note_identity(session_id, self._author, self._profile)
-        # Subagents, cron and flush runs read memory but never write it.
-        self._writes_enabled = kwargs.get("agent_context", "primary") == "primary"
+        # Turns and built-in memory are captured in a person's own session only,
+        # as Hermes asks of providers; the memory tools follow TOOL_WRITE_CONTEXTS.
+        self._agent_context = str(kwargs.get("agent_context") or PRIMARY_CONTEXT)
+        self._writes_enabled = self._agent_context == PRIMARY_CONTEXT
         spawn_context_thread(self._ensure_tables, name="infino-ensure-tables").start()
 
     def _bind(self, settings: config.Settings) -> None:
@@ -506,8 +516,10 @@ class InfinoMemoryProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         if not self._settings:
             return json.dumps({"ok": False, "error": "not configured"})
-        if not self._writes_enabled:
-            return json.dumps({"ok": False, "error": "writes are off in this agent context"})
+        if self._agent_context not in TOOL_WRITE_CONTEXTS:
+            return json.dumps({"ok": False, "error": f"Infino's memory tools do not write from a Hermes "
+                                                     f"'{self._agent_context}' run; they write from a session, "
+                                                     "a subagent or a cron job"})
         try:
             chat = chats.current()  # read here, on the turn's thread
             if tool_name in ("infino_remember", "infino_forget"):

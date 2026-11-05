@@ -151,16 +151,37 @@ def test_builtin_memory_writes_are_mirrored(env, platform, tmp_path):
     assert platform.rows(TEAM_DB, tables.MEMORY)[0]["origin"] == "builtin:memory"
 
 
-def test_subagents_do_not_write(env, platform, tmp_path):
-    mgr, provider = make_manager(tmp_path, agent_context="subagent")
-    out = json.loads(mgr.handle_tool_call("infino_remember", {"content": "x"}))
-    assert out["ok"] is False
+@pytest.mark.parametrize("context", ["subagent", "cron", "flush"])
+def test_only_a_persons_session_captures_turns_and_builtin_memory(env, platform, tmp_path, context):
+    mgr, provider = make_manager(tmp_path, agent_context=context)
     provider.sync_turn("a", "b", session_id="s1")
     provider.on_memory_write("add", "memory", "y")
     provider.shutdown()
     assert platform.rows(TEAM_DB, tables.MEMORY) == []
     assert platform.rows(TEAM_DB, tables.CONVERSATIONS) == []
     assert local_rows(tmp_path, tables.MEMORY) == []
+
+
+@pytest.mark.parametrize("context", ["subagent", "cron"])
+def test_the_memory_tools_write_from_subagents_and_cron_jobs(env, platform, tmp_path, context):
+    mgr, provider = make_manager(tmp_path, agent_context=context)
+    out = json.loads(mgr.handle_tool_call("infino_remember", {"content": "weekly report: 5 sessions"}))
+    assert out == {"ok": True, "scope": "team"}
+    provider.shutdown()
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["weekly report: 5 sessions"]
+    out = json.loads(mgr.handle_tool_call("infino_forget", {"content": "weekly report: 5 sessions"}))
+    assert out["ok"] and out["matched"] == 1
+    provider.shutdown()
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+
+
+def test_a_flush_run_refuses_the_memory_tools_and_says_why(env, platform, tmp_path):
+    mgr, provider = make_manager(tmp_path, agent_context="flush")
+    out = json.loads(mgr.handle_tool_call("infino_remember", {"content": "x"}))
+    assert out["ok"] is False
+    assert "'flush' run" in out["error"] and "cron job" in out["error"]
+    provider.shutdown()
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
 
 
 def test_busy_table_is_retried(env, platform):
