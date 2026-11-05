@@ -13,7 +13,7 @@ flowchart LR
   P --> M[(Personal database)]
   T -- "relevant memories,<br/>before each turn" --> H
   M -- "relevant memories,<br/>before each turn" --> H
-  T -- "find, search, sql, read" --> C[Infino tools]
+  T -- "search, find, sql, ask" --> C[Infino tools]
   C --> H
 ```
 
@@ -75,7 +75,7 @@ flowchart LR
   R2 --> PM
 ```
 
-Which chat a message comes from, and whether that chat is a group, comes from Hermes. With Hermes's channel memory, its setting for the chat decides, including whether someone may write to the owner's personal memory from a group. Without channel memory, every chat except a direct message counts as a group.
+Which chat a message comes from, and whether that chat is a group, comes from Hermes: every chat Hermes does not treat as a direct message counts as a group, and no one writes to the owner's personal memory from a group. Hermes's proposed channel memory ([#144822](https://github.com/NousResearch/hermes-agent/pull/144822)) is supported too: in a Hermes that has it, its setting for the chat decides, including whether someone may write to the owner's personal memory from a group.
 
 **The tools are not separated by chat.** Recall keeps each chat's notes to that chat, but the Infino tools search the whole team database, so an agent can find another chat's notes and conversations with them. Separating chats in the tools needs per-chat permissions, which this version does not have.
 
@@ -84,10 +84,10 @@ Which chat a message comes from, and whether that chat is a group, comes from He
 ```mermaid
 flowchart LR
   H[Hermes] -- every write --> L[(Local database<br/>on your machine)]
-  L -- "sync: a few seconds after each write,<br/>and at the end of each session<br/>(only after you sign in)" --> C[(Team database<br/>in Infino Cloud)]
+  L -- "sync: a few seconds after each write,<br/>and before Hermes exits<br/>(only after you sign in)" --> C[(Team database<br/>in Infino Cloud)]
 ```
 
-**Without an account**, everything is stored under `$HERMES_HOME/infino/` using the Infino engine. Each memory is embedded on your machine with all-MiniLM-L6-v2 (384 dimensions). Recall uses both keyword search and vector search. Nothing leaves your machine.
+**Without an account**, everything is stored under `$HERMES_HOME/infino/` using the Infino engine. Each memory is embedded on your machine with all-MiniLM-L6-v2 (384 dimensions). Recall uses both keyword search and vector search; while the model is still loading (or could not be downloaded), it uses keyword search alone. Nothing leaves your machine.
 
 **After you sign in**:
 - Every row is still written to your machine first. A sync then sends it to the cloud.
@@ -99,10 +99,16 @@ flowchart LR
 ## The Infino tools
 
 Hermes runs the Infino client as an MCP server, started by `hermes infino mcp` (from `mcp_servers.infino` in `config.yaml`). Each time it starts, it checks whether you are signed in:
-- **Not signed in:** the tools (`find`, `search`, `sql`, `read`) search the database on your machine.
-- **Signed in:** the same tools search the team's database in the cloud, plus anything else the cloud offers.
+- **Not signed in:** `search`, `find`, `sql` and `read`, over the database on your machine.
+- **Signed in:** `ask`, `search`, `find`, `sql` and `join_keys`, over the team's database in the cloud. `ask` is Infino's retrieval agent: it runs the searches and joins for a question and returns the rows it found, with where they came from.
 
 The API key is passed to the client in its environment, never on its command line. Hermes does not show an MCP server's instructions to the model, so the plugin adds them to the system prompt.
+
+Hermes's tool search, on by default, shows the model only each MCP tool's name and the first sentence of its description until the model asks for more. To give the model the Infino tools' full descriptions up front, turn it off:
+
+```bash
+hermes config set tools.tool_search.enabled off
+```
 
 ## Install
 
@@ -140,7 +146,7 @@ hermes config set mcp_servers.infino.connect_timeout 120
 
 Hermes starts the tools with `hermes infino mcp`, inside its own environment, where the plugin's dependencies are, and on the Node its installer keeps (`INFINO_NODE` in the same `env` block picks another).
 
-**4. Use it.** Start `hermes` as usual. Everything is kept on your machine until you sign in. The first start downloads the embedding model from Hugging Face in the background (about 90 MB, once); memories saved before it is there are found by keyword, and embedded at the next start.
+**4. Use it.** Start `hermes` as usual. Everything is kept on your machine until you sign in. The first start downloads the embedding model from Hugging Face in the background (about 90 MB, once). Until it is ready, memories are found by keyword, and the ones saved meanwhile are embedded as soon as it is.
 
 ## Signing in
 
@@ -180,7 +186,7 @@ mcp_servers:
     connect_timeout: 120
 ```
 
-With Hermes's [Remote Config](https://github.com/NousResearch/hermes-agent/pull/122509), the same keys come from the config service instead of a file, so an administrator sets the team database once, at the team (group) level, and every agent on the team starts with it. Remote Config refuses a key written out in full, so `INFINO_API_KEY` stays a `${INFINO_API_KEY}` reference, and the key goes in each profile's `.env`. `hermes infino status` says where the settings came from ("from the config").
+With Hermes's [Remote Config](https://github.com/NousResearch/hermes-agent/pull/122509) (on Hermes's main branch, not yet in a release), the same keys come from the config service instead of a file, so an administrator sets the team database once, at the team (group) level, and every agent on the team starts with it. Remote Config refuses a key written out in full, so `INFINO_API_KEY` stays a `${INFINO_API_KEY}` reference, and the key goes in each profile's `.env`. `hermes infino status` says where the settings came from ("from the config").
 
 ```mermaid
 flowchart LR
@@ -219,4 +225,4 @@ From a Hermes checkout, with its environment activated (`source ./activate`) and
 PYTHONPATH=$PWD:$PYTHONPATH python -m pytest tests
 ```
 
-The tests use Hermes's own `MemoryManager`, the real Infino engine for the local database (with a stand-in for the embedding model), and a fake Infino Cloud.
+There is one test file per module (`tests/test_<module>.py`), plus `tests/test_plugin.py`, which runs the plugin end to end. The tests use Hermes's own `MemoryManager`, the real Infino engine for the local database (with a stand-in for the embedding model), and a fake Infino Cloud.
