@@ -4,7 +4,9 @@ A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that store
 
 It saves four things: memory, conversations, traces and skills. Before each turn it gives the agent the memories that matter for that turn. The agent can also search everything with the Infino tools.
 
-You don't need an account. Without one, everything stays in a database on your machine. When you sign in, everything is copied to your team's database in Infino Cloud, and new data keeps going there.
+You don't need an Infino account. Without one, everything is kept in a database on your machine, and nothing leaves it.
+
+With an Infino account, your team shares a database in Infino Cloud, so every agent on the team can search what the others did. `hermes infino login` creates a free account, or joins your team's with a key a teammate gives you. From then on, the plugin uploads what it has kept on your machine so far, then each new memory, conversation, trace and skill as it happens. Your machine keeps its own copy. Personal memory never goes to the team database.
 
 ```mermaid
 flowchart LR
