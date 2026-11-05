@@ -1,5 +1,5 @@
 name: infino
-version: 0.4.0
+version: 0.5.0
 description: "Infino as the backend for Hermes: memory, conversations, traces and skills in an Infino database on this machine, and in the team's Infino Cloud database once signed in (`hermes infino login`), read by the Infino client's MCP tools."
 author: "Infino"
 homepage: "https://github.com/infino-ai/hermes-infino"
@@ -31,6 +31,9 @@ optional_env:
     password: false
   - name: INFINO_MCP_SERVER
     description: "The Infino client's name under mcp_servers (default infino)"
+    password: false
+  - name: INFINO_TEAM_SKILLS
+    description: "off: do not load the skills teammates publish (default on)"
     password: false
 hooks:
   - prefetch

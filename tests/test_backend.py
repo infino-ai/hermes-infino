@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import fcntl
 import time
 
 import pytest
 
-from hermes_infino import backend, config, recall, tables
+from hermes_infino import backend, config, embed, mirror, recall, tables
 from hermes_infino.backend import Backend
 
-from .helpers import TEAM_DB, personal_rows, sign_in, wait_for
+from .helpers import TEAM_DB, fake_embed, personal_rows, sign_in, wait_for
 
 # How long the stand-in sync below takes after it has read its rows.
 SLOW_SYNC_S = 0.5
@@ -99,9 +100,30 @@ def test_signed_in_queries_go_to_the_cloud(cloud_backend, platform):
     assert set(cloud_backend.table_names()) == set(tables.ALL)
 
 
-@pytest.mark.xfail(strict=True, reason="a write made while a sync is running is pushed only if it is newer than "
-                                       "SYNC_DELAY_S when that sync ends; after a long sync it waits for the next "
-                                       "write or the session's end")
+def test_a_sync_another_process_held_off_runs_again(cloud_backend, platform, tmp_path):
+    with open(config.state_dir(tmp_path) / mirror.LOCK_FILE, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)  # another process is syncing
+        cloud_backend.append(tables.MEMORY, [{"content": "written meanwhile"}])
+        time.sleep(SLOW_SYNC_S)
+        assert platform.rows(TEAM_DB, tables.MEMORY) == []
+        fcntl.flock(f, fcntl.LOCK_UN)
+    assert wait_for(lambda: len(platform.rows(TEAM_DB, tables.MEMORY)) == 1)
+
+
+def test_a_local_start_embeds_memories_saved_without_a_vector(home, tmp_path):
+    b = backend.for_settings(config.load(tmp_path))
+    b.ensure()
+
+    def broken(texts):
+        raise OSError("offline")
+
+    embed.use(broken)
+    b.append(tables.MEMORY, [{"content": "kept without a vector"}])
+    embed.use(fake_embed)
+    b.ensure()
+    assert b.local.query_sql("SELECT count(*) AS n FROM memory_vectors")[0]["n"] == 1
+
+
 def test_a_write_during_a_long_sync_is_pushed_after_it(cloud_backend, platform, monkeypatch):
     real = cloud_backend.mirror.sync
     calls = []

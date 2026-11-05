@@ -79,18 +79,63 @@ def test_a_signed_in_team_with_no_skills_table_loads_none(home, platform, tmp_pa
     settings = sign_in(tmp_path, platform)
     platform.databases[TEAM_DB] = {}
     assert skills.register_team_skills(Ctx(), settings, home=tmp_path) == []
-    assert requests_to(platform, "query_sql") == 0
+    assert requests_to(platform, "query_sql") == 1  # one request, no list of tables first
 
 
 def test_the_newest_version_of_each_skill_is_written_and_registered(home, platform, tmp_path):
     settings = sign_in(tmp_path, platform)
     publish(platform, {"name": "deploy", "content": "v1", "created_ms": 1},
-            {"name": "deploy", "content": "v2", "description": "Ship it.", "created_ms": 2},
+            {"name": "deploy", "content": "v2", "description": "Ship it.", "author": "alice", "created_ms": 2},
             {"name": "triage", "content": "t1", "created_ms": 1})
     ctx = Ctx()
     assert skills.register_team_skills(ctx, settings, home=tmp_path) == ["deploy", "triage"]
-    assert ctx.registered == [("deploy", "v2", "Ship it."), ("triage", "t1", "")]
+    assert ctx.registered == [("deploy", "v2", "Ship it. (team skill published by alice)"),
+                              ("triage", "t1", "(team skill)")]
     assert (tmp_path / skills.CACHE_DIR / "deploy" / "SKILL.md").read_text() == "v2"
+
+
+def test_a_platform_that_does_not_answer_loads_the_last_copies(home, platform, tmp_path):
+    settings = sign_in(tmp_path, platform)
+    publish(platform, {"name": "deploy", "content": "v2", "description": "Ship it.", "author": "alice",
+                       "created_ms": 2})
+    skills.register_team_skills(Ctx(), settings, home=tmp_path)
+    platform.close()
+    ctx = Ctx()
+    assert skills.register_team_skills(ctx, settings, home=tmp_path) == ["deploy"]
+    assert ctx.registered == [("deploy", "v2", "Ship it. (team skill published by alice)")]
+
+
+def test_a_copy_without_its_note_reads_the_description_from_the_skill(home, platform, tmp_path):
+    settings = sign_in(tmp_path, platform)
+    copy = tmp_path / skills.CACHE_DIR / "release-checklist" / "SKILL.md"
+    copy.parent.mkdir(parents=True)
+    copy.write_text(SKILL_MD)
+    platform.close()
+    ctx = Ctx()
+    skills.register_team_skills(ctx, settings, home=tmp_path)
+    assert ctx.registered == [("release-checklist", SKILL_MD, "Steps before a release. (team skill)")]
+
+
+def test_team_skills_turned_off_load_nothing_and_ask_nothing(home, platform, tmp_path):
+    home.setenv("INFINO_TEAM_SKILLS", "off")
+    settings = sign_in(tmp_path, platform)
+    publish(platform, {"name": "deploy", "content": "v2", "created_ms": 2})
+    before = requests_to(platform, "query_sql")
+    assert skills.register_team_skills(Ctx(), settings, home=tmp_path) == []
+    assert requests_to(platform, "query_sql") == before
+
+
+def test_the_load_waits_briefly(home, platform, tmp_path, monkeypatch):
+    waits = []
+    settings = sign_in(tmp_path, platform)
+
+    def query(sql, timeout_s=None):
+        waits.append(timeout_s)
+        raise TimeoutError("slow platform")
+
+    monkeypatch.setattr(skills.backend.Backend, "query", lambda self, sql, timeout_s=None: query(sql, timeout_s))
+    assert skills.register_team_skills(Ctx(), settings, home=tmp_path) == []
+    assert waits == [skills.LOAD_TIMEOUT_S] and skills.LOAD_TIMEOUT_S <= 2.0
 
 
 def test_one_refused_skill_does_not_stop_the_rest(home, platform, tmp_path):

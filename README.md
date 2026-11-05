@@ -23,8 +23,8 @@ flowchart LR
 | --- | --- |
 | `memory` | Everything written to Hermes's `MEMORY.md` and `USER.md`, and everything saved with the `infino_remember` tool. `infino_forget` deletes a memory. |
 | `conversations` | Every message in every session, and who sent it. Tool calls and tool results are in their own columns. |
-| `traces` | Every model call (model, provider, tokens, time taken) and every tool call (name, arguments, result, status, time taken). |
-| `skills` | Skills shared with `infino_publish_skill`. Once signed in, every profile on the team can use them, as read-only `infino:<name>` skills. |
+| `traces` | Every model call (model, provider, tokens, time taken) and every tool call (name, arguments, result, status, time taken). Secrets in arguments and results are masked the way Hermes masks what it hands any memory plugin. |
+| `skills` | Skills shared with `infino_publish_skill`. Once signed in, every profile on the team can use them, as read-only `infino:<name>` skills whose description says who published them. `INFINO_TEAM_SKILLS=off` keeps a profile to its own skills. |
 
 A conversation turn and its traces share a `session_id` and `turn_id`, so you can join them. Every row has a `row_id`.
 
@@ -136,7 +136,7 @@ hermes config set mcp_servers.infino.connect_timeout 120
 
 Hermes starts the tools with `hermes infino mcp`, inside its own environment, where the plugin's dependencies are, and on the Node its installer keeps (`INFINO_NODE` in the same `env` block picks another).
 
-**4. Use it.** Start `hermes` as usual. Everything is kept on your machine until you sign in. The first time a memory is saved or searched, the embedding model is downloaded from Hugging Face (about 90 MB, once).
+**4. Use it.** Start `hermes` as usual. Everything is kept on your machine until you sign in. The first start downloads the embedding model from Hugging Face in the background (about 90 MB, once); memories saved before it is there are found by keyword, and embedded at the next start.
 
 ## Signing in
 
@@ -205,6 +205,7 @@ The config block comes first because Hermes starts the Infino tools with that bl
 | `INFINO_AUTHOR` | Who this profile's messages and memories are from, when Hermes doesn't say. In a chat, the sender is always the author, and a message with no sender is saved without one. |
 | `INFINO_MCP_SERVER` | The client's name under `mcp_servers` (default `infino`). Environment only, since it names the config block. |
 | `INFINO_URL` | The Infino Cloud URL (default `https://api.platform.infino.ws`) |
+| `INFINO_TEAM_SKILLS` | `off` stops this profile loading the skills teammates publish (default on) |
 
 ## Development
 

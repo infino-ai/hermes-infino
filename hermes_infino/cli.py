@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+import urllib.error
 from pathlib import Path
 
 from . import config
@@ -53,7 +54,11 @@ def infino_command(args: argparse.Namespace) -> int:
         return {"status": _status, "login": _login, "sync": _sync, "mcp": _mcp}[action](args)
     except InfinoError as e:
         print(f"infino: the platform refused: {e}", file=sys.stderr)
-        return 1
+    except urllib.error.URLError as e:
+        print(f"infino: could not reach the platform: {e.reason}", file=sys.stderr)
+    except TimeoutError:
+        print("infino: the platform did not answer in time", file=sys.stderr)
+    return 1
 
 
 # -- status -------------------------------------------------------------------
@@ -87,10 +92,10 @@ def _status(args) -> int:
     marks = b.mirror.marks()
     for src in b.mirror.sources():
         try:
-            behind = len(src.store.rows_after(src.table, marks[src.mark], int(time.time() * 1000), 1_000_000))
+            behind = src.store.count_after(src.table, marks.get(src.mark), int(time.time() * 1000))
         except Exception:
             behind = "?"
-        print(f"   {src.mark:<16} {behind} rows not in {src.database} yet")
+        print(f"   {src.table:<14} {behind} rows not in {src.database} yet")
     if not settings.personal_database:
         print("   personal memory stays on this machine (no personal database)")
     if b.mirror.last_error():
@@ -162,7 +167,11 @@ def _login(args) -> int:
         if trial.get("console_url"):
             print(f"   manage it at {trial['console_url']}")
     else:
-        api_key = Path(args.api_key_file).expanduser().read_text().strip()
+        try:
+            api_key = Path(args.api_key_file).expanduser().read_text().strip()
+        except OSError as e:
+            print(f"infino: cannot read the key file: {e}", file=sys.stderr)
+            return 1
         client = InfinoClient(api_key, url)
         client.list_databases()  # the key works before anything is stored
         client.ensure_database(database)
@@ -219,19 +228,20 @@ def _catch_up(settings: config.Settings) -> int:
 
     deadline = time.monotonic() + CATCH_UP_S
     total = 0
+    last_pass = False
     while True:
         try:
-            pushed = b.mirror.sync(wait=True, progress=show)
+            pushed = sum(b.mirror.sync(wait=True, progress=show).values())
         except Exception as e:
             print(f"\nThe cloud stopped accepting rows: {e}\nThey are kept here; `hermes infino sync` resumes.",
                   file=sys.stderr)
             return 1
-        total += sum(pushed.values())
-        # Rows from the last few seconds are left for the next pass.
-        if not sum(pushed.values()) or time.monotonic() > deadline:
+        total += pushed
+        if last_pass:
             break
+        # Rows from the last few seconds are left for the next pass; one more,
+        # once they have settled, takes them.
+        last_pass = not pushed or time.monotonic() > deadline
         time.sleep(SETTLE_MS / 1000)
-    time.sleep(SETTLE_MS / 1000)
-    total += sum(b.mirror.sync(wait=True, progress=show).values())
     print(f"\nThe cloud has everything kept here ({total} rows pushed).")
     return 0

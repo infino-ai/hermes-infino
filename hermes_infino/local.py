@@ -18,6 +18,10 @@ checks for the table, so a process that started before the sign-up stops
 embedding too. Local recall is then keyword-only, over this machine's own
 rows, which is all the local copy holds.
 
+A memory is saved before its vector: when the model cannot run (offline on
+first use, before it is downloaded) the memory is kept and found by keyword,
+and the next start embeds every memory that has no vector yet.
+
 Every call opens its own connection: an open connection keeps the snapshot
 it opened with and never sees a commit another process made after it (the
 Hermes gateway and a CLI session can share a profile), and opening one on a
@@ -57,6 +61,12 @@ VECTORS = "memory_vectors"
 RRF_K = 60
 # How many more candidates each side of a fused search fetches than it returns.
 FUSION_DEPTH = 3
+# The farthest a vector-only hit may be from the question (cosine distance, 1 -
+# similarity). A nearest-neighbour search always returns its k nearest, related
+# or not; measured with this model, questions about a memory scored 0.22-0.88
+# similarity and unrelated or mismatched ones 0.0-0.25, so 0.2 similarity keeps
+# every related pair seen and drops most of the rest.
+MAX_VECTOR_DISTANCE = 0.8
 
 _ARROW_TYPES = {
     "utf8": pa.utf8(),
@@ -163,7 +173,10 @@ class LocalStore:
         schema = arrow_schema(table)
 
         def attempt():
-            stored = _now_ms()  # stamped per attempt: commit order is what the mirror follows
+            # Stamped per attempt: commit order is what the mirror follows. Past
+            # every row already committed, so a clock stepped back never stamps a
+            # row behind the mirror's mark (where it would never be pushed).
+            stored = max(_now_ms(), self._latest_stored(table) + 1)
             columns = {
                 f.name: pa.array([stored] * len(batch) if f.name == tables.STORED else [r.get(f.name) for r in batch],
                                  f.type)
@@ -173,7 +186,26 @@ class LocalStore:
 
         self._retry(attempt)
         if table == tables.MEMORY and self.has_vectors():
-            self._append_vectors(batch)
+            try:
+                self._append_vectors(batch)
+            except Exception as e:  # the memories are saved; they get vectors at the next start
+                logger.warning("infino: %d memories saved without vectors (found by keyword until the next "
+                               "start embeds them): %s", len(batch), e)
+
+    def _latest_stored(self, table: str) -> int:
+        found = self.query_sql(f"SELECT max({tables.STORED}) AS top FROM {table}")
+        return int(found[0]["top"] or 0) if found else 0
+
+    def backfill_vectors(self) -> int:
+        """Embed the memories saved without a vector (the model could not run
+        then); how many. Local mode only."""
+        if not self.has_vectors():
+            return 0
+        missing = self.query_sql(f"SELECT {tables.ROW_ID}, {tables.MEMORY_TEXT_COLUMN} FROM {tables.MEMORY} "
+                                 f"WHERE {tables.ROW_ID} NOT IN (SELECT {tables.ROW_ID} FROM {VECTORS})")
+        for start in range(0, len(missing), APPEND_BATCH):
+            self._append_vectors(missing[start:start + APPEND_BATCH])
+        return len(missing)
 
     def _append_vectors(self, batch: list[dict[str, Any]]) -> None:
         """The batch's vectors, after its rows: a memory whose vector never
@@ -195,10 +227,12 @@ class LocalStore:
         found = self.query_sql(f"SELECT {', '.join(dict.fromkeys((tables.ROW_ID,) + columns))} "
                                f"FROM {table} WHERE {predicate}")
         if found:
-            self._retry(lambda: self._connect().open_table(table).delete(predicate))
+            # By id, not by the predicate again: a matching row another process
+            # commits in between is not deleted here without being reported.
+            by_id = f"{tables.ROW_ID} IN ({', '.join(tables.sql_string(str(r[tables.ROW_ID])) for r in found)})"
+            self._retry(lambda: self._connect().open_table(table).delete(by_id))
             if table == tables.MEMORY and self.has_vectors():
-                ids = ", ".join(tables.sql_string(str(r[tables.ROW_ID])) for r in found)
-                self._retry(lambda: self._connect().open_table(VECTORS).delete(f"{tables.ROW_ID} IN ({ids})"))
+                self._retry(lambda: self._connect().open_table(VECTORS).delete(by_id))
         return found
 
     def _retry(self, op):
@@ -227,8 +261,9 @@ class LocalStore:
         if not self.has_vectors():
             return keyword[:k]
         [vector] = embed.embedder()([query])
-        nearest = db.open_table(VECTORS).vector_search(
-            tables.EMBEDDING_COLUMN, vector, k * FUSION_DEPTH, None, None, None, [tables.ROW_ID]).to_pylist()
+        nearest = [r for r in db.open_table(VECTORS).vector_search(
+            tables.EMBEDDING_COLUMN, vector, k * FUSION_DEPTH, None, None, None, [tables.ROW_ID, "score"]).to_pylist()
+            if r["score"] <= MAX_VECTOR_DISTANCE]
         fused: dict[str, float] = {}
         for ranked in (keyword, nearest):
             for rank, r in enumerate(ranked):
@@ -251,10 +286,24 @@ class LocalStore:
         in (stored_ms, row_id) order, without the local-only vector."""
         schema, _ = tables.TEAM_TABLES[table]
         cols = ", ".join(f'"{f["name"]}"' for f in schema if f["type"] != "embedding")
-        where = f"{tables.STORED} <= {int(until_ms)}"
-        if mark is not None:
-            ms, row_id = int(mark[0]), tables.sql_string(mark[1])
-            where += (f" AND ({tables.STORED} > {ms} OR "
-                      f"({tables.STORED} = {ms} AND {tables.ROW_ID} > {row_id}))")
-        return self.query_sql(f"SELECT {cols} FROM {table} WHERE {where} "
+        return self.query_sql(f"SELECT {cols} FROM {table} WHERE {_after(mark, until_ms)} "
                               f"ORDER BY {tables.STORED}, {tables.ROW_ID} LIMIT {int(limit)}")
+
+    def count_after(self, table: str, mark: Optional[tuple[int, str]], until_ms: int) -> int:
+        """How many rows `rows_after` would give with no limit."""
+        found = self.query_sql(f"SELECT count(*) AS n FROM {table} WHERE {_after(mark, until_ms)}")
+        return int(found[0]["n"]) if found else 0
+
+    def has_row(self, table: str, row_id: str) -> bool:
+        found = self.query_sql(f"SELECT count(*) AS n FROM {table} WHERE {tables.ROW_ID} = {tables.sql_string(row_id)}")
+        return bool(found and found[0]["n"])
+
+
+def _after(mark: Optional[tuple[int, str]], until_ms: int) -> str:
+    """Rows stored at or before `until_ms` and after `mark`, in (stored_ms, row_id) order."""
+    where = f"{tables.STORED} <= {int(until_ms)}"
+    if mark is not None:
+        ms, row_id = int(mark[0]), tables.sql_string(mark[1])
+        where += (f" AND ({tables.STORED} > {ms} OR "
+                  f"({tables.STORED} = {ms} AND {tables.ROW_ID} > {row_id}))")
+    return where

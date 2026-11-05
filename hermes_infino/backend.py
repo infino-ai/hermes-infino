@@ -10,7 +10,8 @@ or nowhere when the person has none.
 One backend per profile home, shared by the memory provider, the trace hooks
 and the skills loader. Writes land locally and return; when signed in they
 also schedule a sync, which runs on a background thread once the rows have
-settled (`mirror.SETTLE_MS`), at most one at a time.
+settled (`mirror.SETTLE_MS`), at most one at a time. A write made while a
+sync runs, or a sync that found another process syncing, schedules one more.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from . import config, recall, tables
+from . import config, embed, recall, tables
 from .client import InfinoClient
 from .local import PERSONAL_DB_DIR, LocalStore
 from .mirror import PERSONAL_MEMORY, SETTLE_MS, Mirror
@@ -45,6 +46,8 @@ class Backend:
         self._timer: Optional[threading.Timer] = None
         self._timer_lock = threading.Lock()
         self._last_write = 0.0
+        # A sync was asked for while one was pending or running.
+        self._again = False
 
     @property
     def signed_in(self) -> bool:
@@ -52,7 +55,9 @@ class Backend:
 
     def ensure(self) -> None:
         """Create what is missing: the local tables (with local vectors only
-        in local mode) and, signed in, the cloud tables; then catch up."""
+        in local mode) and, signed in, the cloud tables; then catch up: push
+        to the cloud, or, in local mode, load the model and embed the
+        memories saved while it could not run."""
         self.local.ensure_tables(with_vectors=not self.signed_in)
         self.personal.ensure_tables(with_vectors=not self.signed_in, only=(tables.MEMORY,))
         self._move_personal_memory()
@@ -61,6 +66,15 @@ class Backend:
             self.personal.drop_vectors()
             self.mirror.ensure_cloud_tables()
             self.schedule_sync(delay_s=0)
+            return
+        try:
+            # Loaded here, at start, so a first memory never waits on the download.
+            embed.embedder()
+            n = self.local.backfill_vectors() + self.personal.backfill_vectors()
+            if n:
+                logger.info("infino: embedded %d memories saved without vectors", n)
+        except Exception as e:
+            logger.warning("infino: the local model is not available (memories are found by keyword): %s", e)
 
     def _move_personal_memory(self) -> None:
         """Personal memories an older version kept in the team's local
@@ -111,22 +125,26 @@ class Backend:
             return
         with self._timer_lock:
             if self._timer is not None and self._timer.is_alive():
-                return  # the pending sync will see these rows too, or reschedule
+                # The pending or running sync may have read its rows already: one more after it.
+                self._again = True
+                return
             self._timer = threading.Timer(delay_s, self._sync_quietly)
             self._timer.daemon = True
             self._timer.start()
 
     def _sync_quietly(self) -> None:
+        skipped = False
         try:
             pushed = self.mirror.sync()
+            skipped = pushed == {}  # another process holds the sync: it may not see these rows
             if any(pushed.values()):
                 logger.info("infino: pushed %s", {t: n for t, n in pushed.items() if n})
         except Exception as e:
             logger.warning("infino: sync to the cloud stopped (the rows stay local and go next time): %s", e)
-        # Rows written while this sync ran were too new for it.
-        if time.monotonic() - self._last_write < SYNC_DELAY_S:
-            with self._timer_lock:
-                self._timer = None
+        with self._timer_lock:
+            again, self._again = self._again or skipped, False
+            self._timer = None
+        if again:
             self.schedule_sync()
 
     def flush(self) -> None:

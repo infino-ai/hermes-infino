@@ -344,7 +344,7 @@ def test_a_published_skill_loads_in_every_profile(env, platform, tmp_path):
             registered.append((name, path.read_text(), description))
 
     assert skills.register_team_skills(Ctx(), config.load(other), home=other) == ["release-checklist"]
-    assert registered == [("release-checklist", SKILL_MD, "Steps before a release.")]
+    assert registered == [("release-checklist", SKILL_MD, "Steps before a release. (team skill)")]
 
 
 def test_newest_skill_version_wins():
@@ -542,12 +542,13 @@ def test_signing_in_pushes_everything_kept_locally(home, platform, tmp_path):
 def test_the_tool_server_follows_the_sign_in(home, platform, tmp_path):
     from hermes_infino import mcp_launch
 
-    argv, env = mcp_launch.client_command(config.load(tmp_path), "/c/cli.js", "node", "/empty")
+    db = str(local(tmp_path).path)
+    argv, env = mcp_launch.client_command(config.load(tmp_path), "/c/cli.js", "node", "/empty", db)
     assert argv == ["node", "/c/cli.js", "mcp"]
-    assert env["CX_LOCAL_DB"] == str(tmp_path / "infino" / "db") and "INFINO_API_KEY" not in env
+    assert env["CX_LOCAL_DB"] == db and "INFINO_API_KEY" not in env
 
     config.write_credentials({"url": platform.url, "api_key": "secret-key", "team_database": TEAM_DB}, tmp_path)
-    argv, env = mcp_launch.client_command(config.load(tmp_path), "/c/cli.js", "node", "/empty")
+    argv, env = mcp_launch.client_command(config.load(tmp_path), "/c/cli.js", "node", "/empty", db)
     assert argv[:5] == ["node", "/c/cli.js", "mcp", "--db", f"{platform.url}/{TEAM_DB}"]
     assert "secret-key" not in " ".join(argv)  # the key is never on a command line
     assert env["INFINO_API_KEY"] == "secret-key" and "CX_LOCAL_DB" not in env

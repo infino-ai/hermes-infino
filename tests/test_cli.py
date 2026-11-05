@@ -154,7 +154,19 @@ def test_the_upload_notice_says_what_goes_and_what_stays():
     assert "nothing yet" in cli._upload_notice("https://x", TEAM_DB, {}, new_account=False)
 
 
-@pytest.mark.xfail(strict=True, reason="only the platform's refusals (InfinoError) are caught: an unreachable "
-                                       "platform ends `hermes infino login` with a Python traceback")
-def test_login_to_an_unreachable_platform_reports_it(home, tmp_path, no_terminal, key_file):
+def test_login_to_an_unreachable_platform_reports_it(home, tmp_path, no_terminal, key_file, capsys):
     assert run("login", "--url", DEAD_URL, "--api-key-file", str(key_file), "--team-database", TEAM_DB, "--yes") == 1
+    assert "could not reach the platform" in capsys.readouterr().err
+    assert config.read_credentials(tmp_path) == {}
+
+
+def test_login_with_a_key_file_that_is_not_there(home, platform, tmp_path, no_terminal, capsys):
+    assert run("login", "--url", platform.url, "--api-key-file", str(tmp_path / "missing.key"),
+               "--team-database", TEAM_DB, "--yes") == 1
+    assert "cannot read the key file" in capsys.readouterr().err
+
+
+def test_sync_to_an_unreachable_platform_reports_it(home, tmp_path, capsys):
+    config.write_credentials({"url": DEAD_URL, "api_key": "k", "team_database": TEAM_DB}, tmp_path)
+    assert run("sync") == 1
+    assert "could not reach the platform" in capsys.readouterr().err

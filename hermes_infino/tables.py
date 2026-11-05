@@ -168,4 +168,5 @@ def ensure_all(client: InfinoClient, database: str, personal: bool = False) -> N
         missing = [f["name"] for f in schema if f["type"] != "embedding" and f["name"] not in have]
         if missing:
             raise OutdatedTable(f"{database}.{table} has no {', '.join(missing)}: it was created by an older "
-                                f"hermes-infino; drop it (its rows are kept on each machine and pushed again)")
+                                f"hermes-infino; drop it, and each machine pushes the rows it keeps to the new "
+                                f"table at its next start")

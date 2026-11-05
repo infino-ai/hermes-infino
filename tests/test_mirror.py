@@ -42,12 +42,14 @@ def conversation_rows(n: int) -> list[dict]:
 
 
 def test_the_sources_are_the_teams_tables(m):
-    assert [(s.mark, s.table, s.database) for s in m.sources()] == [(t, t, TEAM_DB) for t in tables.ALL]
+    assert [(s.mark, s.table, s.database) for s in m.sources()] == [(f"{TEAM_DB}/{t}", t, TEAM_DB)
+                                                                    for t in tables.ALL]
 
 
 def test_a_personal_database_adds_the_personal_source(home, platform, tmp_path):
     m = make_mirror(tmp_path, sign_in(tmp_path, platform, personal_database=PERSONAL_DB))
-    assert (mirror.PERSONAL_MEMORY, tables.MEMORY, PERSONAL_DB) in [(s.mark, s.table, s.database) for s in m.sources()]
+    assert (f"{PERSONAL_DB}/{mirror.PERSONAL_MEMORY}", tables.MEMORY, PERSONAL_DB) in [
+        (s.mark, s.table, s.database) for s in m.sources()]
     assert set(platform.databases[PERSONAL_DB]) == {tables.MEMORY}
 
 
@@ -56,12 +58,13 @@ def test_rows_go_in_batches_and_the_mark_moves_with_each(m, platform, monkeypatc
     m.local.append(tables.CONVERSATIONS, conversation_rows(ROWS))
     seen = []
     pushed = m.sync(wait=True, progress=lambda mark, n: seen.append((mark, n)))
-    assert pushed[tables.CONVERSATIONS] == ROWS
+    mark = m.mark_of(tables.CONVERSATIONS)
+    assert pushed[mark] == ROWS
     assert requests_to(platform, "append") == 3  # 3 + 3 + 1
-    assert seen == [(tables.CONVERSATIONS, 3), (tables.CONVERSATIONS, 6), (tables.CONVERSATIONS, 7)]
+    assert seen == [(mark, 3), (mark, 6), (mark, 7)]
     last = max(m.local.query_sql("SELECT stored_ms, row_id FROM conversations"),
                key=lambda r: (r[tables.STORED], r[tables.ROW_ID]))
-    assert m.marks()[tables.CONVERSATIONS] == (last[tables.STORED], last[tables.ROW_ID])
+    assert m.marks()[mark] == (last[tables.STORED], last[tables.ROW_ID])
 
 
 def test_a_second_sync_pushes_nothing(m, platform):
@@ -76,7 +79,7 @@ def test_rows_inside_the_settle_window_wait(m, platform, monkeypatch):
     m.local.append(tables.MEMORY, [{"content": "just written"}])
     assert sum(m.sync(wait=True).values()) == 0
     monkeypatch.setattr(mirror, "SETTLE_MS", 0)
-    assert m.sync(wait=True)[tables.MEMORY] == 1
+    assert m.sync(wait=True)[m.mark_of(tables.MEMORY)] == 1
 
 
 def test_a_sync_skips_while_another_holds_the_lock(m, platform):
@@ -85,13 +88,78 @@ def test_a_sync_skips_while_another_holds_the_lock(m, platform):
         fcntl.flock(f, fcntl.LOCK_EX)
         assert m.sync() == {}
         fcntl.flock(f, fcntl.LOCK_UN)
-    assert m.sync()[tables.MEMORY] == 1
+    assert m.sync()[m.mark_of(tables.MEMORY)] == 1
 
 
 def test_an_unreadable_state_file_starts_over(m, platform):
     (m.dir / mirror.STATE_FILE).write_text("not json")
-    assert set(m.marks().values()) == {None}
+    assert m.marks() == {}
     assert m.last_error() == ""
+
+
+def test_marks_an_older_version_kept_by_table_carry_over(m, platform):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "old", "content": "pushed by the older version"}])
+    [row] = m.local.query_sql("SELECT stored_ms, row_id FROM memory")
+    (m.dir / mirror.STATE_FILE).write_text(json.dumps(
+        {"marks": {tables.MEMORY: [row[tables.STORED], "old"], mirror.PERSONAL_MEMORY: [1, "x"]}}))
+    assert m.marks() == {m.mark_of(tables.MEMORY): (row[tables.STORED], "old")}  # no personal database here
+    assert m.sync(wait=True)[m.mark_of(tables.MEMORY)] == 0
+    assert set(json.loads((m.dir / mirror.STATE_FILE).read_text())["marks"]) == {m.mark_of(tables.MEMORY)}
+
+
+def test_a_big_batch_is_cut_to_fit_one_append(m, platform, monkeypatch):
+    # Each row's JSON is a little over 1,000 bytes: two fit, three do not.
+    monkeypatch.setattr(mirror, "PUSH_MAX_BYTES", 3_000)
+    m.local.append(tables.CONVERSATIONS, [{"seq": i, "content": "x" * 1_000} for i in range(5)])
+    m.sync(wait=True)
+    assert requests_to(platform, "append") == 3  # 2 + 2 + 1
+    assert len(platform.rows(TEAM_DB, tables.CONVERSATIONS)) == 5
+
+
+def test_one_row_larger_than_the_cap_still_goes(m, platform, monkeypatch):
+    monkeypatch.setattr(mirror, "PUSH_MAX_BYTES", 10)
+    m.local.append(tables.MEMORY, [{"content": "longer than ten bytes"}])
+    m.sync(wait=True)
+    assert len(platform.rows(TEAM_DB, tables.MEMORY)) == 1
+
+
+def test_an_append_that_reached_the_cloud_before_failing_is_not_sent_again(m, platform, monkeypatch):
+    m.local.append(tables.CONVERSATIONS, conversation_rows(3))
+    real = m.client.append
+
+    def times_out_after_storing(db, table, rows):
+        real(db, table, rows)
+        raise TimeoutError("the answer never came")
+
+    monkeypatch.setattr(m.client, "append", times_out_after_storing)
+    with pytest.raises(TimeoutError):
+        m.sync(wait=True)
+    monkeypatch.setattr(m.client, "append", real)
+    m.local.append(tables.CONVERSATIONS, conversation_rows(1))
+    m.sync(wait=True)
+    assert sorted(r["content"] for r in platform.rows(TEAM_DB, tables.CONVERSATIONS)) == ["m0", "m0", "m1", "m2"]
+    assert len({r["row_id"] for r in platform.rows(TEAM_DB, tables.CONVERSATIONS)}) == 4
+
+
+def test_a_mark_whose_row_was_forgotten_is_kept(m, platform):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "a", "content": "kept"}, {tables.ROW_ID: "z", "content": "gone"}])
+    m.sync(wait=True)
+    gone = m.local.delete(tables.MEMORY, "row_id = 'z'")
+    m.forget(tables.MEMORY, TEAM_DB, [r[tables.ROW_ID] for r in gone])
+    m.sync(wait=True)
+    m.ensure_cloud_tables()  # the mark's row is gone from both: not a lost table
+    m.sync(wait=True)
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["kept"]
+
+
+def test_a_table_another_machine_made_again_gets_this_machines_rows(m, platform):
+    m.local.append(tables.MEMORY, [{"content": "this machine's"}])
+    m.sync(wait=True)
+    platform.databases[TEAM_DB][tables.MEMORY] = [{"row_id": "theirs", "content": "another machine's"}]
+    m.ensure_cloud_tables()
+    m.sync(wait=True)
+    assert sorted(r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)) == ["another machine's",
+                                                                                  "this machine's"]
 
 
 def test_the_state_file_is_replaced_whole(m, platform):
@@ -167,18 +235,18 @@ def test_a_forget_goes_to_the_database_it_names(home, platform, tmp_path):
 
 # -- where the marks point ---------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason="marks are kept per table, not per (database, table): a profile moved to "
-                                       "another team database never pushes its earlier rows there")
 def test_a_new_team_database_gets_every_row(m, platform, tmp_path):
     m.local.append(tables.MEMORY, [{"content": "kept before the move"}])
     m.sync(wait=True)
     moved = make_mirror(tmp_path, sign_in(tmp_path, platform, team=ANOTHER_TEAM_DB))
     moved.sync(wait=True)
     assert [r["content"] for r in platform.rows(ANOTHER_TEAM_DB, tables.MEMORY)] == ["kept before the move"]
+    # Each database keeps its own progress: moving back sends nothing twice.
+    back = make_mirror(tmp_path, sign_in(tmp_path, platform))
+    back.sync(wait=True)
+    assert len(platform.rows(TEAM_DB, tables.MEMORY)) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="tables.OutdatedTable says to drop the cloud table and its rows are 'pushed "
-                                       "again', but the marks stay past them, so a recreated table stays empty")
 def test_a_dropped_and_recreated_cloud_table_is_filled_again(m, platform, tmp_path):
     m.local.append(tables.MEMORY, [{"content": "kept on this machine"}])
     m.sync(wait=True)

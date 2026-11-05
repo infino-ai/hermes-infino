@@ -28,6 +28,8 @@ first.
                              (default `infino`), whose instructions this plugin
                              hands the model; read from the environment only,
                              since it names the config block
+- INFINO_TEAM_SKILLS         `off` stops this profile loading the skills its
+                             teammates publish (default on)
 
 A variable that is set wins over the sign-in, so a deployment's `.env` is
 never overridden by a file on the machine.
@@ -49,6 +51,11 @@ try:  # Hermes's profile-scoped secret lookup; plain env outside Hermes.
     from agent.secret_scope import get_secret as _get_secret
 except ImportError:  # pragma: no cover - only outside a Hermes install
     _get_secret = None
+try:  # Hermes's home for the profile running now: a gateway serving several
+    # profiles sets it per turn, not in the process environment.
+    from hermes_constants import get_hermes_home as _get_hermes_home
+except ImportError:  # pragma: no cover - only outside a Hermes install
+    _get_hermes_home = None
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +65,11 @@ PERSONAL_DB_ENV = "INFINO_PERSONAL_DATABASE"
 URL_ENV = "INFINO_URL"
 AUTHOR_ENV = "INFINO_AUTHOR"
 MCP_SERVER_ENV = "INFINO_MCP_SERVER"
+TEAM_SKILLS_ENV = "INFINO_TEAM_SKILLS"
 
 DEFAULT_MCP_SERVER = "infino"
+# Values of INFINO_TEAM_SKILLS that turn the team's skills off.
+OFF_VALUES = ("off", "false", "no", "0")
 # A `${VAR}` reference Hermes left as written: its variable is not set.
 UNRESOLVED_REF = re.compile(r"^\$\{[^}]*\}$")
 
@@ -72,6 +82,9 @@ CREDENTIALS_MODE = 0o600
 
 
 def home() -> Path:
+    """The home of the profile running now, as Hermes resolves it."""
+    if _get_hermes_home is not None:
+        return Path(_get_hermes_home())
     return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 
 
@@ -102,11 +115,10 @@ def tools_env(server: str, home_dir: Path) -> dict:
     Remote Config by importing it)."""
     try:
         from hermes_cli.config import cfg_get, load_config_readonly
-        from hermes_constants import get_hermes_home
     except ImportError:
         return {}
     try:
-        if Path(get_hermes_home()).resolve() != Path(home_dir).resolve():
+        if _get_hermes_home is None or home().resolve() != Path(home_dir).resolve():
             return {}
         env = cfg_get(load_config_readonly(), "mcp_servers", server, "env")
     except Exception as e:  # an unreadable config must not take memory down with it
@@ -129,7 +141,9 @@ def write_credentials(creds: dict, home_dir: Optional[Path] = None) -> Path:
     path = state_dir(home_dir) / CREDENTIALS_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, CREDENTIALS_MODE)
+    # A file left by a crash keeps its own mode through os.open: start a new one.
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, CREDENTIALS_MODE)
     with os.fdopen(fd, "w") as f:
         json.dump(creds, f, indent=2)
     os.replace(tmp, path)
@@ -148,6 +162,8 @@ class Settings:
     # Where the key and team database came from: "config", "environment",
     # "sign-in", or "" when there are none.
     source: str = ""
+    # Whether the skills teammates publish load in this profile.
+    team_skills: bool = True
 
     @property
     def signed_in(self) -> bool:
@@ -182,6 +198,7 @@ def load(home_dir: Optional[Path] = None, *, from_config: bool = True) -> Settin
         mcp_server=server,
         home=home_dir,
         source=team_from if team_from == key_from else "+".join(w for w in (team_from, key_from) if w),
+        team_skills=pick(TEAM_SKILLS_ENV)[0].lower() not in OFF_VALUES,
     )
 
 
@@ -222,5 +239,11 @@ def config_schema() -> list[dict]:
             "description": "Infino platform URL",
             "default": DEFAULT_URL,
             "env_var": URL_ENV,
+        },
+        {
+            "key": "team_skills",
+            "description": "Load the skills teammates publish (off: only this profile's own)",
+            "default": "on",
+            "env_var": TEAM_SKILLS_ENV,
         },
     ]

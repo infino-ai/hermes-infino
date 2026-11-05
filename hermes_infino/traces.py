@@ -5,6 +5,11 @@ the conversation they belong to.
 Rows are buffered per session and written once per turn (Hermes's plugin
 `on_session_end` hook fires at each turn's end), so a turn with ten tool
 calls is one append, not eleven. No OpenTelemetry collector is involved.
+
+Hermes scrubs secrets from everything it hands a memory provider, but these
+hooks get tool arguments and results as the tool saw them. So every text
+cell is put through the same scrub (`redact_for_egress`) before it is kept:
+a key a tool printed never reaches the team's database.
 """
 
 from __future__ import annotations
@@ -13,23 +18,42 @@ import json
 import logging
 import threading
 import time
+from collections import OrderedDict
 from typing import Any
 
 from agent.memory_provider import spawn_context_thread
 
 from . import backend, config, tables
 
+try:  # Hermes's scrub for anything leaving the agent.
+    from agent.redact import redact_for_egress as _scrub
+except ImportError:  # pragma: no cover - a Hermes without it scrubs nothing here either
+    def _scrub(text: str) -> str:
+        return text
+
 logger = logging.getLogger(__name__)
 
 # Longest args/result text kept per trace row.
 MAX_TRACE_CELL_CHARS = 4_000
+# Sessions whose turn and person are remembered; a long-running gateway sees
+# many, and only the latest few are still running.
+MAX_SESSIONS = 1_024
 
 
 def _clip(value: Any) -> str:
-    if value is None:
+    """A cell's text: scrubbed of secrets, then cut (so no secret is cut in half and kept)."""
+    if value is None or value == "":
         return ""
-    s = value if isinstance(value, str) else json.dumps(value, default=str)
+    s = _scrub(value if isinstance(value, str) else json.dumps(value, default=str))
     return s if len(s) <= MAX_TRACE_CELL_CHARS else s[:MAX_TRACE_CELL_CHARS]
+
+
+def _remember(table: OrderedDict, session_id: str, value) -> None:
+    """Note a session's latest value, forgetting the oldest sessions past MAX_SESSIONS."""
+    table[session_id] = value
+    table.move_to_end(session_id)
+    while len(table) > MAX_SESSIONS:
+        table.popitem(last=False)
 
 
 def _tokens(usage: Any) -> tuple[int, int, int]:
@@ -54,7 +78,7 @@ def _tokens(usage: Any) -> tuple[int, int, int]:
 # The turn each session's latest model or tool call belonged to, so the
 # provider's `conversations` rows carry the same `turn_id` as the turn's
 # `traces` rows (Hermes hands the id to these hooks, not to `sync_turn`).
-_last_turn: dict[str, str] = {}
+_last_turn: OrderedDict[str, str] = OrderedDict()
 _last_turn_lock = threading.Lock()
 
 
@@ -68,12 +92,12 @@ def last_turn_id(session_id: str) -> str:
 # the trace hooks no user identity; the memory provider learns it (at
 # `initialize`, and per turn in `sync_turn`, which Hermes calls before the
 # turn-end hook that flushes a turn's traces) and notes it here.
-_identity: dict[str, tuple[str, str]] = {}
+_identity: OrderedDict[str, tuple[str, str]] = OrderedDict()
 
 
 def note_identity(session_id: str, author: str, profile: str) -> None:
     with _last_turn_lock:
-        _identity[session_id or ""] = (author, profile)
+        _remember(_identity, session_id or "", (author, profile))
 
 
 def _identity_of(session_id: str) -> tuple[str, str]:
@@ -91,7 +115,7 @@ class TraceRecorder:
             self._buffers.setdefault(session_id or "", []).append(row)
         if row["turn_id"]:
             with _last_turn_lock:
-                _last_turn[session_id or ""] = row["turn_id"]
+                _remember(_last_turn, session_id or "", row["turn_id"])
 
     def on_api(self, **kw: Any) -> None:
         inp, out, cached = _tokens(kw.get("usage"))

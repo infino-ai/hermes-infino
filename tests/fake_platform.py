@@ -184,7 +184,17 @@ class FakePlatform:
             hits.sort(key=lambda h: -h["score"])
             return 200, {"data": hits[: body["k"]]}, None
         if op == "query_sql":
-            # Only the statement the plugin runs: the skills table's rows.
-            m = re.match(r"SELECT .* FROM (\w+)", body["query"])
-            return 200, {"data": list(tables.get(m.group(1), []))}, None
+            # Only the statements the plugin runs: a table's rows (the skills
+            # load), and rows or a count by row_id (the mirror's checks).
+            m = re.match(r"SELECT (.*?) FROM (\w+)(?: WHERE row_id (?:= (.*)|IN \((.*)\)))?", body["query"])
+            if m.group(2) not in tables:
+                return 400, {"error": f"table '{m.group(2)}' not found"}, None
+            rows = list(tables[m.group(2)])
+            wanted = m.group(3) or m.group(4)
+            if wanted is not None:
+                ids = {v.replace("''", "'") for v in re.findall(r"'((?:[^']|'')*)'", wanted)}
+                rows = [r for r in rows if r.get("row_id") in ids]
+            if m.group(1).startswith("count(*)"):
+                return 200, {"data": [{"n": len(rows)}]}, None
+            return 200, {"data": rows}, None
         return 404, {"error": f"no route {op}"}, None

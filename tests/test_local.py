@@ -177,16 +177,61 @@ def test_a_vector_whose_memory_is_gone_is_not_recalled(store):
     assert store.search_memory("deploy freeze", 5, PROJECTION) == []
 
 
-def test_a_memory_whose_vector_never_landed_is_still_found_by_keyword(store):
+def test_a_memory_saved_while_the_model_cannot_run_is_kept_and_found_by_keyword(store):
     def broken(texts):
         raise RuntimeError("model unavailable")
 
     embed.use(broken)
-    with pytest.raises(RuntimeError):
-        store.append(tables.MEMORY, [{"content": "deploy freeze starts December 20"}])
+    store.append(tables.MEMORY, [{"content": "deploy freeze starts December 20"}])
     embed.use(fake_embed)
     assert [h["content"] for h in store.search_memory("deploy freeze", 5, PROJECTION)] == [
         "deploy freeze starts December 20"]
+    assert store.backfill_vectors() == 1
+    assert store.backfill_vectors() == 0  # each memory once
+    assert store.query_sql(f"SELECT count(*) AS n FROM {VECTORS}")[0]["n"] == 1
+
+
+def test_without_vectors_there_is_nothing_to_backfill(keyword_store):
+    keyword_store.append(tables.MEMORY, [{"content": "x"}])
+    assert keyword_store.backfill_vectors() == 0
+
+
+def test_an_unrelated_question_recalls_nothing(store):
+    store.append(tables.MEMORY, [{"content": "the deploy freeze starts December 20"}])
+    assert store.search_memory("lunch menu tomorrow", 5, PROJECTION) == []
+
+
+def test_a_clock_stepped_back_never_stamps_behind_a_committed_row(store, monkeypatch):
+    store.append(tables.CONVERSATIONS, [{"content": "first"}])
+    [first] = store.query_sql("SELECT stored_ms FROM conversations")
+    monkeypatch.setattr(local_mod, "_now_ms", lambda: first[tables.STORED] - 60_000)
+    store.append(tables.CONVERSATIONS, [{"content": "after the clock moved back"}])
+    later = store.query_sql("SELECT stored_ms FROM conversations WHERE content = 'after the clock moved back'")
+    assert later[0][tables.STORED] > first[tables.STORED]
+
+
+def test_a_delete_takes_only_the_rows_it_found(store, monkeypatch):
+    store.append(tables.MEMORY, [{tables.ROW_ID: "1", "content": "same words"}])
+    real = store.query_sql
+
+    def another_process_commits_meanwhile(sql):
+        out = real(sql)
+        if sql.startswith("SELECT row_id FROM memory WHERE content"):
+            LocalStore(store.path).append(tables.MEMORY, [{tables.ROW_ID: "2", "content": "same words"}])
+        return out
+
+    monkeypatch.setattr(store, "query_sql", another_process_commits_meanwhile)
+    assert ids(store.delete(tables.MEMORY, "content = 'same words'")) == ["1"]
+    assert ids(real("SELECT row_id FROM memory")) == ["2"]  # still here, and still to be pushed
+
+
+def test_rows_after_and_their_count_agree(store):
+    store.append(tables.CONVERSATIONS, [{tables.ROW_ID: i, "content": i} for i in ("a", "b", "c")])
+    [stored] = {r[tables.STORED] for r in store.query_sql("SELECT stored_ms FROM conversations")}
+    for mark in (None, (stored, "a"), (stored, "c")):
+        assert store.count_after(tables.CONVERSATIONS, mark, stored) == len(
+            store.rows_after(tables.CONVERSATIONS, mark, stored, 100))
+    assert store.has_row(tables.CONVERSATIONS, "b") and not store.has_row(tables.CONVERSATIONS, "nope")
 
 
 # -- commit races ----------------------------------------------------------------

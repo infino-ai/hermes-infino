@@ -8,10 +8,11 @@ import sys
 
 import pytest
 
-from hermes_infino import config, embed, provider as provider_mod, tables
+from hermes_infino import backend, config, embed, provider as provider_mod, tables
+from hermes_infino.local import VECTORS
 from hermes_infino.provider import InfinoMemoryProvider
 
-from .helpers import SKILL_MD, local_rows, make_manager, personal_rows
+from .helpers import SKILL_MD, fake_embed, local, local_rows, make_manager, personal_rows
 
 TOOLS = ("infino_remember", "infino_forget", "infino_publish_skill")
 
@@ -222,20 +223,37 @@ def test_a_published_skill_is_kept_locally_without_an_account(mgr, tmp_path):
     assert row["content"] == SKILL_MD and row["description"] == "Steps before a release."
 
 
-# -- known bugs ----------------------------------------------------------------------
+# -- scope, resumed sessions, and a model that cannot run ------------------------------
 
-@pytest.mark.xfail(strict=True, reason="scope is not checked against its enum: a model sending 'Personal' or "
-                                       "'private' saves a private memory into the team's database")
-@pytest.mark.parametrize("scope", ["Personal", "private"])
+@pytest.mark.parametrize("scope", ["Personal", "private", "everyone"])
 def test_a_scope_outside_the_enum_never_lands_in_the_teams_database(mgr, tmp_path, scope):
     m, _ = mgr
     out = call(m, "infino_remember", content="my home address is 1 Main St", scope=scope)
     assert out["ok"] is False or local_rows(tmp_path, tables.MEMORY) == []
 
 
-@pytest.mark.xfail(strict=True, reason="messages already stored are counted per process: a resumed session (or a "
-                                       "gateway agent rebuilt for it) stores the whole history again; seen in the "
-                                       "demo, where Alice's resumed session holds its first turn three times")
+def test_a_scope_in_another_case_is_understood(mgr, tmp_path):
+    m, _ = mgr
+    assert call(m, "infino_remember", content="my dentist is Tuesday", scope=" Personal ") == {
+        "ok": True, "scope": "personal"}
+    assert [r["content"] for r in personal_rows(tmp_path)] == ["my dentist is Tuesday"]
+
+
+def test_an_unknown_scope_is_refused_by_name(mgr, tmp_path):
+    m, _ = mgr
+    out = call(m, "infino_forget", content="x", scope="private")
+    assert out == {"ok": False, "error": "scope must be 'team' or 'personal', not 'private'"}
+
+
+def test_a_turn_without_its_messages_continues_the_sessions_count(mgr, tmp_path):
+    _, p = mgr
+    p.sync_turn("one", "two", session_id="s1")
+    p.sync_turn("three", "four", session_id="s1")
+    p._drain()
+    assert [(r["seq"], r["content"]) for r in turn_rows(tmp_path)] == [(0, "one"), (1, "two"), (2, "three"),
+                                                                     (3, "four")]
+
+
 def test_a_resumed_session_stores_each_message_once(home, tmp_path):
     history = [{"role": "user", "content": "run the tests"}, {"role": "assistant", "content": "2 fail"}]
     _, first = make_manager(tmp_path, session_id="s1")
@@ -250,8 +268,6 @@ def test_a_resumed_session_stores_each_message_once(home, tmp_path):
         (0, "run the tests"), (1, "2 fail"), (2, "fix it"), (3, "fixed")]
 
 
-@pytest.mark.xfail(strict=True, reason="the memory row commits before its vector; when embedding fails the tool "
-                                       "says it failed although the memory was saved, so the model saves it again")
 def test_a_remember_that_reports_failure_saved_nothing(mgr, tmp_path):
     m, _ = mgr
 
@@ -261,3 +277,29 @@ def test_a_remember_that_reports_failure_saved_nothing(mgr, tmp_path):
     embed.use(broken)
     out = call(m, "infino_remember", content="the deploy freeze starts December 20")
     assert out["ok"] or local_rows(tmp_path, tables.MEMORY) == []
+
+
+def test_a_memory_saved_while_the_model_could_not_run_is_embedded_at_the_next_start(home, tmp_path):
+    def broken(texts):
+        raise OSError("no network to download the model")
+
+    m, _ = make_manager(tmp_path)
+    embed.use(broken)
+    assert call(m, "infino_remember", content="the deploy freeze starts December 20")["ok"]
+    store = local(tmp_path)
+    assert store.query_sql(f"SELECT count(*) AS n FROM {VECTORS}")[0]["n"] == 0
+    embed.use(fake_embed)
+    backend._backends.clear()
+    make_manager(tmp_path)  # the next start
+    assert store.query_sql(f"SELECT count(*) AS n FROM {VECTORS}")[0]["n"] == 1
+
+
+def test_a_start_without_the_model_still_starts(home, tmp_path):
+    def broken(texts):
+        raise OSError("no network to download the model")
+
+    embed.use(broken)
+    m, p = make_manager(tmp_path)
+    assert call(m, "infino_remember", content="the deploy freeze starts December 20")["ok"]
+    embed.use(fake_embed)
+    assert "deploy freeze" in p.prefetch("deploy freeze")

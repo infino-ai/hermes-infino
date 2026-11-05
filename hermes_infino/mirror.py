@@ -16,6 +16,18 @@ any process pushes its rows.
 nearly `stored_ms` order; a sync leaves the last `SETTLE_MS` alone, so a row
 still committing in another process is not passed by the mark.
 
+A mark belongs to one cloud database and table (`<database>/<table>`): a
+profile moved to another team database pushes everything there. And a mark
+is dropped when the cloud has lost the row it points at while this machine
+still has it - the cloud table was dropped and made again - so the new table
+gets this machine's rows. (A forgotten memory is deleted here too, so its
+mark never looks lost.)
+
+A batch whose append failed may still have reached the cloud (a timeout after
+the platform committed it). So after a sync that stopped, the next one first
+asks the cloud which of its first batch's rows it has, and sends only the
+rest: an append is never sent twice.
+
 A memory deleted locally (`infino_forget`, or Hermes replacing a built-in
 memory) is deleted in the cloud by its `row_id`s, from a small queue applied
 after each sync's pushes: by id, so a memory saved again later is never
@@ -50,14 +62,29 @@ LOCK_FILE = "mirror.lock"
 SETTLE_MS = 2_000
 # Rows per cloud append.
 PUSH_BATCH = 200
+# The most JSON one append carries: a conversation row can hold three 20,000
+# character cells, and a request that large risks the client's timeout.
+PUSH_MAX_BYTES = 2_000_000
 # Row ids per cloud delete.
 FORGET_BATCH = 100
-# The mark of the personal memory source (the team's are their tables' names).
+# The personal memory source (the team's are named by their tables).
 PERSONAL_MEMORY = "personal_memory"
+# What each team table's mark was called before marks named their database.
+LEGACY_MARKS = (*tables.ALL, PERSONAL_MEMORY)
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _fit(rows: list[dict]) -> list[dict]:
+    """The leading rows whose JSON fits one append (PUSH_MAX_BYTES), at least one."""
+    size = 0
+    for i, r in enumerate(rows):
+        size += len(json.dumps(r, default=str))
+        if size > PUSH_MAX_BYTES and i:
+            return rows[:i]
+    return rows
 
 
 @dataclass(frozen=True)
@@ -81,16 +108,42 @@ class Mirror:
 
     # -- where rows go -------------------------------------------------------
 
+    def mark_of(self, source: str) -> str:
+        """The mark of a source: a team table's name, or PERSONAL_MEMORY."""
+        if source == PERSONAL_MEMORY:
+            return f"{self.settings.personal_database}/{PERSONAL_MEMORY}"
+        return f"{self.settings.team_database}/{source}"
+
     def sources(self) -> list[Source]:
-        out = [Source(t, self.local, t, self.settings.team_database) for t in tables.ALL]
+        out = [Source(self.mark_of(t), self.local, t, self.settings.team_database) for t in tables.ALL]
         if self.settings.personal_database:
-            out.append(Source(PERSONAL_MEMORY, self.personal, tables.MEMORY, self.settings.personal_database))
+            out.append(Source(self.mark_of(PERSONAL_MEMORY), self.personal, tables.MEMORY,
+                              self.settings.personal_database))
         return out
 
     def ensure_cloud_tables(self) -> None:
         tables.ensure_all(self.client, self.settings.team_database)
         if self.settings.personal_database:
             tables.ensure_all(self.client, self.settings.personal_database, personal=True)
+        self._drop_lost_marks()
+
+    def _drop_lost_marks(self) -> None:
+        """Forget each mark whose row the cloud no longer has while this
+        machine does: its cloud table was dropped and made again."""
+        with self._lock(wait=True):
+            marks = self.marks()
+            lost = []
+            for src in self.sources():
+                mark = marks.get(src.mark)
+                if mark is None or not src.store.has_row(src.table, mark[1]):
+                    continue
+                where = f"{tables.ROW_ID} = {tables.sql_string(mark[1])}"
+                found = self.client.query_sql(src.database, f"SELECT count(*) AS n FROM {src.table} WHERE {where}")
+                if not (found and found[0].get("n")):
+                    lost.append(src.mark)
+            if lost:
+                logger.info("infino: the cloud lost %s; pushing this machine's rows again", ", ".join(lost))
+                self._save_marks({k: v for k, v in marks.items() if k not in lost}, self.last_error())
 
     # -- state ---------------------------------------------------------------
 
@@ -101,9 +154,17 @@ class Mirror:
             return {}
         return state if isinstance(state, dict) else {}
 
-    def marks(self) -> dict[str, Optional[tuple[int, str]]]:
+    def marks(self) -> dict[str, tuple[int, str]]:
+        """Every mark kept, by `<database>/<source>`. Marks an older version kept
+        by table name alone were for the team database it had then, which is
+        taken to be today's."""
         raw = self._state().get("marks", {})
-        return {k: (tuple(raw[k]) if raw.get(k) else None) for k in (*tables.ALL, PERSONAL_MEMORY)}
+        raw = raw if isinstance(raw, dict) else {}
+        out = {k: (int(v[0]), str(v[1])) for k, v in raw.items() if v and k not in LEGACY_MARKS}
+        for legacy in LEGACY_MARKS:
+            if raw.get(legacy) and (legacy != PERSONAL_MEMORY or self.settings.personal_database):
+                out.setdefault(self.mark_of(legacy), (int(raw[legacy][0]), str(raw[legacy][1])))
+        return out
 
     def last_error(self) -> str:
         """Why the last sync stopped, or empty when it finished."""
@@ -141,18 +202,23 @@ class Mirror:
             if not held:
                 return {}
             marks = self.marks()
+            # The last sync stopped: its last batch may have reached the cloud anyway.
+            uncertain = bool(self.last_error())
             until = _now_ms() - SETTLE_MS
             pushed = {}
             try:
                 for src in self.sources():
                     pushed[src.mark] = 0
+                    check = uncertain
                     while True:
-                        rows = src.store.rows_after(src.table, marks[src.mark], until, PUSH_BATCH)
+                        rows = _fit(src.store.rows_after(src.table, marks.get(src.mark), until, PUSH_BATCH))
                         if not rows:
                             break
+                        send = self._not_in_cloud(src, rows) if check else rows
+                        check = False
                         # The mark moves after each accepted batch, so a refused
                         # append never sends the rows before it again.
-                        self.client.append(src.database, src.table, rows)
+                        self.client.append(src.database, src.table, send)
                         marks[src.mark] = (int(rows[-1][tables.STORED]), str(rows[-1][tables.ROW_ID]))
                         self._save_marks(marks)
                         pushed[src.mark] += len(rows)
@@ -167,9 +233,17 @@ class Mirror:
             self._save_marks(marks)
             return pushed
 
-    def unsynced_after(self, mark: str) -> Optional[tuple[int, str]]:
-        """The mark a source's local rows must be past to be missing from the cloud."""
-        return self.marks()[mark]
+    def _not_in_cloud(self, src: Source, rows: list[dict]) -> list[dict]:
+        """The rows of a batch the cloud does not have."""
+        ids = ", ".join(tables.sql_string(str(r[tables.ROW_ID])) for r in rows)
+        have = {str(r.get(tables.ROW_ID)) for r in self.client.query_sql(
+            src.database, f"SELECT {tables.ROW_ID} FROM {src.table} WHERE {tables.ROW_ID} IN ({ids})")}
+        return [r for r in rows if str(r[tables.ROW_ID]) not in have]
+
+    def unsynced_after(self, source: str) -> Optional[tuple[int, str]]:
+        """The mark a source's local rows must be past to be missing from the
+        cloud; `source` is a team table's name or PERSONAL_MEMORY."""
+        return self.marks().get(self.mark_of(source))
 
     # -- forgets -------------------------------------------------------------
 

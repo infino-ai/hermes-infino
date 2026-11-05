@@ -89,6 +89,16 @@ def _text(content: Any) -> str:
     return content if isinstance(content, str) else ""
 
 
+def _scope(value: Any) -> Optional[str]:
+    """A tool's `scope`: "" when none was given, the scope in its canonical
+    spelling, or None when it names neither (a private memory must never land
+    in the team's database because the model spelled its scope its own way)."""
+    if value is None or value == "":
+        return ""
+    s = str(value).strip().lower()
+    return s if s in (TEAM, PERSONAL) else None
+
+
 def dependencies_missing() -> list[str]:
     """The local database's libraries this Python cannot import."""
     missing = []
@@ -111,7 +121,10 @@ class InfinoMemoryProvider(MemoryProvider):
         self._platform = ""
         self._author = ""
         self._session_id = ""
-        self._seen: dict[str, int] = {}        # session_id -> messages already appended
+        # session_id -> messages already stored. A session this process has not
+        # stored yet is looked up in the local database (stored_messages): a
+        # resumed session, or a gateway's rebuilt agent, starts after them.
+        self._seen: dict[str, int] = {}
         self._writer: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._last_recall: Optional[RecallStatus] = None
@@ -291,12 +304,13 @@ class InfinoMemoryProvider(MemoryProvider):
             # nobody named the turn is kept unattributed, never put on the owner.
             author = named or (turn_author or {}).get("id") or ""
         note_identity(session, author, self._profile)
+        start = self._seen[session] if session in self._seen else self._stored_messages(session)
         if messages:
-            start = self._seen.get(session, 0)
             new = messages[start:]
-            self._seen[session] = len(messages)
+            self._seen[session] = max(start, len(messages))
         else:
-            start, new = 0, [{"role": "user", "content": user_content}, {"role": "assistant", "content": assistant_content}]
+            new = [{"role": "user", "content": user_content}, {"role": "assistant", "content": assistant_content}]
+            self._seen[session] = start + len(new)
         turn = last_turn_id(session)
         # A tool message names its call, not always its tool: the call's tool is
         # on the assistant message that made it.
@@ -307,6 +321,20 @@ class InfinoMemoryProvider(MemoryProvider):
         rows = [r for r in rows if r["content"] or r["tool_name"]]
         if rows:
             self._run_write(self._append, tables.CONVERSATIONS, rows)
+
+    def _stored_messages(self, session: str) -> int:
+        """How many of a session's messages are stored already: one past the
+        highest `seq` this machine kept for it (0 for a new session)."""
+        assert self._backend is not None
+        self._ready.wait(READY_WAIT_S)
+        try:
+            found = self._backend.local.query_sql(
+                f"SELECT max(seq) AS top FROM {tables.CONVERSATIONS} WHERE session_id = {tables.sql_string(session)}")
+        except Exception as e:  # unreadable: count from the start, as a new session does
+            logger.warning("infino: could not read session %s's stored messages: %s", session, e)
+            return 0
+        top = found[0]["top"] if found else None
+        return 0 if top is None else int(top) + 1
 
     def _conversation_row(self, session: str, turn: str, seq: int, m: dict, author: str,
                           called: dict[str, str]) -> dict:
@@ -381,6 +409,11 @@ class InfinoMemoryProvider(MemoryProvider):
             return json.dumps({"ok": False, "error": "writes are off in this agent context"})
         try:
             chat = chats.current()  # read here, on the turn's thread
+            if tool_name in ("infino_remember", "infino_forget"):
+                asked = _scope(args.get("scope"))
+                if asked is None:
+                    return json.dumps({"ok": False, "error": f"scope must be '{TEAM}' or '{PERSONAL}', "
+                                                             f"not {args.get('scope')!r}"})
             self._ready.wait(READY_WAIT_S)
             if tool_name == "infino_remember":
                 if chat.group:
@@ -389,11 +422,11 @@ class InfinoMemoryProvider(MemoryProvider):
                     self._append(tables.MEMORY, [self._memory_row(str(args["content"]), TEAM, "remember", chat,
                                                                   "" if chat.owner_writes else sender)])
                     return json.dumps({"ok": True, "scope": "this group chat (and the team)"})
-                scope = args.get("scope") or self._default_scope()
+                scope = asked or self._default_scope()
                 self._append(tables.MEMORY, [self._memory_row(str(args["content"]), scope, "remember")])
                 return json.dumps({"ok": True, "scope": scope})
             if tool_name == "infino_forget":
-                scope = None if chat.group else args.get("scope")
+                scope = None if chat.group else (asked or None)
                 matched = self._forget(str(args["content"]), scope, chat)
                 return json.dumps({"ok": True, "scope": scope or "any", "matched": matched})
             if tool_name == "infino_publish_skill":

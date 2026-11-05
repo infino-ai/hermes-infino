@@ -6,10 +6,18 @@ Hermes registers a plugin's skill from a SKILL.md on disk, at plugin load
 version of each skill in the table is written under the profile's home
 (`cache/infino/team-skills/<name>/SKILL.md`) and registered from there.
 A skill published later loads in the next session.
+
+Every Hermes start waits on this, so the platform gets LOAD_TIMEOUT_S; when
+it does not answer, the copies written by the last load are registered.
+
+A team skill is text a teammate's agent wrote, loaded into every profile: its
+description says who published it, so the model and the person see where it
+came from, and INFINO_TEAM_SKILLS=off keeps a profile to its own skills.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -22,11 +30,13 @@ logger = logging.getLogger(__name__)
 
 # Where the team's skills are written under the profile's home.
 CACHE_DIR = Path("cache") / "infino" / "team-skills"
+# Beside each cached SKILL.md: its description and who published it.
+ABOUT_FILE = "infino.json"
 # Hermes's skill names: what `register_skill` accepts.
 SKILL_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
-# Seconds the load waits on the platform before the session starts without
-# the team's skills.
-LOAD_TIMEOUT_S = 5.0
+# Seconds the load waits on the platform before the session starts with the
+# copies the last load wrote.
+LOAD_TIMEOUT_S = 2.0
 # The most skill rows read at load.
 MAX_SKILL_ROWS = 2_000
 
@@ -43,32 +53,57 @@ def latest(rows: list[dict]) -> dict[str, dict]:
     return out
 
 
+def described(description: str, author: str) -> str:
+    """A team skill's description, saying who published it."""
+    by = f"(team skill published by {author})" if author else "(team skill)"
+    return f"{description} {by}".strip()
+
+
 def register_team_skills(ctx, settings: Optional[config.Settings] = None, home: Optional[Path] = None) -> list[str]:
     """Write the team's skills under the profile's home and register each; the
-    names registered. Never raises: a team with no skills, or a platform that
-    does not answer in time, starts the session without them. Without an
-    account there is no team: the only published skills are this profile's
-    own, which Hermes already loads."""
+    names registered. Never raises: a platform that does not answer in time
+    starts the session with the last load's copies. Without an account there
+    is no team: the only published skills are this profile's own, which
+    Hermes already loads."""
     settings = settings or config.load(home)
-    if not settings.signed_in:
-        return []
-    try:
-        b = backend.for_settings(settings)
-        if tables.SKILLS not in b.table_names():
-            return []
-        rows = b.query(f"SELECT name, description, content, created_ms FROM {tables.SKILLS} "
-                       f"ORDER BY created_ms DESC LIMIT {MAX_SKILL_ROWS}", timeout_s=LOAD_TIMEOUT_S)
-    except Exception as e:
-        logger.info("infino: team skills not loaded: %s", e)
+    if not settings.signed_in or not settings.team_skills:
         return []
     root = (home or settings.home) / CACHE_DIR
+    try:
+        rows = backend.for_settings(settings).query(
+            f"SELECT name, description, content, author, created_ms FROM {tables.SKILLS} "
+            f"ORDER BY created_ms DESC LIMIT {MAX_SKILL_ROWS}", timeout_s=LOAD_TIMEOUT_S)
+    except Exception as e:  # no answer in time, or no skills table yet
+        logger.info("infino: team skills read from the last load's copies: %s", e)
+        return _register_cached(ctx, root)
     registered = []
     for name, row in sorted(latest(rows).items()):
         try:
             path = root / name / "SKILL.md"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(str(row["content"]))
-            ctx.register_skill(name, path, str(row.get("description") or ""))
+            about = {"description": str(row.get("description") or ""), "author": str(row.get("author") or "")}
+            (path.parent / ABOUT_FILE).write_text(json.dumps(about))
+            ctx.register_skill(name, path, described(about["description"], about["author"]))
+            registered.append(name)
+        except Exception as e:
+            logger.info("infino: team skill %s not registered: %s", name, e)
+    return registered
+
+
+def _register_cached(ctx, root: Path) -> list[str]:
+    """Register the copies a previous load wrote; the names registered."""
+    registered = []
+    for path in sorted(root.glob("*/SKILL.md")) if root.is_dir() else []:
+        name = path.parent.name
+        if not SKILL_NAME.match(name):
+            continue
+        try:
+            about = json.loads((path.parent / ABOUT_FILE).read_text())
+        except (OSError, ValueError):
+            about = {"description": description_of(path.read_text()), "author": ""}
+        try:
+            ctx.register_skill(name, path, described(str(about.get("description") or ""), str(about.get("author") or "")))
             registered.append(name)
         except Exception as e:
             logger.info("infino: team skill %s not registered: %s", name, e)

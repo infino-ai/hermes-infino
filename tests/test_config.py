@@ -111,7 +111,6 @@ def test_the_sign_in_is_written_whole_and_private(home, tmp_path):
     assert not path.with_suffix(".tmp").exists()
 
 
-@pytest.mark.xfail(strict=True, reason="a .tmp left by a crash keeps its mode: os.open sets the mode only on create")
 def test_a_left_over_temporary_file_never_widens_the_sign_ins_mode(home, tmp_path):
     tmp = config.state_dir(tmp_path) / (Path(config.CREDENTIALS_FILE).stem + ".tmp")
     tmp.parent.mkdir(parents=True)
@@ -131,9 +130,6 @@ def test_without_hermes_home_the_home_is_the_users(home, monkeypatch):
     assert config.home() == Path.home() / ".hermes"
 
 
-@pytest.mark.xfail(strict=True, reason="config.home() reads HERMES_HOME from os.environ; Hermes sets a profile's "
-                                       "home context-locally (hermes_constants.get_hermes_home), so the trace hooks "
-                                       "and the skills loader of a multiplexed gateway use the wrong profile")
 def test_the_home_follows_hermes_context_local_profile(home, tmp_path):
     other = tmp_path / "profile-b"
     other.mkdir()
@@ -141,8 +137,20 @@ def test_the_home_follows_hermes_context_local_profile(home, tmp_path):
     try:
         assert hermes_constants.get_hermes_home() == other
         assert config.home() == other
+        config.write_credentials({"api_key": "b-key", "team_database": "b-team"}, other)
+        assert config.load().team_database == "b-team"  # the trace hooks' load, in profile b's turn
     finally:
         hermes_constants._HERMES_HOME_OVERRIDE.reset(token)
+    assert config.load().team_database == ""
+
+
+def test_team_skills_are_on_unless_turned_off(home, tmp_path):
+    assert config.load(tmp_path).team_skills
+    for off in ("off", "OFF", "false", "0", "no"):
+        home.setenv("INFINO_TEAM_SKILLS", off)
+        assert not config.load(tmp_path).team_skills
+    home.setenv("INFINO_TEAM_SKILLS", "on")
+    assert config.load(tmp_path).team_skills
 
 
 # -- the manifests agree with the code ----------------------------------------
@@ -164,7 +172,6 @@ def test_hermes_and_pip_install_the_same_dependencies():
     assert sorted(hermes) == sorted(pip)
 
 
-@pytest.mark.xfail(strict=True, reason="plugin.yaml says 0.4.0, pyproject.toml says 0.1.0")
 def test_the_two_manifests_carry_one_version():
     assert yaml.safe_load(PLUGIN_YAML.read_text())["version"] == tomllib.loads(PYPROJECT.read_text())["project"]["version"]
 

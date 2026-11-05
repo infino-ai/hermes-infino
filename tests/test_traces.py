@@ -114,13 +114,26 @@ def test_hermes_masks_the_secret_the_next_test_uses():
     assert SECRET not in _redact_for_provider(f"key={SECRET}")
 
 
-@pytest.mark.xfail(strict=True, reason="Hermes scrubs secrets from everything it hands a memory provider (#115104), "
-                                       "but the trace hooks get raw tool args and results, and the plugin stores "
-                                       "them unscrubbed, so a key a tool printed goes to the team's database")
 def test_a_secret_in_a_tool_call_is_scrubbed_as_hermes_scrubs_provider_egress(hooks, tmp_path):
     hooks["post_tool_call"](session_id="s9", turn_id="t1", tool_name="terminal", tool_call_id="c1",
-                            args={"cmd": f"export ANTHROPIC_API_KEY={SECRET}"}, result=f"key={SECRET}")
+                            args={"cmd": f"export ANTHROPIC_API_KEY={SECRET}"}, result=f"key={SECRET}",
+                            status="error", error_message=f"bad key {SECRET}")
+    hooks["post_api_request"](session_id="s9", turn_id="t1", model="m", assistant_message=f"your key is {SECRET}")
     hooks["on_session_end"](session_id="s9")
-    assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 1)
-    [row] = local_rows(tmp_path, tables.TRACES)
-    assert SECRET not in row["args"] and SECRET not in row["result"]
+    assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 2)
+    for row in local_rows(tmp_path, tables.TRACES):
+        assert all(SECRET not in str(row[c]) for c in ("args", "result", "error"))
+    assert any("ANTHROPIC_API_KEY" in r["args"] for r in local_rows(tmp_path, tables.TRACES))  # the rest is kept
+
+
+def test_a_secret_is_scrubbed_before_a_cell_is_cut(monkeypatch):
+    monkeypatch.setattr(traces, "MAX_TRACE_CELL_CHARS", 30)
+    assert SECRET[:20] not in traces._clip("x" * 20 + SECRET)
+
+
+def test_only_the_latest_sessions_are_remembered(monkeypatch):
+    monkeypatch.setattr(traces, "MAX_SESSIONS", 3)
+    for i in range(5):
+        traces.note_identity(f"cap-{i}", f"person-{i}", "p")
+    assert traces._identity_of("cap-0") == ("", "") and traces._identity_of("cap-4") == ("person-4", "p")
+    assert len([k for k in traces._identity if k.startswith("cap-")]) <= 3

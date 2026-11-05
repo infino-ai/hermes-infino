@@ -63,16 +63,17 @@ def _load_plugin():
     return importlib.import_module(f"{PACKAGE}.config"), importlib.import_module(f"{PACKAGE}.local")
 
 
-def client_command(settings, client_js: str, node: str, empty_root: str) -> tuple[list[str], dict[str, str]]:
-    """The client's command line and the environment it adds, for `settings`."""
+def client_command(settings, client_js: str, node: str, empty_root: str,
+                   local_db: str) -> tuple[list[str], dict[str, str]]:
+    """The client's command line and the environment it adds, for `settings`;
+    `local_db` is the team tables' local database, which it reads in local mode."""
     if settings.signed_in:
         argv = [node, client_js, "mcp", "--db", f"{settings.url.rstrip('/')}/{settings.team_database}",
                 "--embed-provider", "platform"]
         env = {**CLOUD_ENV, "INFINO_API_KEY": settings.api_key, "CX_ROOT": empty_root}
     else:
         argv = [node, client_js, "mcp"]
-        db = Path(settings.home) / "infino" / "db"
-        env = {**LOCAL_ENV, "CX_LOCAL_DB": str(db), "CX_ROOT": empty_root}
+        env = {**LOCAL_ENV, "CX_LOCAL_DB": local_db, "CX_ROOT": empty_root}
     return argv, env
 
 
@@ -100,7 +101,7 @@ def launch(config, local) -> None:
     # A folder the client may take as its root; nothing is indexed in it.
     empty_root = str(config.state_dir(settings.home) / "client-root")
     os.makedirs(empty_root, exist_ok=True)
-    argv, env = client_command(settings, client_js, node_command(), empty_root)
+    argv, env = client_command(settings, client_js, node_command(), empty_root, str(store.path))
     sys.stdout.flush()
     os.execvpe(argv[0], argv, {**os.environ, **env})
 
