@@ -2,8 +2,9 @@
 the cloud databases once signed in, caught up by the mirror.
 
 Two local databases: the team's tables (`infino/db`), which the Infino tools
-read, and the person's own memory (`infino/personal`), which only the plugin
-opens. A personal memory is never in a database a tool or a group chat can
+read, and the person's own (`infino/personal`): their memory, and the
+conversations and traces kept personal (privacy.py), which only the plugin
+opens. Nothing personal is ever in a database a tool or a group chat can
 reach: locally it is in its own, and in the cloud in the personal database,
 or nowhere when the person has none.
 
@@ -22,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from . import config, embed, recall, tables
+from . import config, embed, privacy, recall, tables
 from .client import InfinoClient
 from .local import PERSONAL_DB_DIR, LocalStore
 from .mirror import PERSONAL_MEMORY, SETTLE_MS, Mirror
@@ -34,6 +35,9 @@ logger = logging.getLogger(__name__)
 SYNC_DELAY_S = SETTLE_MS / 1000 + 0.5
 # The most a session's end waits for its rows to reach the cloud.
 FLUSH_TIMEOUT_S = 30.0
+# The tables whose rows follow their session: personal sessions' go to the
+# person's own database.
+TRANSCRIPT_TABLES = (tables.CONVERSATIONS, tables.TRACES)
 
 
 class Backend:
@@ -61,7 +65,7 @@ class Backend:
         """Create the local tables that are missing (with local vectors only in
         local mode): all a write needs, and quick."""
         self.local.ensure_tables(with_vectors=not self.signed_in)
-        self.personal.ensure_tables(with_vectors=not self.signed_in, only=(tables.MEMORY,))
+        self.personal.ensure_tables(with_vectors=not self.signed_in, only=tables.PERSONAL)
         self._move_personal_memory()
 
     def catch_up(self) -> None:
@@ -94,14 +98,44 @@ class Backend:
 
     # -- writes --------------------------------------------------------------
 
-    def append(self, table: str, rows: list[dict[str, Any]]) -> None:
+    def append(self, table: str, rows: list[dict[str, Any]], personal: bool = False) -> None:
+        """Write rows locally. A memory goes where its scope says; `personal`
+        sends a personal session's conversation or trace rows to the person's
+        own database instead of the team's."""
         if table == tables.MEMORY:
-            personal = [r for r in rows if r.get("scope") == recall.PERSONAL]
+            mine = [r for r in rows if r.get("scope") == recall.PERSONAL]
             rows = [r for r in rows if r.get("scope") != recall.PERSONAL]
-            self.personal.append(tables.MEMORY, personal)
-        self.local.append(table, rows)
+            self.personal.append(tables.MEMORY, mine)
+        if personal and table in TRANSCRIPT_TABLES:
+            self.personal.append(table, rows)
+        else:
+            self.local.append(table, rows)
         self._last_write = time.monotonic()
         self.schedule_sync()
+
+    def transcript_personal(self, session_id: str, messages: Optional[list[dict]] = None) -> bool:
+        """Whether a session's conversation and traces are personal
+        (privacy.transcript_personal), or this machine kept its earlier turns
+        personal: a chat stays personal after compaction drops the delivery
+        that made it so, and after a restart."""
+        if privacy.transcript_personal(self.settings, session_id, messages):
+            return True
+        if privacy.first_look(session_id) and self._kept_personal(session_id):
+            privacy.note_personal(session_id)
+            return True
+        return False
+
+    def _kept_personal(self, session_id: str) -> bool:
+        """Whether the person's own tables hold any of a session's turns."""
+        session = tables.sql_string(session_id)
+        for table in TRANSCRIPT_TABLES:
+            try:
+                found = self.personal.query_sql(f"SELECT count(*) AS n FROM {table} WHERE session_id = {session}")
+            except Exception:  # a table not made yet holds nothing
+                continue
+            if found and found[0]["n"]:
+                return True
+        return False
 
     def forget_memory(self, content: str, scope: Optional[str] = None, visible: tuple[str, ...] = ("",),
                       person: Optional[str] = None, about_prefix: str = "") -> int:
@@ -224,7 +258,7 @@ _backends_lock = threading.Lock()
 def for_settings(settings: config.Settings) -> Backend:
     """The shared backend of a profile, rebuilt when its sign-in changes."""
     key = (str(Path(settings.home).resolve()), settings.api_key, settings.team_database,
-           settings.personal_database, settings.url)
+           settings.personal_database, settings.url, settings.personal_profile, settings.personal_jobs)
     with _backends_lock:
         backend = _backends.get(key)
         if backend is None:

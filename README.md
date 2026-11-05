@@ -6,7 +6,7 @@ It saves four things: memory, conversations, traces and skills. Before each turn
 
 You don't need an Infino account. Without one, everything is kept in a database on your machine, and nothing leaves it.
 
-With an Infino account, your team shares a database in Infino Cloud, so every agent on the team can search what the others did. `hermes infino login` creates a free account, or joins your team's with a key a teammate gives you. From then on, the plugin uploads what it has kept on your machine so far, then each new memory, conversation, trace and skill as it happens. Your machine keeps its own copy. Personal memory never goes to the team database.
+With an Infino account, your team shares a database in Infino Cloud, so every agent on the team can search what the others did. `hermes infino login` creates a free account, or joins your team's with a key a teammate gives you. From then on, the plugin uploads what it has kept on your machine so far, then each new memory, conversation, trace and skill as it happens. Your machine keeps its own copy. Personal memory, and the conversations and traces of work you mark personal, never go to the team database.
 
 ```mermaid
 flowchart LR
@@ -52,6 +52,17 @@ flowchart TD
 Personal memory lives in a separate database. The Infino tools never open it, so no other agent and no chat can read it. On your machine it is `$HERMES_HOME/infino/personal`. When you sign in it goes to your personal database (`--personal-database`). If you don't have one, it stays on your machine. It never goes to the team database: when the agent saves a personal memory, the tool call is still logged in `conversations` and `traces`, but with the memory's text left out.
 
 What is said in a conversation is the conversation: `conversations` keeps every message as it was written, including anything personal someone says there.
+
+## Personal conversations and traces
+
+Conversations and traces belong to the team, so every agent on the team can see what the others did. Some work is one person's own: a scheduled job that reads your email and sends you a digest, or a profile you keep for private errands. Mark it personal, and its conversations and traces go where personal memory goes: your personal database, or your machine when you have none. They never go to the team database.
+
+| Setting | What becomes personal |
+| --- | --- |
+| `INFINO_PERSONAL_JOBS=email-digest,weekly-finances` | Each run of those scheduled jobs (named by name or id, as `hermes cron list` shows them): every model call and tool call on the way to the output, and the subagents it starts. And the chat its output is delivered into: when Hermes puts the output in the chat's history (`attach_to_session`, `cron.mirror_delivery`, or a continuable thread), that chat's conversation and traces are personal from then on. |
+| `INFINO_PERSONAL_PROFILE=on` | Every conversation and trace of the profile. |
+
+The job itself can still be shared: a skill a personal job uses is the team's like any other skill. What the job reads and writes stays with you. Memory keeps its own rule (team unless it is about one person), whatever the setting.
 
 On a gateway, where one profile answers several people, each person's personal memory is saved under their name and recalled only in their own chats with the agent.
 
@@ -218,6 +229,8 @@ The config block comes first because Hermes starts the Infino tools with that bl
 | `INFINO_MCP_SERVER` | The client's name under `mcp_servers` (default `infino`). Environment only, since it names the config block. |
 | `INFINO_URL` | The Infino Cloud URL (default `https://api.platform.infino.ws`) |
 | `INFINO_TEAM_SKILLS` | `off` stops this profile loading the skills teammates publish (default on) |
+| `INFINO_PERSONAL_PROFILE` | `on` keeps every conversation and trace of this profile out of the team database (default off). See [Personal conversations and traces](#personal-conversations-and-traces). |
+| `INFINO_PERSONAL_JOBS` | Scheduled jobs (ids or names, comma-separated) whose runs, and the chats their output is delivered into, are kept out of the team database |
 
 ## Development
 

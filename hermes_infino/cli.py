@@ -71,7 +71,7 @@ def _status(args) -> int:
     settings = config.load()
     b = Backend(settings)
     for label, store, names in (("local database ", b.local, tables.ALL),
-                                ("personal memory", b.personal, (tables.MEMORY,))):
+                                ("personal       ", b.personal, tables.PERSONAL)):
         print(f"{label}  {store.path}")
         try:
             have = set(store.list_tables())
@@ -98,7 +98,8 @@ def _status(args) -> int:
             behind = "?"
         print(f"   {src.table:<14} {behind} rows not in {src.database} yet")
     if not settings.personal_database:
-        print("   personal memory stays on this machine (no personal database)")
+        print("   personal memory stays on this machine, as do personal conversations and traces "
+              "(no personal database)")
     if b.mirror.last_error():
         print(f"last sync        stopped: {b.mirror.last_error()}")
     if b.mirror.refused():
@@ -121,8 +122,9 @@ def _upload_notice(url: str, database: str, counts: dict, new_account: bool) -> 
     return "\n".join([
         f"Signing in {'creates a free Infino account on' if new_account else 'connects this profile to'} {url}",
         f"and uploads to the database '{database}':",
-        f"  - everything kept on this machine so far ({kept}), except personal memory, which goes",
-        "    only to a personal database (--personal-database) and otherwise stays here;",
+        f"  - everything kept on this machine so far ({kept}), except personal memory and the",
+        "    conversations and traces of personal profiles and scheduled jobs, which go only to a",
+        "    personal database (--personal-database) and otherwise stay here;",
         "  - and from then on, every memory, conversation (tool calls and their results included),",
         "    trace and published skill this profile writes.",
         "It stays on this machine too.",
@@ -130,8 +132,8 @@ def _upload_notice(url: str, database: str, counts: dict, new_account: bool) -> 
 
 
 def _local_counts() -> dict:
-    """Rows kept on this machine that a sign-in uploads (personal memory goes
-    only to a personal database, so it is not counted here)."""
+    """Rows kept on this machine that a sign-in uploads to the team (what is
+    personal goes only to a personal database, so it is not counted here)."""
     from .local import LocalStore
     from . import tables
 
@@ -222,7 +224,7 @@ def _catch_up(settings: config.Settings) -> int:
 
     b = Backend(settings)
     b.local.ensure_tables(with_vectors=False)
-    b.personal.ensure_tables(with_vectors=False, only=(tables.MEMORY,))
+    b.personal.ensure_tables(with_vectors=False, only=tables.PERSONAL)
     b.local.drop_vectors()
     b.personal.drop_vectors()
     b.mirror.ensure_cloud_tables()
