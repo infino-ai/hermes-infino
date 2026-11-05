@@ -1,4 +1,4 @@
-# Recall everything an agent does
+# Recall everything an agent has ever done
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that stores the agent's memory and history in Infino.
 
