@@ -1,4 +1,4 @@
-# hermes-infino
+# Infinite Recall for Hermes agents
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that stores the agent's memory and history in Infino.
 
