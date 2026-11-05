@@ -1,4 +1,4 @@
-# Durable recall for Hermes agents
+# Durable recall for Hermes fleets
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that stores the agent's memory and history in Infino.
 
