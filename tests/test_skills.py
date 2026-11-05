@@ -1,0 +1,107 @@
+"""The team's skills: reading a SKILL.md, picking versions, and loading
+them into a profile."""
+
+from __future__ import annotations
+
+import pytest
+
+from hermes_infino import config, skills, tables
+from hermes_infino.client import InfinoClient
+
+from .helpers import SKILL_MD, TEAM_DB, requests_to, sign_in
+
+
+class Ctx:
+    """Hermes's plugin context, as far as the skills loader uses it."""
+
+    def __init__(self, refuse: tuple[str, ...] = ()):
+        self.registered: list[tuple[str, str, str]] = []
+        self._refuse = refuse
+
+    def register_skill(self, name, path, description=""):
+        if name in self._refuse:
+            raise ValueError(f"{name} clashes with a built-in skill")
+        self.registered.append((name, path.read_text(), description))
+
+
+def publish(platform, *rows: dict) -> None:
+    c = InfinoClient("k", platform.url)
+    tables.ensure_all(c, TEAM_DB)
+    c.append(TEAM_DB, tables.SKILLS, list(rows))
+
+
+@pytest.mark.parametrize("md, description", [
+    (SKILL_MD, "Steps before a release."),
+    ("---\nname: x\ndescription: \"Quoted: with a colon\"\n---\nbody", "Quoted: with a colon"),
+    ("---\nname: x\n---\nbody", ""),
+    ("no frontmatter at all\ndescription: not this", ""),
+    ("", ""),
+])
+def test_the_description_comes_from_the_frontmatter(md, description):
+    assert skills.description_of(md) == description
+
+
+def test_a_published_row_carries_who_and_when(home):
+    row = skills.skill_row("release-checklist", SKILL_MD, "alice", "ops")
+    assert (row["name"], row["author"], row["profile"], row["content"]) == ("release-checklist", "alice", "ops", SKILL_MD)
+    assert row["description"] == "Steps before a release." and row["created_ms"] > 0
+
+
+def test_names_hermes_would_refuse_and_empty_skills_are_skipped():
+    rows = [{"name": n, "content": "x", "created_ms": 1} for n in ("../escape", "a/b", "has space", "", "ok_name-2")]
+    rows.append({"name": "empty", "content": "", "created_ms": 1})
+    assert list(skills.latest(rows)) == ["ok_name-2"]
+
+
+def test_a_tie_keeps_the_first_row_read():
+    rows = [{"name": "a", "content": "first", "created_ms": 5}, {"name": "a", "content": "second", "created_ms": 5}]
+    assert skills.latest(rows)["a"]["content"] == "first"
+
+
+def test_a_local_skill_is_found_at_any_depth(home, tmp_path):
+    deep = tmp_path / "skills" / "team" / "ops" / "release-checklist" / "SKILL.md"
+    deep.parent.mkdir(parents=True)
+    deep.write_text(SKILL_MD)
+    assert skills.find_local_skill("release-checklist", tmp_path) == deep
+    assert skills.find_local_skill("release", tmp_path) is None
+
+
+def test_a_profile_without_skills_has_none(home, tmp_path):
+    assert skills.find_local_skill("anything", tmp_path) is None
+
+
+def test_without_an_account_nothing_is_loaded_or_asked(home, platform, tmp_path):
+    assert skills.register_team_skills(Ctx(), config.load(tmp_path), home=tmp_path) == []
+    assert platform.requests == []
+
+
+def test_a_signed_in_team_with_no_skills_table_loads_none(home, platform, tmp_path):
+    settings = sign_in(tmp_path, platform)
+    platform.databases[TEAM_DB] = {}
+    assert skills.register_team_skills(Ctx(), settings, home=tmp_path) == []
+    assert requests_to(platform, "query_sql") == 0
+
+
+def test_the_newest_version_of_each_skill_is_written_and_registered(home, platform, tmp_path):
+    settings = sign_in(tmp_path, platform)
+    publish(platform, {"name": "deploy", "content": "v1", "created_ms": 1},
+            {"name": "deploy", "content": "v2", "description": "Ship it.", "created_ms": 2},
+            {"name": "triage", "content": "t1", "created_ms": 1})
+    ctx = Ctx()
+    assert skills.register_team_skills(ctx, settings, home=tmp_path) == ["deploy", "triage"]
+    assert ctx.registered == [("deploy", "v2", "Ship it."), ("triage", "t1", "")]
+    assert (tmp_path / skills.CACHE_DIR / "deploy" / "SKILL.md").read_text() == "v2"
+
+
+def test_one_refused_skill_does_not_stop_the_rest(home, platform, tmp_path):
+    settings = sign_in(tmp_path, platform)
+    publish(platform, {"name": "deploy", "content": "d", "created_ms": 1},
+            {"name": "triage", "content": "t", "created_ms": 1})
+    assert skills.register_team_skills(Ctx(refuse=("deploy",)), settings, home=tmp_path) == ["triage"]
+
+
+def test_a_skill_name_never_writes_outside_the_cache(home, platform, tmp_path):
+    settings = sign_in(tmp_path, platform)
+    publish(platform, {"name": "../../escape", "content": "owned", "created_ms": 1})
+    assert skills.register_team_skills(Ctx(), settings, home=tmp_path) == []
+    assert not (tmp_path / "escape").exists() and not (tmp_path.parent / "escape").exists()

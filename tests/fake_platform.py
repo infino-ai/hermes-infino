@@ -26,8 +26,14 @@ class FakePlatform:
         self.failed_appends = 0        # next N appends answer 500 (not retried)
         self.trials = 0                # free accounts handed out
         self.hybrid_refused = False    # hybrid search answers 400 (no embedder)
+        self.hybrid_statuses: list[int] = []  # the next hybrid searches answer these statuses, in order
+        self.failed_deletes = 0        # next N deletes answer 500
         self.no_embedder = False       # create_table refuses embedding columns with 403
         self.database_limit = None     # like a free plan: creates past this count answer 403
+        self.trial_status = None       # /v1/trial answers this status (501: no free accounts; 409: one per network)
+        self.trial_without_key = False  # /v1/trial answers 200 with no api_key
+        self.valid_keys = None         # a set: any other bearer key answers 401
+        self.keys_seen: list[str] = []  # the bearer key of every request
         self._lock = threading.Lock()
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
@@ -56,10 +62,21 @@ class FakePlatform:
                 self.end_headers()
                 self.wfile.write(raw)
 
+            def _refused_key(self) -> bool:
+                """Record the request's key; answer 401 when the platform does not know it."""
+                key = (self.headers.get("Authorization") or "").removeprefix("Bearer ")
+                fake.keys_seen.append(key)
+                if fake.valid_keys is not None and key not in fake.valid_keys and self.path != "/v1/trial":
+                    self._send(401, {"error": "invalid api key"})
+                    return True
+                return False
+
             def do_GET(self):
                 parsed = urllib.parse.urlparse(self.path)
                 with fake._lock:
                     fake.requests.append((parsed.path, "{}"))
+                    if self._refused_key():
+                        return
                     if parsed.path == "/v1/databases":
                         self._send(200, [{"name": n} for n in fake.databases])
                     else:
@@ -73,6 +90,8 @@ class FakePlatform:
                 parts = parsed.path.strip("/").split("/")
                 with fake._lock:
                     fake.requests.append((parsed.path, json.dumps(params)))
+                    if self._refused_key():
+                        return
                     status, out, headers = fake._route(parts, params, body)
                 self._send(status, out, headers)
 
@@ -80,6 +99,10 @@ class FakePlatform:
 
     def _route(self, parts, params, body):
         if parts == ["v1", "trial"]:
+            if self.trial_status is not None:
+                return self.trial_status, {"error": "no free account"}, None
+            if self.trial_without_key:
+                return 200, {"database": body["database"]}, None
             self.trials += 1
             self.databases.setdefault(body["database"], {})
             return 200, {"api_key": f"trial-key-{self.trials}", "database": body["database"],
@@ -125,6 +148,9 @@ class FakePlatform:
                 rows.append({"_id": str(len(rows)), **r})
             return 200, {}, None
         if op == "delete":
+            if self.failed_deletes > 0:
+                self.failed_deletes -= 1
+                return 500, {"error": "delete error"}, None
             predicate = params["predicate"]
             m = re.fullmatch(r"content = '((?:[^']|'')*)'", predicate)
             if m:
@@ -142,6 +168,8 @@ class FakePlatform:
         if op in ("hybrid_search", "bm25_search"):
             if op == "hybrid_search" and self.hybrid_refused:
                 return 400, {"error": "no embedding server"}, None
+            if op == "hybrid_search" and self.hybrid_statuses:
+                return self.hybrid_statuses.pop(0), {"error": "scripted"}, None
             schema = self.schemas.get((db, body["table_name"]), [])
             if op == "hybrid_search" and not any(f["name"] == body["vector_field"] for f in schema):
                 return 400, {"error": f"no column {body['vector_field']}"}, None

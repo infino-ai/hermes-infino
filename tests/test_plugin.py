@@ -4,131 +4,25 @@ the local database, and a fake platform for the cloud."""
 from __future__ import annotations
 
 import argparse
-import hashlib
-import importlib.util
 import io
 import json
-import math
 import os
-import re
 import stat
-import time
-from pathlib import Path
 from types import SimpleNamespace
 
-import hermes_cli
 import infino
 import pyarrow as pa
 import pytest
 
-from agent.memory_manager import MemoryManager
 from hermes_cli.config import cfg_get, load_config
-from plugins.config_backends import remote as remote_config
-from plugins.config_backends.remote import backend as remote_backend, credentials as remote_credentials
 from plugins.config_backends.remote.values import secret_literal_path
 
-from hermes_infino import backend, chats, cli, config, embed, instructions, mirror, recall, skills, tables, traces
+from hermes_infino import backend, chats, cli, config, instructions, mirror, recall, skills, tables, traces
 from hermes_infino.client import InfinoClient
-from hermes_infino.local import LocalStore, arrow_schema, index_spec
-from hermes_infino.provider import InfinoMemoryProvider
+from hermes_infino.local import arrow_schema, index_spec
 
-from .fake_platform import FakePlatform
-
-TEAM_DB = "team-test"
-PERSONAL_DB = "person-test"
-# Hermes's own stand-in for the Remote Config service, which its tests ship.
-REMOTE_CONFIG_STUB = Path(hermes_cli.__file__).resolve().parent.parent / "tests" / "plugins" / "config_backends" / "stub_plane.py"
-# Seconds a test waits for a background write to land.
-WRITE_WAIT_S = 5.0
-# How long a scheduled sync waits in these tests (the settle window is off).
-TEST_SYNC_DELAY_S = 0.05
-
-
-def fake_embed(texts: list[str]) -> list[list[float]]:
-    """Deterministic stand-in for the model: words hashed into the 384 dimensions."""
-    out = []
-    for t in texts:
-        v = [0.0] * embed.DIM
-        for w in re.findall(r"\w+", t.lower()):
-            v[int(hashlib.md5(w.encode()).hexdigest(), 16) % embed.DIM] += 1.0
-        n = math.sqrt(sum(x * x for x in v)) or 1.0
-        out.append([x / n if any(v) else 1.0 / math.sqrt(embed.DIM) for x in v])
-    return out
-
-
-@pytest.fixture(autouse=True)
-def quick(monkeypatch):
-    embed.use(fake_embed)
-    monkeypatch.setattr(mirror, "SETTLE_MS", 0)
-    monkeypatch.setattr(backend, "SETTLE_MS", 0)
-    monkeypatch.setattr(backend, "SYNC_DELAY_S", TEST_SYNC_DELAY_S)
-    backend._backends.clear()
-    yield
-    embed.use(None)
-    backend._backends.clear()
-
-
-@pytest.fixture
-def platform():
-    fake = FakePlatform()
-    yield fake
-    fake.close()
-
-
-@pytest.fixture
-def home(monkeypatch, tmp_path):
-    # Hermes refuses memory calls from a profile other than the one the provider was
-    # initialized for, so the test's caller profile is the temporary home too.
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    for name in ("INFINO_API_KEY", "INFINO_TEAM_DATABASE", "INFINO_URL", "INFINO_PERSONAL_DATABASE",
-                 "INFINO_AUTHOR", "INFINO_MCP_SERVER"):
-        monkeypatch.delenv(name, raising=False)
-    return monkeypatch
-
-
-@pytest.fixture
-def env(home, platform):
-    """A profile signed in through its environment, as a deployment configures one."""
-    home.setenv("INFINO_API_KEY", "test-key")
-    home.setenv("INFINO_URL", platform.url)
-    home.setenv("INFINO_TEAM_DATABASE", TEAM_DB)
-    return home
-
-
-def make_manager(tmp_path, **kwargs) -> tuple[MemoryManager, InfinoMemoryProvider]:
-    provider = InfinoMemoryProvider()
-    mgr = MemoryManager()
-    mgr.add_provider(provider)
-    kwargs.setdefault("platform", "cli")
-    mgr.initialize_all(session_id="s1", hermes_home=str(tmp_path), **kwargs)
-    provider._ready.wait(5)
-    return mgr, provider
-
-
-def wait_for(predicate, timeout: float = WRITE_WAIT_S):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline and not predicate():
-        time.sleep(0.05)
-    return predicate()
-
-
-def hook_ctx():
-    hooks = {}
-
-    class Ctx:
-        def register_hook(self, name, fn):
-            hooks[name] = fn
-
-    traces.register_hooks(Ctx())
-    return hooks
-
-
-def local(tmp_path) -> LocalStore:
-    return LocalStore.under(config.state_dir(tmp_path))
-
-
-def local_rows(tmp_path, table: str) -> list[dict]:
-    return local(tmp_path).query_sql(f"SELECT * FROM {table} ORDER BY stored_ms, row_id")
+from .helpers import (DM, GROUP, OTHER_GROUP, PERSONAL_DB, SKILL_MD, TEAM_DB, hook_ctx, in_session, local,
+                      local_rows, make_manager, personal_rows, wait_for)
 
 
 # -- signed in ----------------------------------------------------------------
@@ -429,9 +323,6 @@ def test_a_refused_push_resumes_where_it_stopped(env, platform, tmp_path):
     assert b.mirror.last_error() == ""
 
 
-SKILL_MD = "---\nname: release-checklist\ndescription: Steps before a release.\n---\n\n1. Freeze.\n"
-
-
 def test_a_published_skill_loads_in_every_profile(env, platform, tmp_path):
     mgr, provider = make_manager(tmp_path)
     skill = tmp_path / "skills" / "ops" / "release-checklist" / "SKILL.md"
@@ -471,22 +362,6 @@ def test_skills_load_never_raises_without_a_platform(env, platform, tmp_path):
 
 
 # -- group chats --------------------------------------------------------------
-
-GROUP = {"HERMES_SESSION_PLATFORM": "telegram", "HERMES_SESSION_CHAT_ID": "-100", "HERMES_SESSION_CHAT_TYPE": "group",
-         "HERMES_SESSION_USER_ID": "222", "HERMES_SESSION_USER_NAME": "mallory"}
-OTHER_GROUP = {**GROUP, "HERMES_SESSION_CHAT_ID": "-200"}
-DM = {**GROUP, "HERMES_SESSION_CHAT_ID": "111", "HERMES_SESSION_CHAT_TYPE": "dm", "HERMES_SESSION_USER_NAME": "owner"}
-
-
-def in_session(monkeypatch, values: dict, binding="absent"):
-    """The turn's gateway session values; `binding` stands in for Hermes's
-    channel memory binding ("absent": a Hermes without channel memory)."""
-    monkeypatch.setattr(chats, "_get_session_env", lambda name, default="": values.get(name, default))
-    if binding == "absent":
-        monkeypatch.setattr(chats, "_CHANNEL_MEMORY", None)
-    else:
-        monkeypatch.setattr(chats, "_CHANNEL_MEMORY", SimpleNamespace(get=lambda default=None: binding))
-
 
 def test_the_chat_is_keyed_as_hermes_keys_channel_memory():
     assert chats.chat_key("telegram", "-100") == "telegram:-100"
@@ -583,10 +458,6 @@ def test_a_local_table_from_an_older_version_gains_the_new_column(home, tmp_path
 
 
 # -- personal memory ----------------------------------------------------------
-
-def personal_rows(tmp_path) -> list[dict]:
-    return LocalStore.under(config.state_dir(tmp_path), "personal").query_sql("SELECT * FROM memory")
-
 
 def test_personal_memory_is_never_in_the_database_the_tools_read(home, tmp_path, monkeypatch):
     mgr, provider = make_manager(tmp_path, platform="telegram")
@@ -768,24 +639,6 @@ def test_another_profiles_config_is_not_read(home, platform, tmp_path):
     write_config(other, {"mcp_servers": {"infino": tools_block(platform)}})
     home.setenv("INFINO_API_KEY", "test-key")
     assert config.load(other).team_database == ""  # Hermes has tmp_path loaded, not `other`
-
-
-@pytest.fixture
-def remote(home, tmp_path):
-    """Hermes on Remote Config, served by Hermes's own stand-in service."""
-    spec = importlib.util.spec_from_file_location("hermes_remote_config_stub", REMOTE_CONFIG_STUB)
-    stub = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(stub)
-    with stub.StubPlane() as plane:
-        for k, v in stub.remote_env(plane).items():
-            home.setenv(k, v)
-        home.setattr(remote_backend, "BOOT_RETRY_DELAYS", (0.0, 0.0))
-        remote_config._reset_for_tests()
-        remote_credentials._IDP_CACHE.clear()
-        plane.home = tmp_path
-        yield plane
-        remote_config._reset_for_tests()
-        remote_credentials._IDP_CACHE.clear()
 
 
 def test_remote_config_signs_the_plugin_in(remote, home, platform, tmp_path):
