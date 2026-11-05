@@ -8,11 +8,11 @@ import sys
 
 import pytest
 
-from hermes_infino import backend, config, embed, provider as provider_mod, tables
+from hermes_infino import backend, config, embed, privacy, provider as provider_mod, skills, tables
 from hermes_infino.local import VECTORS
 from hermes_infino.provider import InfinoMemoryProvider
 
-from .helpers import SKILL_MD, fake_embed, local, local_rows, make_manager, personal_rows
+from .helpers import DM, GROUP, SKILL_MD, fake_embed, in_session, local, local_rows, make_manager, personal_rows, wait_for
 
 TOOLS = ("infino_remember", "infino_forget", "infino_publish_skill")
 
@@ -169,8 +169,9 @@ def test_rows_from_every_message_shape(mgr, tmp_path):
     p.sync_turn("look at this", "done", session_id="s1", messages=messages)
     p._drain()
     rows = turn_rows(tmp_path)
-    assert [(r["seq"], r["role"]) for r in rows] == [(1, "user"), (2, "assistant"), (3, "tool"), (4, "tool"),
-                                                    (6, "assistant")]
+    # The turn starts at its user message; the system prompt is no part of it.
+    assert [(r["seq"], r["role"]) for r in rows] == [(0, "user"), (1, "assistant"), (2, "tool"), (3, "tool"),
+                                                    (5, "assistant")]
     assert rows[0]["content"] == "look at\n\nthis"  # an image part leaves an empty line
     assert rows[1]["tool_name"] == "read_file,terminal"
     assert [r["tool_name"] for r in rows[2:4]] == ["read_file", "terminal"]
@@ -254,6 +255,165 @@ def test_a_turn_without_its_messages_continues_the_sessions_count(mgr, tmp_path)
                                                                      (3, "four")]
 
 
+def turn(user: str, answer: str) -> list[dict]:
+    return [{"role": "user", "content": user}, {"role": "assistant", "content": answer}]
+
+
+def test_a_session_compacted_in_place_keeps_being_stored(mgr, tmp_path):
+    _, p = mgr
+    history = turn("q1", "a1") + turn("q2", "a2") + turn("q3", "a3")
+    for i in range(3):
+        p.sync_turn(f"q{i + 1}", f"a{i + 1}", session_id="s1", messages=history[:2 * (i + 1)])
+    # Hermes compacts in place: same session id, a summary and the tail.
+    compacted = [{"role": "user", "content": "[summary of q1-q2]"}] + turn("q3", "a3") + turn("q4", "a4")
+    p.on_session_switch("s1", reset=False, reason="compression")
+    p.sync_turn("q4", "a4", session_id="s1", messages=compacted)
+    p._drain()
+    assert [(r["seq"], r["content"]) for r in turn_rows(tmp_path)] == [
+        (0, "q1"), (1, "a1"), (2, "q2"), (3, "a2"), (4, "q3"), (5, "a3"), (6, "q4"), (7, "a4")]
+
+
+def test_a_turn_after_undo_is_stored(mgr, tmp_path):
+    _, p = mgr
+    p.sync_turn("q1", "a1", session_id="s1", messages=turn("q1", "a1"))
+    p.sync_turn("q2", "a2", session_id="s1", messages=turn("q1", "a1") + turn("q2", "a2"))
+    p.on_session_switch("s1", rewound=True)  # /undo took q2 back
+    p.sync_turn("q2 again", "a2 again", session_id="s1", messages=turn("q1", "a1") + turn("q2 again", "a2 again"))
+    p._drain()
+    assert [r["content"] for r in turn_rows(tmp_path)] == ["q1", "a1", "q2", "a2", "q2 again", "a2 again"]
+
+
+def test_a_branched_session_stores_only_its_own_turns(mgr, tmp_path):
+    _, p = mgr
+    p.sync_turn("q1", "a1", session_id="s1", messages=turn("q1", "a1"))
+    p.on_session_switch("s1-branch")  # /branch: a new id, the history copied
+    p.sync_turn("q2", "a2", session_id="s1-branch", messages=turn("q1", "a1") + turn("q2", "a2"))
+    p._drain()
+    assert [(r["session_id"], r["seq"], r["content"]) for r in turn_rows(tmp_path)] == [
+        ("s1", 0, "q1"), ("s1", 1, "a1"), ("s1-branch", 0, "q2"), ("s1-branch", 1, "a2")]
+
+
+def test_the_turn_starts_at_its_own_user_message(mgr, tmp_path):
+    _, p = mgr
+    # A message the turn added in the user's role (a steer) after the user's own.
+    messages = turn("q1", "a1") + [{"role": "user", "content": "fix the build"},
+                                   {"role": "user", "content": "(also: run the linter)"},
+                                   {"role": "assistant", "content": "done"}]
+    p.sync_turn("q1", "a1", session_id="s1", messages=turn("q1", "a1"))
+    p.sync_turn("fix the build", "done", session_id="s1", messages=messages)
+    p._drain()
+    assert [r["content"] for r in turn_rows(tmp_path)][2:] == ["fix the build", "(also: run the linter)", "done"]
+
+
+def test_a_personal_memory_call_is_logged_without_its_text(mgr, tmp_path):
+    _, p = mgr
+    messages = [{"role": "user", "content": "remember my dentist is Tuesday"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {
+                    "name": "infino_remember",
+                    "arguments": json.dumps({"content": "dentist is Tuesday", "scope": "personal"})}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "{\"ok\": true, \"scope\": \"personal\"}"},
+                {"role": "assistant", "content": "Saved."}]
+    p.sync_turn("remember my dentist is Tuesday", "Saved.", session_id="s1", messages=messages)
+    p._drain()
+    rows = turn_rows(tmp_path)
+    assert "dentist is Tuesday" not in rows[1]["tool_args"] and privacy.WITHHELD in rows[1]["tool_args"]
+    assert rows[2]["tool_result"] == privacy.WITHHELD
+    assert rows[0]["content"] == "remember my dentist is Tuesday"  # what was said is the conversation
+
+
+def test_a_memory_is_capped(mgr, tmp_path):
+    m, _ = mgr
+    call(m, "infino_remember", content="x" * (provider_mod.MAX_CELL_CHARS + 5))
+    assert len(local_rows(tmp_path, tables.MEMORY)[0]["content"]) == provider_mod.MAX_CELL_CHARS
+
+
+def test_a_skill_too_large_to_share_is_refused(mgr, tmp_path, monkeypatch):
+    m, _ = mgr
+    monkeypatch.setattr(skills, "MAX_SKILL_CHARS", 10)
+    skill = tmp_path / "skills" / "big" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(SKILL_MD)
+    out = call(m, "infino_publish_skill", name="big")
+    assert out["ok"] is False and "the most a team skill may be is 10" in out["error"]
+    assert local_rows(tmp_path, tables.SKILLS) == []
+
+
+def test_session_end_only_starts_a_sync(env, platform, tmp_path, monkeypatch):
+    m, p = make_manager(tmp_path)
+    monkeypatch.setattr(p._backend, "flush", lambda: pytest.fail("session end waited for the cloud"))
+    started = []
+    monkeypatch.setattr(p._backend, "schedule_sync", lambda *a, **k: started.append(1))
+    p.on_session_end([])
+    assert started == [1]
+
+
+def test_a_running_process_picks_up_a_sign_in(home, platform, tmp_path, monkeypatch):
+    m, p = make_manager(tmp_path)
+    assert not p._backend.signed_in
+    config.write_credentials({"url": platform.url, "api_key": "k", "team_database": "team-test"}, tmp_path)
+    p._checked_at -= provider_mod.SETTINGS_RECHECK_S  # half a minute later
+    p.prefetch("anything")
+    assert p._backend.signed_in
+    assert wait_for(lambda: tables.MEMORY in platform.databases.get("team-test", {}))
+    call(m, "infino_remember", content="written after the sign-in")
+    p.shutdown()
+    assert [r["content"] for r in platform.rows("team-test", tables.MEMORY)] == ["written after the sign-in"]
+
+
+def test_on_a_gateway_the_prompt_names_no_one(home, tmp_path):
+    home.setenv("INFINO_AUTHOR", "alice")
+    _, p = make_manager(tmp_path, platform="telegram", user_name="whoever-built-the-agent")
+    block = p.system_prompt_block()
+    assert "You are working with" not in block and "Several people may talk to you here" in block
+
+
+# -- one profile answering several people over DMs ---------------------------------
+
+def dm_from(monkeypatch, name: str) -> None:
+    in_session(monkeypatch, {**DM, "HERMES_SESSION_CHAT_ID": f"dm-{name}", "HERMES_SESSION_USER_NAME": name})
+
+
+def test_each_person_recalls_only_their_own_personal_memory(home, tmp_path, monkeypatch):
+    m, p = make_manager(tmp_path, platform="telegram")
+    dm_from(monkeypatch, "ana")
+    call(m, "infino_remember", content="ana's dentist appointment is Tuesday", scope="personal")
+    assert "dentist" in p.prefetch("dentist appointment")
+    dm_from(monkeypatch, "ben")
+    assert "dentist" not in p.prefetch("dentist appointment")
+    assert call(m, "infino_forget", content="ana's dentist appointment is Tuesday")["matched"] == 0
+    dm_from(monkeypatch, "ana")
+    assert call(m, "infino_forget", content="ana's dentist appointment is Tuesday")["matched"] == 1
+
+
+def test_a_dm_naming_nobody_reads_no_personal_memory(home, tmp_path, monkeypatch):
+    m, p = make_manager(tmp_path, platform="telegram")
+    dm_from(monkeypatch, "ana")
+    call(m, "infino_remember", content="ana's dentist appointment is Tuesday", scope="personal")
+    in_session(monkeypatch, {**DM, "HERMES_SESSION_USER_NAME": "", "HERMES_SESSION_USER_ID": ""})
+    assert "dentist" not in p.prefetch("dentist appointment")
+
+
+def test_a_dm_users_entry_is_kept_under_the_senders_name(home, tmp_path, monkeypatch):
+    _, p = make_manager(tmp_path, platform="telegram")
+    dm_from(monkeypatch, "ana")
+    p.on_memory_write("add", "user", "Prefers short answers")
+    p._drain()
+    [row] = personal_rows(tmp_path)
+    assert (row["content"], row["author"]) == ("About ana: Prefers short answers", "ana")
+
+
+def test_a_group_forgets_an_entry_another_member_wrote(home, tmp_path, monkeypatch):
+    _, p = make_manager(tmp_path, platform="telegram")
+    in_session(monkeypatch, GROUP)  # mallory says it
+    p.on_memory_write("add", "user", "Is on call this week")
+    p.on_memory_write("add", "user", "Is not on call this week")  # ends differently: kept
+    p._drain()
+    in_session(monkeypatch, {**GROUP, "HERMES_SESSION_USER_NAME": "zed"})  # zed takes it back
+    p.on_memory_write("remove", "user", "", {"previous_content": "Is on call this week"})
+    p._drain()
+    assert [r["content"] for r in local_rows(tmp_path, tables.MEMORY)] == ["About mallory: Is not on call this week"]
+
+
 def test_a_resumed_session_stores_each_message_once(home, tmp_path):
     history = [{"role": "user", "content": "run the tests"}, {"role": "assistant", "content": "2 fail"}]
     _, first = make_manager(tmp_path, session_id="s1")
@@ -291,7 +451,7 @@ def test_a_memory_saved_while_the_model_could_not_run_is_embedded_at_the_next_st
     embed.use(fake_embed)
     backend._backends.clear()
     make_manager(tmp_path)  # the next start
-    assert store.query_sql(f"SELECT count(*) AS n FROM {VECTORS}")[0]["n"] == 1
+    assert wait_for(lambda: store.query_sql(f"SELECT count(*) AS n FROM {VECTORS}")[0]["n"] == 1)
 
 
 def test_a_start_without_the_model_still_starts(home, tmp_path):

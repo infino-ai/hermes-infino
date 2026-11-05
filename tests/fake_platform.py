@@ -28,6 +28,8 @@ class FakePlatform:
         self.hybrid_refused = False    # hybrid search answers 400 (no embedder)
         self.hybrid_statuses: list[int] = []  # the next hybrid searches answer these statuses, in order
         self.failed_deletes = 0        # next N deletes answer 500
+        self.refused_marker = None     # an append carrying a row with this text answers refused_status
+        self.refused_status = 400
         self.no_embedder = False       # create_table refuses embedding columns with 403
         self.database_limit = None     # like a free plan: creates past this count answer 403
         self.trial_status = None       # /v1/trial answers this status (501: no free accounts; 409: one per network)
@@ -143,6 +145,10 @@ class FakePlatform:
             if self.failed_appends > 0:
                 self.failed_appends -= 1
                 return 500, {"error": "append error"}, None
+            if self.refused_marker and any(self.refused_marker in json.dumps(r) for r in body["data"]):
+                return self.refused_status, {"error": "row refused"}, None
+            if params["table"] not in tables:
+                return 404, {"error": f"no table {params['table']}"}, None
             rows = tables[params["table"]]
             for r in body["data"]:
                 rows.append({"_id": str(len(rows)), **r})

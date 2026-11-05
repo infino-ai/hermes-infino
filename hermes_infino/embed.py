@@ -7,14 +7,21 @@ two must agree: they do exactly with the full-precision file (`model.onnx`),
 and differ in the third decimal with the 8-bit one, whose integer kernels are
 not the same in the two ONNX runtimes. Hence fp32, here and in the client.
 
-The model is downloaded from Hugging Face on first use and cached there; it
-loads once per process, on the first text embedded.
+The model is downloaded from Hugging Face on first use and cached there. It is
+loaded on a background thread (`load_in_background`), never on a turn: until
+it is ready, `ready()` gives None, memories are saved without vectors (and
+embedded once it is), and recall is keyword-only. A load that failed (offline
+on first use) is not tried again for FAILED_RETRY_S.
 """
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from typing import Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 MODEL = "Xenova/all-MiniLM-L6-v2"
 MODEL_FILE = "onnx/model.onnx"
@@ -24,11 +31,15 @@ DIM = 384
 MAX_TOKENS = 512
 # Texts per model call.
 BATCH = 32
+# Seconds before a failed load (no network, no cached file) is tried again.
+FAILED_RETRY_S = 600.0
 
 Embedder = Callable[[list[str]], list[list[float]]]
 
 _lock = threading.Lock()
 _model: Optional[Embedder] = None
+_loading = False
+_failed_at: Optional[float] = None
 
 
 def _load() -> Embedder:
@@ -67,17 +78,52 @@ def _load() -> Embedder:
     return embed
 
 
-def embedder() -> Embedder:
-    """The process's model, loaded on first use."""
-    global _model
+def ready() -> Optional[Embedder]:
+    """The model if it is loaded, else None. Never loads, never waits."""
+    return _model
+
+
+def load_in_background(then: Optional[Callable[[], None]] = None) -> None:
+    """Load the model on a thread of its own, then call `then` (when it is
+    ready). Does nothing while a load runs, or soon after one failed; calls
+    `then` at once when the model is loaded already."""
+    global _loading
     with _lock:
         if _model is None:
-            _model = _load()
-        return _model
+            if _loading or (_failed_at is not None and time.monotonic() - _failed_at < FAILED_RETRY_S):
+                return
+            _loading = True
+    if _model is not None:
+        _then(then)
+        return
+
+    def run() -> None:
+        global _model, _loading, _failed_at
+        try:
+            model = _load()
+        except Exception as e:
+            logger.warning("infino: the local model could not load (memories are found by keyword): %s", e)
+            with _lock:
+                _loading, _failed_at = False, time.monotonic()
+            return
+        with _lock:
+            _model, _loading, _failed_at = model, False, None
+        _then(then)
+
+    threading.Thread(target=run, name="infino-model-load", daemon=True).start()
+
+
+def _then(then: Optional[Callable[[], None]]) -> None:
+    if then is None:
+        return
+    try:
+        then()
+    except Exception as e:
+        logger.warning("infino: after the model loaded: %s", e)
 
 
 def use(model: Optional[Embedder]) -> None:
     """Replace the model (tests), or None to load the real one again."""
-    global _model
+    global _model, _loading, _failed_at
     with _lock:
-        _model = model
+        _model, _loading, _failed_at = model, False, None

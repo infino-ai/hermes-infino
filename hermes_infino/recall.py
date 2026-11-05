@@ -18,12 +18,20 @@ else's agent wrote.
 A recall shows what the chat it runs in may see (chats.py): the team's
 memories, plus, in a group chat, that chat's own - never another chat's, and
 in a group chat never the person's own memory, which would put one member's
-notes in front of every member.
+notes in front of every member. On a gateway, where one profile can answer
+several people, personal memory shows only to the person it came from.
+
+Hermes waits 8 s for a recall. The cloud searches run side by side and get
+RECALL_BUDGET_S between them; a source whose cloud has not answered by then
+is answered from this machine, so a slow cloud never costs the turn its
+recall.
 """
 
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -39,11 +47,19 @@ PERSONAL = "personal"
 # Rows recalled per source, and the character budget the block is packed into.
 RECALL_K = 8
 RECALL_MAX_CHARS = 4_000
-# Seconds a recall may take before the turn goes on without it (Hermes's own
-# prefetch timeout is 8 s).
+# Seconds one cloud request of a recall may take.
 RECALL_TIMEOUT_S = 5.0
-# Statuses that mean "this table or deployment cannot run the vector leg".
+# Seconds all of a recall's cloud searches get together: under Hermes's 8 s
+# prefetch timeout, with room left for the local searches.
+RECALL_BUDGET_S = 6.0
+# Statuses that may mean "this table or deployment cannot run the vector leg".
 NO_VECTOR_STATUSES = (400, 403, 503)
+# Words in a 400 that say it is the vector leg, not the query, that failed.
+NO_VECTOR_WORDS = ("embedding", "vector")
+# Threads for cloud searches, shared by every recall of the process.
+CLOUD_SEARCH_THREADS = 8
+
+_pool = ThreadPoolExecutor(max_workers=CLOUD_SEARCH_THREADS, thread_name_prefix="infino-recall")
 # The heading the recalled block goes under in Hermes's context.
 HEADING = "## Relevant memory (Infino)"
 # What the block is, for the model: background, never instructions.
@@ -95,41 +111,57 @@ class Recaller:
                 if e.status not in NO_VECTOR_STATUSES:
                     raise
                 logger.info("infino: hybrid recall refused on %s (%s); using keyword search", database, e.status)
-                if e.status != 503:  # 503 is transient; the others hold for this table
+                # 403 holds for the table; a 400 only when it names the vector
+                # leg (any other 400 is about this query); 503 is transient.
+                if e.status == 403 or (e.status == 400 and any(w in e.message.lower() for w in NO_VECTOR_WORDS)):
                     self._keyword_only.add(database)
         return self._cloud.bm25_search(
             database, tables.MEMORY, query, field=tables.MEMORY_TEXT_COLUMN, k=k, projection=PROJECTION)
 
-    def _from(self, src: Source, query: str, chat: chats.Chat) -> list[dict]:
-        """A source's rows for `query` that `chat` may see, best first."""
-        depth = RECALL_K * CHAT_FILTER_DEPTH
+    def _cloud_rows(self, src: Source, query: str) -> list[dict]:
+        return self.search_cloud(src.database, query, RECALL_K * CHAT_FILTER_DEPTH)
+
+    def _from(self, src: Source, query: str, chat: chats.Chat, cloud_rows: Optional[list[dict]],
+              person: Optional[str]) -> list[dict]:
+        """A source's rows for `query` that `chat` (and, for personal memory,
+        `person`) may see, best first. `cloud_rows` is what its cloud answered,
+        None when it did not answer in time or has no cloud."""
+        def visible(r: dict) -> bool:
+            return _visible(r, chat) and (src.scope != PERSONAL or person is None or r.get("author") == person)
+
         cloud: list[dict] = []
-        answered = False
-        if src.database and self._cloud is not None:
-            try:
-                cloud = [r for r in self.search_cloud(src.database, query, depth) if _visible(r, chat)][:RECALL_K]
-                cloud.sort(key=lambda r: -float(r.get("score") or 0.0))
-                answered = True
-            except Exception as e:  # the local database answers instead
-                logger.info("infino: recall from %s failed: %s", src.database, e)
+        if cloud_rows is not None:
+            cloud = sorted((r for r in cloud_rows if visible(r)), key=lambda r: -float(r.get("score") or 0.0))
+            cloud = cloud[:RECALL_K]
         try:
-            local = [r for r in src.local.search_memory(query, depth, PROJECTION) if _visible(r, chat)][:RECALL_K]
+            depth = RECALL_K * CHAT_FILTER_DEPTH
+            local = [r for r in src.local.search_memory(query, depth, PROJECTION) if visible(r)][:RECALL_K]
         except Exception as e:
             logger.info("infino: local %s recall failed: %s", src.scope, e)
             local = []
-        if answered:
+        if cloud_rows is not None:
             seen = {str(r.get(tables.ROW_ID)) for r in cloud}
             mark = src.mark() if src.mark else None
             local = [r for r in local if str(r.get(tables.ROW_ID)) not in seen and _past(r, mark)]
         return cloud + local
 
-    def recall(self, query: str, chat: chats.Chat = chats.NO_CHAT) -> tuple[str, int]:
-        """The block for `query` in `chat`, and its row count."""
+    def recall(self, query: str, chat: chats.Chat = chats.NO_CHAT, person: Optional[str] = None) -> tuple[str, int]:
+        """The block for `query` in `chat`, and its row count. `person` is who
+        asks on a gateway (their personal memory only; "" for nobody known:
+        none), None on this machine's own sessions (its owner's)."""
+        sources = [s for s in self._sources if s.scope != PERSONAL or (not chat.group and person != "")]
+        deadline = time.monotonic() + RECALL_BUDGET_S
+        asked = {id(s): _pool.submit(self._cloud_rows, s, query)
+                 for s in sources if s.database and self._cloud is not None}
         rows: list[tuple[str, dict]] = []
-        for src in self._sources:
-            if chat.group and src.scope == PERSONAL:
-                continue
-            rows += [(src.scope, r) for r in self._from(src, query, chat)]
+        for src in sources:
+            cloud_rows = None
+            if id(src) in asked:
+                try:
+                    cloud_rows = asked[id(src)].result(timeout=max(0.0, deadline - time.monotonic()))
+                except Exception as e:  # not in time, or failed: this machine answers instead
+                    logger.info("infino: recall from %s did not answer: %s", src.database, e or "timed out")
+            rows += [(src.scope, r) for r in self._from(src, query, chat, cloud_rows, person)]
         lines, used = [], 0
         for scope, r in rows:
             label = "this chat" if r.get(tables.CHAT) else scope

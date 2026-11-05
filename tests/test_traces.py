@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import contextvars
+import json
+from types import SimpleNamespace
+
 import pytest
 
 from agent.memory_manager import _redact_for_provider
 
-from hermes_infino import tables, traces
+from hermes_infino import privacy, tables, traces
 
-from .helpers import hook_ctx, local, local_rows, wait_for
+from .helpers import GROUP, hook_ctx, in_session, local, local_rows, wait_for
 
 # A credential shaped the way Hermes's redaction recognizes one.
 SECRET = "sk-ant-api03-" + "A1b2C3d4E5f6G7h8I9j0" * 4
@@ -96,11 +100,59 @@ def test_each_session_flushes_only_its_own_rows(hooks, tmp_path):
     assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 2)
 
 
-def test_the_last_turn_id_ignores_calls_that_name_no_turn(hooks):
+def test_the_turn_id_ignores_calls_that_name_no_turn(hooks):
     hooks["post_api_request"](session_id="s7", turn_id="t1", model="m")
     hooks["post_tool_call"](session_id="s7", turn_id="", tool_name="x")
-    assert traces.last_turn_id("s7") == "t1"
-    assert traces.last_turn_id("never-seen") == ""
+    assert traces.current_turn_id("s7") == "t1"
+    assert traces.current_turn_id("never-seen") == ""
+
+
+def test_a_call_in_another_context_never_moves_this_turns_id(hooks):
+    # Hermes's background review shares the session id but runs in a context of its own.
+    hooks["post_api_request"](session_id="s8", turn_id="the-turn", model="m")
+    contextvars.copy_context().run(hooks["post_api_request"], session_id="s8", turn_id="the-review", model="m")
+    assert traces.current_turn_id("s8") == "the-turn"
+
+
+def test_a_gateway_turns_rows_are_the_senders(hooks, tmp_path, monkeypatch):
+    in_session(monkeypatch, GROUP)
+    traces.note_identity("g1", "the-profiles-owner", "ops")
+    hooks["post_api_request"](session_id="g1", turn_id="t1", model="m")
+    hooks["on_session_end"](session_id="g1")
+    assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 1)
+    [row] = local_rows(tmp_path, tables.TRACES)
+    assert (row["author"], row["profile"]) == ("mallory", "ops")
+
+
+def test_a_model_calls_row_keeps_its_text_not_its_tool_calls(hooks, tmp_path):
+    message = SimpleNamespace(content="Saving that.", tool_calls=[{"function": {"arguments": "private words"}}])
+    hooks["post_api_request"](session_id="s9", turn_id="t1", model="m", assistant_message=message)
+    hooks["on_session_end"](session_id="s9")
+    assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 1)
+    assert local_rows(tmp_path, tables.TRACES)[0]["result"] == "Saving that."
+
+
+@pytest.mark.parametrize("tool, args", [
+    ("infino_remember", {"content": "my dentist is Tuesday", "scope": "Personal"}),
+    ("memory", {"target": "user", "operations": [{"action": "add", "content": "my dentist is Tuesday"}]}),
+    ("memory", json.dumps({"target": "user", "action": "add", "content": "my dentist is Tuesday"})),
+])
+def test_a_personal_memory_call_is_traced_without_its_text(hooks, tmp_path, tool, args):
+    hooks["post_tool_call"](session_id="s9", turn_id="t1", tool_name=tool, args=args,
+                            result="entries: my dentist is Tuesday")
+    hooks["on_session_end"](session_id="s9")
+    assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 1)
+    [row] = local_rows(tmp_path, tables.TRACES)
+    assert "dentist" not in row["args"] and "dentist" not in row["result"]
+    assert privacy.WITHHELD in row["args"] and row["tool"] == tool
+
+
+def test_a_team_memory_call_is_traced_whole(hooks, tmp_path):
+    hooks["post_tool_call"](session_id="s9", turn_id="t1", tool_name="infino_remember",
+                            args={"content": "deploys freeze Dec 20"}, result="ok")
+    hooks["on_session_end"](session_id="s9")
+    assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 1)
+    assert "deploys freeze Dec 20" in local_rows(tmp_path, tables.TRACES)[0]["args"]
 
 
 def test_a_session_nobody_identified_has_no_author(hooks, tmp_path):

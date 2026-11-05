@@ -54,27 +54,32 @@ class Backend:
         return self.mirror is not None
 
     def ensure(self) -> None:
-        """Create what is missing: the local tables (with local vectors only
-        in local mode) and, signed in, the cloud tables; then catch up: push
-        to the cloud, or, in local mode, load the model and embed the
-        memories saved while it could not run."""
+        self.ensure_local()
+        self.catch_up()
+
+    def ensure_local(self) -> None:
+        """Create the local tables that are missing (with local vectors only in
+        local mode): all a write needs, and quick."""
         self.local.ensure_tables(with_vectors=not self.signed_in)
         self.personal.ensure_tables(with_vectors=not self.signed_in, only=(tables.MEMORY,))
         self._move_personal_memory()
+
+    def catch_up(self) -> None:
+        """What may take a while, after the local tables exist: signed in, the
+        cloud tables and a sync; in local mode, the model's load (in the
+        background) and then the memories saved without a vector."""
         if self.mirror is not None:
             self.local.drop_vectors()
             self.personal.drop_vectors()
             self.mirror.ensure_cloud_tables()
             self.schedule_sync(delay_s=0)
             return
-        try:
-            # Loaded here, at start, so a first memory never waits on the download.
-            embed.embedder()
-            n = self.local.backfill_vectors() + self.personal.backfill_vectors()
-            if n:
-                logger.info("infino: embedded %d memories saved without vectors", n)
-        except Exception as e:
-            logger.warning("infino: the local model is not available (memories are found by keyword): %s", e)
+        embed.load_in_background(self._backfill_vectors)
+
+    def _backfill_vectors(self) -> None:
+        n = self.local.backfill_vectors() + self.personal.backfill_vectors()
+        if n:
+            logger.info("infino: embedded %d memories saved without vectors", n)
 
     def _move_personal_memory(self) -> None:
         """Personal memories an older version kept in the team's local
@@ -98,16 +103,27 @@ class Backend:
         self._last_write = time.monotonic()
         self.schedule_sync()
 
-    def forget_memory(self, content: str, scope: Optional[str] = None, visible: tuple[str, ...] = ("",)) -> int:
+    def forget_memory(self, content: str, scope: Optional[str] = None, visible: tuple[str, ...] = ("",),
+                      person: Optional[str] = None, about_prefix: str = "") -> int:
         """Delete memories with exactly this text, of the chats in `visible`
         ("" is no chat), in `scope` when given: a chat forgets only what it
-        can recall."""
-        predicate = f"content = {tables.sql_string(content)} AND {tables.chat_predicate(visible)}"
+        can recall. `person` (a gateway turn's sender) limits personal
+        memory to theirs. `about_prefix` also matches the text after any
+        "About <name>: " prefix of that shape (a group's entries about its
+        members, whoever wrote them)."""
+        text = tables.sql_string(content)
+        match = f"content = {text}"
+        if about_prefix:
+            match = (f"({match} OR (content LIKE {tables.sql_string(about_prefix + '%')} "
+                     f"AND ends_with(content, {tables.sql_string(': ' + content)})))")
+        predicate = f"{match} AND {tables.chat_predicate(visible)}"
         if scope:
             predicate += f" AND scope = {tables.sql_string(scope)}"
         team = self.local.delete(tables.MEMORY, predicate) if scope != recall.PERSONAL else []
         # A group chat never reaches the person's own memory (`visible` holds a chat).
-        reaches_personal = scope in (None, recall.PERSONAL) and visible == ("",)
+        reaches_personal = scope in (None, recall.PERSONAL) and visible == ("",) and person != ""
+        if person:
+            predicate += f" AND author = {tables.sql_string(person)}"
         personal = self.personal.delete(tables.MEMORY, predicate) if reaches_personal else []
         if self.mirror is not None:
             # Each row is deleted from the cloud database its source went to.

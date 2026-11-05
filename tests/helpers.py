@@ -54,8 +54,15 @@ def make_manager(tmp_path, **kwargs) -> tuple[MemoryManager, InfinoMemoryProvide
     mgr.add_provider(provider)
     kwargs.setdefault("platform", "cli")
     mgr.initialize_all(session_id=kwargs.pop("session_id", "s1"), hermes_home=str(tmp_path), **kwargs)
-    provider._ready.wait(5)
+    settle(provider)
     return mgr, provider
+
+
+def settle(provider: InfinoMemoryProvider) -> None:
+    """Wait for the provider's start: the local tables, the catch-up, and the sync it began."""
+    provider._ready.wait(WRITE_WAIT_S)
+    provider._caught_up.wait(WRITE_WAIT_S)
+    wait_for(lambda: provider._backend._timer is None or not provider._backend._timer.is_alive())
 
 
 def wait_for(predicate, timeout: float = WRITE_WAIT_S):

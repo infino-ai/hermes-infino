@@ -39,6 +39,15 @@ SKILL_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 LOAD_TIMEOUT_S = 2.0
 # The most skill rows read at load.
 MAX_SKILL_ROWS = 2_000
+# Seconds a load's copies stand for the next one in the same process: a
+# gateway loads the plugin for every agent it builds, and the team's skills
+# do not change that fast.
+REFRESH_S = 300.0
+# The largest SKILL.md that may be published (characters).
+MAX_SKILL_CHARS = 200_000
+
+# When each profile home last read the team's skills, in this process.
+_loaded_at: dict[str, float] = {}
 
 
 def latest(rows: list[dict]) -> dict[str, dict]:
@@ -69,6 +78,9 @@ def register_team_skills(ctx, settings: Optional[config.Settings] = None, home: 
     if not settings.signed_in or not settings.team_skills:
         return []
     root = (home or settings.home) / CACHE_DIR
+    key = str(root.resolve())
+    if time.monotonic() - _loaded_at.get(key, -REFRESH_S) < REFRESH_S:
+        return _register_cached(ctx, root)
     try:
         rows = backend.for_settings(settings).query(
             f"SELECT name, description, content, author, created_ms FROM {tables.SKILLS} "
@@ -76,6 +88,7 @@ def register_team_skills(ctx, settings: Optional[config.Settings] = None, home: 
     except Exception as e:  # no answer in time, or no skills table yet
         logger.info("infino: team skills read from the last load's copies: %s", e)
         return _register_cached(ctx, root)
+    _loaded_at[key] = time.monotonic()
     registered = []
     for name, row in sorted(latest(rows).items()):
         try:

@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from gateway.slash_access import _DM_CHAT_TYPES
+
 from hermes_infino import chats
 
 from .helpers import DM, GROUP, in_session
@@ -34,10 +36,14 @@ def test_this_machines_own_sessions_are_never_a_group(monkeypatch, platform):
     assert chats.current() == chats.NO_CHAT
 
 
-@pytest.mark.parametrize("chat_type", ["dm", "private", "DM"])
+@pytest.mark.parametrize("chat_type", ["dm", "private", "DM", "direct", ""])
 def test_a_one_to_one_chat_is_not_a_group(monkeypatch, chat_type):
     in_session(monkeypatch, {**DM, "HERMES_SESSION_CHAT_TYPE": chat_type})
     assert chats.current() == chats.NO_CHAT
+
+
+def test_a_dm_is_what_hermes_calls_a_dm():
+    assert chats.DM_TYPES == _DM_CHAT_TYPES
 
 
 def test_without_channel_memory_a_group_writes_nobodys_own_memory(monkeypatch):

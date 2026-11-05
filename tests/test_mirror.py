@@ -6,10 +6,12 @@ from __future__ import annotations
 import fcntl
 import json
 
+import pyarrow as pa
 import pytest
 
 from hermes_infino import config, mirror, tables
-from hermes_infino.local import PERSONAL_DB_DIR, LocalStore
+from hermes_infino.client import InfinoError
+from hermes_infino.local import LATE_COMMITS_FILE, PERSONAL_DB_DIR, LocalStore, arrow_schema
 from hermes_infino.mirror import Mirror
 
 from .helpers import PERSONAL_DB, TEAM_DB, requests_to, sign_in
@@ -141,6 +143,99 @@ def test_an_append_that_reached_the_cloud_before_failing_is_not_sent_again(m, pl
     assert len({r["row_id"] for r in platform.rows(TEAM_DB, tables.CONVERSATIONS)}) == 4
 
 
+def test_a_row_the_cloud_refuses_is_set_aside_and_the_rest_go(m, platform):
+    m.local.append(tables.CONVERSATIONS, [{"seq": i, "content": "REFUSE-ME" if i == 2 else f"m{i}"} for i in range(5)])
+    platform.refused_marker = "REFUSE-ME"
+    m.sync(wait=True)
+    assert sorted(r["content"] for r in platform.rows(TEAM_DB, tables.CONVERSATIONS)) == ["m0", "m1", "m3", "m4"]
+    assert m.refused() == 1 and m.last_error() == ""
+    m.local.append(tables.CONVERSATIONS, [{"seq": 9, "content": "after it"}])
+    m.sync(wait=True)  # never stuck on the refused row
+    assert len(platform.rows(TEAM_DB, tables.CONVERSATIONS)) == 5
+
+
+def test_a_row_too_large_alone_is_set_aside(m, platform):
+    m.local.append(tables.MEMORY, [{"content": "TOO-LARGE"}])
+    platform.refused_marker, platform.refused_status = "TOO-LARGE", 413
+    m.sync(wait=True)
+    assert m.refused() == 1 and platform.rows(TEAM_DB, tables.MEMORY) == []
+
+
+def test_a_plain_400_on_every_row_is_the_tables_trouble_not_a_rows(m, platform):
+    m.local.append(tables.CONVERSATIONS, [{"seq": i, "content": f"BAD {i}"} for i in range(3)])
+    platform.refused_marker = "BAD"
+    with pytest.raises(InfinoError):
+        m.sync(wait=True)
+    assert m.refused() == 0  # nothing set aside: the next sync tries them again
+    platform.refused_marker = None
+    m.sync(wait=True)
+    assert len(platform.rows(TEAM_DB, tables.CONVERSATIONS)) == 3
+
+
+def test_a_failing_source_holds_up_neither_the_others_nor_the_forgets(m, platform, monkeypatch):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "f", "content": "to forget"}])
+    m.sync(wait=True)
+    m.forget(tables.MEMORY, TEAM_DB, ["f"])
+    m.local.append(tables.MEMORY, [{"content": "a new memory"}])
+    m.local.append(tables.CONVERSATIONS, conversation_rows(2))
+    real = m.client.append
+
+    def conversations_fail(db, table, rows):
+        if table == tables.CONVERSATIONS:
+            raise RuntimeError("conversations are down")
+        real(db, table, rows)
+
+    monkeypatch.setattr(m.client, "append", conversations_fail)
+    with pytest.raises(RuntimeError):
+        m.sync(wait=True)
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["a new memory"]  # forget applied too
+    assert platform.rows(TEAM_DB, tables.CONVERSATIONS) == []
+
+
+def test_a_process_killed_mid_append_does_not_send_the_batch_twice(m, platform, monkeypatch):
+    m.local.append(tables.CONVERSATIONS, conversation_rows(3))
+    real = m.client.append
+
+    def killed_after_the_cloud_stored_it(db, table, rows):
+        real(db, table, rows)
+        raise KeyboardInterrupt  # not an Exception: nothing records an error
+
+    monkeypatch.setattr(m.client, "append", killed_after_the_cloud_stored_it)
+    with pytest.raises(KeyboardInterrupt):
+        m.sync(wait=True)
+    monkeypatch.setattr(m.client, "append", real)
+    m.sync(wait=True)
+    assert len(platform.rows(TEAM_DB, tables.CONVERSATIONS)) == 3
+
+
+def test_a_slow_local_commit_is_pushed_after_all(m, platform):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "a", "content": "pushed"}])
+    m.sync(wait=True)
+    # A row committed after the mark had passed its stamp: the sync never saw it.
+    [stored] = {r[tables.STORED] for r in m.local.query_sql("SELECT stored_ms FROM memory")}
+    late = {tables.ROW_ID: "0-late", "content": "committed slowly", tables.STORED: stored}
+    m.local._connect().open_table(tables.MEMORY).append(
+        pa.Table.from_pylist([{f.name: late.get(f.name) for f in arrow_schema(tables.MEMORY)}],
+                             schema=arrow_schema(tables.MEMORY)))
+    assert sum(m.sync(wait=True).values()) == 0
+    with open(m.dir / LATE_COMMITS_FILE, "a") as f:  # what local.py notes for a slow commit
+        f.write(json.dumps({"store": m.local.path.name, "table": tables.MEMORY, "stored_ms": stored}) + "\n")
+    m.sync(wait=True)
+    assert sorted(r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)) == ["committed slowly", "pushed"]
+
+
+def test_a_cloud_slow_to_show_its_newest_row_is_not_a_lost_table(m, platform):
+    m.local.append(tables.MEMORY, [{"content": "old"}])
+    m.sync(wait=True)
+    m.local.append(tables.MEMORY, [{"content": "new"}])
+    m.sync(wait=True)
+    platform.databases[TEAM_DB][tables.MEMORY] = [r for r in platform.rows(TEAM_DB, tables.MEMORY)
+                                                  if r["content"] == "old"]  # the newest not visible yet
+    m.ensure_cloud_tables()
+    m.sync(wait=True)
+    assert sorted(r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)) == ["old"]  # nothing re-sent
+
+
 def test_a_mark_whose_row_was_forgotten_is_kept(m, platform):
     m.local.append(tables.MEMORY, [{tables.ROW_ID: "a", "content": "kept"}, {tables.ROW_ID: "z", "content": "gone"}])
     m.sync(wait=True)
@@ -166,7 +261,8 @@ def test_the_state_file_is_replaced_whole(m, platform):
     m.local.append(tables.MEMORY, [{"content": "x"}])
     m.sync(wait=True)
     state = json.loads((m.dir / mirror.STATE_FILE).read_text())
-    assert set(state) == {"marks", "last_error", "at_ms"}
+    assert set(state) == {"marks", "last_error", "in_flight", "recheck", "at_ms"}
+    assert state["in_flight"] == [] and state["last_error"] == ""
     assert not (m.dir / "mirror.tmp").exists()
 
 

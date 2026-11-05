@@ -3,14 +3,17 @@ mirror reads in, deletes, and local recall."""
 
 from __future__ import annotations
 
+import json
+import time
+
 import infino
 import pyarrow as pa
 import pytest
 
-from hermes_infino import embed, local as local_mod, tables
+from hermes_infino import embed, local as local_mod, mirror, tables
 from hermes_infino.local import VECTORS, LocalStore, arrow_schema
 
-from .helpers import fake_embed
+from .helpers import fake_embed, wait_for
 
 # Words the stand-in model below treats as one meaning, with no word in common.
 SYNONYMS = {"car": "automobile", "automobile": "automobile"}
@@ -19,6 +22,8 @@ SMALL_BATCH = 2
 MANY_ROWS = 5
 # Text whose SQL literal needs its quotes doubled.
 QUOTED = "it's Bob's"
+# The mirror's settle window as shipped (the tests' fixture turns it off).
+SETTLE_MS = mirror.SETTLE_MS
 
 
 @pytest.fixture
@@ -189,6 +194,64 @@ def test_a_memory_saved_while_the_model_cannot_run_is_kept_and_found_by_keyword(
     assert store.backfill_vectors() == 1
     assert store.backfill_vectors() == 0  # each memory once
     assert store.query_sql(f"SELECT count(*) AS n FROM {VECTORS}")[0]["n"] == 1
+
+
+def test_before_the_model_loads_recall_is_keyword_and_writes_skip_vectors(store):
+    embed.use(None)  # not loaded yet
+    store.append(tables.MEMORY, [{"content": "the deploy freeze starts December 20"}])
+    assert [h["content"] for h in store.search_memory("deploy freeze", 5, PROJECTION)] == [
+        "the deploy freeze starts December 20"]
+    assert store.query_sql(f"SELECT count(*) AS n FROM {VECTORS}")[0]["n"] == 0
+    assert store.backfill_vectors() == 0  # nothing to embed with yet
+    embed.use(fake_embed)
+    assert store.backfill_vectors() == 1
+
+
+def test_a_model_that_fails_on_a_question_leaves_the_keyword_hits(store):
+    store.append(tables.MEMORY, [{"content": "the deploy freeze starts December 20"}])
+
+    def broken(texts):
+        raise RuntimeError("model crashed")
+
+    embed.use(broken)
+    assert [h["content"] for h in store.search_memory("deploy freeze", 5, PROJECTION)] == [
+        "the deploy freeze starts December 20"]
+
+
+def test_a_failed_model_load_is_not_retried_at_once(monkeypatch):
+    loads = []
+
+    def offline():
+        loads.append(1)
+        raise OSError("no network")
+
+    embed.use(None)
+    monkeypatch.setattr(embed, "_load", offline)
+    embed.load_in_background()
+    assert wait_for(lambda: embed._failed_at is not None)
+    embed.load_in_background()
+    time.sleep(0.2)
+    assert loads == [1] and embed.ready() is None
+
+
+def test_a_model_load_calls_back_once_ready(monkeypatch):
+    called = []
+    embed.use(None)
+    monkeypatch.setattr(embed, "_load", lambda: fake_embed)
+    embed.load_in_background(lambda: called.append(1))
+    assert wait_for(lambda: called == [1]) and embed.ready() is fake_embed
+
+
+def test_a_slow_commit_leaves_a_note_for_the_next_sync(store, monkeypatch):
+    clock = iter([1_000, 1_000 + local_mod.SLOW_COMMIT_MS + 1])
+    monkeypatch.setattr(local_mod, "_now_ms", lambda: next(clock))
+    store.append(tables.CONVERSATIONS, [{"content": "slow"}])
+    [note] = [json.loads(line) for line in (store.path.parent / local_mod.LATE_COMMITS_FILE).read_text().splitlines()]
+    assert note == {"store": "db", "table": tables.CONVERSATIONS, "stored_ms": 1_000}
+
+
+def test_a_slow_commit_is_still_well_inside_the_settle_window():
+    assert local_mod.SLOW_COMMIT_MS < SETTLE_MS
 
 
 def test_without_vectors_there_is_nothing_to_backfill(keyword_store):

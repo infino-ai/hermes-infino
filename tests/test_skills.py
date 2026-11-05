@@ -100,6 +100,7 @@ def test_a_platform_that_does_not_answer_loads_the_last_copies(home, platform, t
                        "created_ms": 2})
     skills.register_team_skills(Ctx(), settings, home=tmp_path)
     platform.close()
+    skills._loaded_at.clear()  # a new process
     ctx = Ctx()
     assert skills.register_team_skills(ctx, settings, home=tmp_path) == ["deploy"]
     assert ctx.registered == [("deploy", "v2", "Ship it. (team skill published by alice)")]
@@ -122,6 +123,15 @@ def test_team_skills_turned_off_load_nothing_and_ask_nothing(home, platform, tmp
     publish(platform, {"name": "deploy", "content": "v2", "created_ms": 2})
     before = requests_to(platform, "query_sql")
     assert skills.register_team_skills(Ctx(), settings, home=tmp_path) == []
+    assert requests_to(platform, "query_sql") == before
+
+
+def test_agents_built_soon_after_reuse_the_load(home, platform, tmp_path):
+    settings = sign_in(tmp_path, platform)
+    publish(platform, {"name": "deploy", "content": "v2", "created_ms": 2})
+    assert skills.register_team_skills(Ctx(), settings, home=tmp_path) == ["deploy"]
+    before = requests_to(platform, "query_sql")
+    assert skills.register_team_skills(Ctx(), settings, home=tmp_path) == ["deploy"]
     assert requests_to(platform, "query_sql") == before
 
 

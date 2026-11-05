@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from hermes_infino import chats, recall, tables
@@ -13,6 +15,9 @@ from .helpers import TEAM_DB, requests_to
 
 # Long enough that a few of them fill the block's character budget.
 LONG = 900
+# A recall budget, and a cloud slower than it.
+SHORT_BUDGET_S = 0.3
+SLOW_CLOUD_S = 1.5
 GROUP = chats.Chat(key="telegram:-100", group=True, owner_writes=False)
 
 
@@ -141,6 +146,37 @@ def test_another_chats_cloud_rows_are_dropped(team_local, cloud):
                                           {"row_id": "b", "content": "standup is at ten", tables.CHAT: ""}])
     block, n = Recaller([cloud_source(team_local)], cloud).recall("standup", GROUP)
     assert n == 1 and "at ten" in block and "moved" not in block
+
+
+def test_a_slow_cloud_leaves_this_machine_to_answer_in_time(team_local, personal_local, cloud, monkeypatch):
+    team_local.append(tables.MEMORY, [{"content": "deploy freeze kept here"}])
+    monkeypatch.setattr(recall, "RECALL_BUDGET_S", SHORT_BUDGET_S)
+    monkeypatch.setattr(Recaller, "_cloud_rows", lambda self, src, query: time.sleep(SLOW_CLOUD_S) or [])
+    sources = [cloud_source(team_local, (2 ** 62, "")), Source(recall.PERSONAL, personal_local, "person-db", lambda: None)]
+    started = time.monotonic()
+    block, _ = Recaller(sources, cloud).recall("deploy freeze")
+    assert "kept here" in block
+    assert time.monotonic() - started < SLOW_CLOUD_S  # the two sources' clouds were waited on together, briefly
+
+
+def test_a_400_about_the_query_does_not_turn_hybrid_off(team_local, cloud, platform):
+    cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploy freeze"}])
+    r = Recaller([cloud_source(team_local)], cloud)
+    platform.hybrid_statuses = [400]  # "scripted": nothing about vectors
+    r.recall("deploy freeze")
+    before = requests_to(platform, "hybrid_search")
+    r.recall("deploy freeze")
+    assert requests_to(platform, "hybrid_search") == before + 1
+
+
+def test_personal_memory_shows_only_to_its_person(team_local, personal_local):
+    personal_local.append(tables.MEMORY, [{"content": "dentist on Tuesday", "author": "ana", "scope": "personal"},
+                                          {"content": "dentist on Friday", "author": "ben", "scope": "personal"}])
+    r = Recaller([Source(recall.TEAM, team_local), Source(recall.PERSONAL, personal_local)])
+    ana, _ = r.recall("dentist", person="ana")
+    assert "Tuesday" in ana and "Friday" not in ana
+    assert r.recall("dentist", person="")[1] == 0  # a sender nobody named reads no one's
+    assert r.recall("dentist")[1] == 2  # this machine's own session: its owner's, all of it
 
 
 @pytest.mark.parametrize("row, mark, past", [

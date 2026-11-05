@@ -65,6 +65,7 @@ def infino_command(args: argparse.Namespace) -> int:
 
 def _status(args) -> int:
     from .backend import Backend
+    from .mirror import REFUSED_FILE
     from . import tables
 
     settings = config.load()
@@ -100,6 +101,9 @@ def _status(args) -> int:
         print("   personal memory stays on this machine (no personal database)")
     if b.mirror.last_error():
         print(f"last sync        stopped: {b.mirror.last_error()}")
+    if b.mirror.refused():
+        print(f"refused          {b.mirror.refused()} rows the cloud would not take; they stay here "
+              f"(listed in {config.state_dir(settings.home) / REFUSED_FILE})")
     return 0
 
 
@@ -185,8 +189,8 @@ def _login(args) -> int:
     status = _catch_up(config.load())
     # The launcher picks the database when Hermes starts the tool server, and a
     # running Hermes (its gateway) keeps the one it started.
-    print("Recall reads the cloud from the next turn. The agent's Infino tools read it once Hermes restarts; "
-          "until then they read this machine's copy, which has everything too.")
+    print("A running Hermes moves recall and writes to the cloud within half a minute. Its Infino tools read "
+          "the cloud once Hermes restarts; until then they read this machine's copy, which has everything too.")
     return status
 
 

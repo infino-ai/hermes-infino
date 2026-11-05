@@ -22,7 +22,7 @@ flowchart LR
 | Table | What goes in it |
 | --- | --- |
 | `memory` | Everything written to Hermes's `MEMORY.md` and `USER.md`, and everything saved with the `infino_remember` tool. `infino_forget` deletes a memory. |
-| `conversations` | Every message in every session, and who sent it. Tool calls and tool results are in their own columns. |
+| `conversations` | Every message in every session, and who sent it. Tool calls and tool results are in their own columns. It is a log: when context compression shortens a session, or `/undo` takes a turn back, what was already said stays. |
 | `traces` | Every model call (model, provider, tokens, time taken) and every tool call (name, arguments, result, status, time taken). Secrets in arguments and results are masked the way Hermes masks what it hands any memory plugin. |
 | `skills` | Skills shared with `infino_publish_skill`. Once signed in, every profile on the team can use them, as read-only `infino:<name>` skills whose description says who published them. `INFINO_TEAM_SKILLS=off` keeps a profile to its own skills. |
 
@@ -47,7 +47,11 @@ flowchart TD
   Q -- yes --> P[(Personal database<br/>only your own recall reads it)]
 ```
 
-Personal memory lives in a separate database. The Infino tools never open it, so no other agent and no chat can read it. On your machine it is `$HERMES_HOME/infino/personal`. When you sign in it goes to your personal database (`--personal-database`). If you don't have one, it stays on your machine. It never goes to the team database.
+Personal memory lives in a separate database. The Infino tools never open it, so no other agent and no chat can read it. On your machine it is `$HERMES_HOME/infino/personal`. When you sign in it goes to your personal database (`--personal-database`). If you don't have one, it stays on your machine. It never goes to the team database: when the agent saves a personal memory, the tool call is still logged in `conversations` and `traces`, but with the memory's text left out.
+
+What is said in a conversation is the conversation: `conversations` keeps every message as it was written, including anything personal someone says there.
+
+On a gateway, where one profile answers several people, each person's personal memory is saved under their name and recalled only in their own chats with the agent.
 
 ## Group chats
 
@@ -87,10 +91,10 @@ flowchart LR
 
 **After you sign in**:
 - Every row is still written to your machine first. A sync then sends it to the cloud.
-- The sync sends rows in the order they were saved and picks up where it stopped. If the cloud is down or refuses a write, nothing is lost and nothing is sent twice. `hermes infino status` shows how far behind the cloud is, and why the last sync stopped if it did.
+- The sync sends rows in the order they were saved and picks up where it stopped. If the cloud is down, nothing is lost, and a batch whose upload was cut off is checked against the cloud before it is sent again. A row the cloud refuses outright stays on your machine and is listed by `hermes infino status`, which also shows how far behind the cloud is, and why the last sync stopped if it did.
 - A forgotten memory is deleted from the cloud too.
 - The cloud embeds memory itself, so your machine stops embedding.
-- Recall reads the cloud first and adds any rows on your machine that the cloud doesn't have yet. If the cloud can't be reached, recall searches your machine's own rows by keyword.
+- Recall reads the cloud first and adds any rows on your machine that the cloud doesn't have yet. If the cloud can't be reached or is slow to answer, recall searches your machine's own rows by keyword.
 
 ## The Infino tools
 
@@ -156,7 +160,7 @@ hermes infino login --url https://api.platform.staging.infino.ai --api-key-file 
 
 Before creating anything or sending anything, `login` tells you exactly what will be uploaded and asks you to confirm. Only a person at a terminal can agree to create an account: with no terminal, it refuses, and no flag can answer for you. When you sign in with a key someone gave you, `--yes` confirms the upload. The key is saved in `$HERMES_HOME/infino/credentials.json`, which only you can read.
 
-Recall uses the cloud from the next turn. The Infino tools switch to the cloud when Hermes restarts. Until then they search the copy on your machine, which has everything too.
+A Hermes that is already running picks up the sign-in within half a minute: recall and writes go to the cloud from then on. The Infino tools switch to the cloud when Hermes restarts. Until then they search the copy on your machine, which has everything too.
 
 ## Fleets: settings from config or Remote Config
 

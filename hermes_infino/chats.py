@@ -34,8 +34,10 @@ try:  # Hermes's channel memory binding (when Hermes has channel memory).
 except ImportError:
     _CHANNEL_MEMORY = None
 
-# Chat types Hermes labels a one-to-one chat with.
-DM_TYPES = frozenset({"dm", "private"})
+try:  # The chat types Hermes itself treats as a one-to-one chat ("" included).
+    from gateway.slash_access import _DM_CHAT_TYPES as DM_TYPES
+except ImportError:  # the same set, for a Hermes that does not name it
+    DM_TYPES = frozenset({"dm", "direct", "private", ""})
 # Platforms whose sessions are this machine's own, never a gateway chat.
 LOCAL_PLATFORMS = frozenset({"", "local", "cli", "tui"})
 

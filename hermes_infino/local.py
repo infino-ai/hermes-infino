@@ -18,9 +18,10 @@ checks for the table, so a process that started before the sign-up stops
 embedding too. Local recall is then keyword-only, over this machine's own
 rows, which is all the local copy holds.
 
-A memory is saved before its vector: when the model cannot run (offline on
-first use, before it is downloaded) the memory is kept and found by keyword,
-and the next start embeds every memory that has no vector yet.
+A memory is saved before its vector: while the model is not loaded (it loads
+in the background; offline on first use it cannot) the memory is kept and
+found by keyword, and every memory without a vector is embedded once the
+model is ready. Recall is keyword-only until then.
 
 Every call opens its own connection: an open connection keeps the snapshot
 it opened with and never sees a commit another process made after it (the
@@ -30,6 +31,8 @@ local folder is cheap.
 
 from __future__ import annotations
 
+import fcntl
+import json
 import logging
 import time
 import uuid
@@ -54,6 +57,11 @@ CONFLICT_RETRIES = 5
 CONFLICT_BACKOFF_S = 0.05
 # Rows per append when a caller hands over many.
 APPEND_BATCH = 512
+# A commit slower than this, from its stamp to done, may have been passed by a
+# sync's mark: it must stay well under the mirror's settle window (SETTLE_MS).
+SLOW_COMMIT_MS = 1_000
+# Beside the databases: the commits that were that slow, for the next sync.
+LATE_COMMITS_FILE = "late_commits.jsonl"
 # The local-only table of memory vectors (local mode).
 VECTORS = "memory_vectors"
 # Reciprocal-rank fusion's damping constant (the usual 60): a row's fused
@@ -172,34 +180,47 @@ class LocalStore:
     def _append_batch(self, table: str, batch: list[dict[str, Any]]) -> None:
         schema = arrow_schema(table)
 
+        others = [f for f in schema if f.name != tables.STORED]
+        values = {f.name: pa.array([r.get(f.name) for r in batch], f.type) for f in others}
+
         def attempt():
-            # Stamped per attempt: commit order is what the mirror follows. Past
-            # every row already committed, so a clock stepped back never stamps a
-            # row behind the mirror's mark (where it would never be pushed).
+            # Stamped per attempt, as late as it can be: commit order is what the
+            # mirror follows. Past every row already committed, so a clock
+            # stepped back never stamps a row behind the mirror's mark.
             stored = max(_now_ms(), self._latest_stored(table) + 1)
-            columns = {
-                f.name: pa.array([stored] * len(batch) if f.name == tables.STORED else [r.get(f.name) for r in batch],
-                                 f.type)
-                for f in schema
-            }
+            columns = {f.name: values[f.name] if f.name != tables.STORED else pa.array([stored] * len(batch), f.type)
+                       for f in schema}
             self._connect().open_table(table).append(pa.table(columns, schema=schema))
+            if _now_ms() - stored > SLOW_COMMIT_MS:
+                self._note_late_commit(table, stored)
 
         self._retry(attempt)
         if table == tables.MEMORY and self.has_vectors():
             try:
                 self._append_vectors(batch)
-            except Exception as e:  # the memories are saved; they get vectors at the next start
-                logger.warning("infino: %d memories saved without vectors (found by keyword until the next "
-                               "start embeds them): %s", len(batch), e)
+            except Exception as e:  # the memories are saved; they get vectors when the model can run
+                logger.warning("infino: %d memories saved without vectors (found by keyword until they are "
+                               "embedded): %s", len(batch), e)
+
+    def _note_late_commit(self, table: str, stored: int) -> None:
+        """A commit that took longer than the mirror's settle window: a sync may
+        have moved its mark past these rows before they were visible. The note
+        makes the next sync go back for them (mirror.py)."""
+        logger.warning("infino: a %s commit took over %d ms; the next sync re-checks it", table, SLOW_COMMIT_MS)
+        line = json.dumps({"store": self.path.name, "table": table, "stored_ms": stored}) + "\n"
+        with open(self.path.parent / LATE_COMMITS_FILE, "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.write(line)
+            fcntl.flock(f, fcntl.LOCK_UN)
 
     def _latest_stored(self, table: str) -> int:
         found = self.query_sql(f"SELECT max({tables.STORED}) AS top FROM {table}")
         return int(found[0]["top"] or 0) if found else 0
 
     def backfill_vectors(self) -> int:
-        """Embed the memories saved without a vector (the model could not run
-        then); how many. Local mode only."""
-        if not self.has_vectors():
+        """Embed the memories saved without a vector (the model was not ready
+        then); how many. Local mode, once the model is loaded."""
+        if not self.has_vectors() or embed.ready() is None:
             return 0
         missing = self.query_sql(f"SELECT {tables.ROW_ID}, {tables.MEMORY_TEXT_COLUMN} FROM {tables.MEMORY} "
                                  f"WHERE {tables.ROW_ID} NOT IN (SELECT {tables.ROW_ID} FROM {VECTORS})")
@@ -209,8 +230,12 @@ class LocalStore:
 
     def _append_vectors(self, batch: list[dict[str, Any]]) -> None:
         """The batch's vectors, after its rows: a memory whose vector never
-        lands (a crash between the two) is still found by keyword."""
-        vectors = embed.embedder()([str(r.get(tables.MEMORY_TEXT_COLUMN) or "") for r in batch])
+        lands (a crash between the two, or no model yet) is still found by
+        keyword, and embedded by `backfill_vectors`."""
+        model = embed.ready()
+        if model is None:
+            return
+        vectors = model([str(r.get(tables.MEMORY_TEXT_COLUMN) or "") for r in batch])
         schema = arrow_schema(VECTORS)
         data = pa.table({tables.ROW_ID: pa.array([r[tables.ROW_ID] for r in batch], pa.utf8()),
                          tables.EMBEDDING_COLUMN: pa.array(vectors, schema.field(tables.EMBEDDING_COLUMN).type)},
@@ -251,19 +276,24 @@ class LocalStore:
     def search_memory(self, query: str, k: int, projection: list[str]) -> list[dict]:
         """The `k` best memories: keyword and vector search (the query
         embedded here) fused by reciprocal rank in local mode, keyword alone
-        once the local copy carries no vectors. `score` is the fused score
-        (or the BM25 score), higher better."""
+        once the local copy carries no vectors or while the model is not
+        ready. `score` is the fused score (or the BM25 score), higher better."""
         db = self._connect()
         cols = [c for c in projection if c != "score"]
         keyword = db.open_table(tables.MEMORY).bm25_search(
             tables.MEMORY_TEXT_COLUMN, query, k * FUSION_DEPTH, "or", list(dict.fromkeys(cols + [tables.ROW_ID, "score"]))
         ).to_pylist()
-        if not self.has_vectors():
+        model = embed.ready()
+        if model is None or not self.has_vectors():
             return keyword[:k]
-        [vector] = embed.embedder()([query])
-        nearest = [r for r in db.open_table(VECTORS).vector_search(
-            tables.EMBEDDING_COLUMN, vector, k * FUSION_DEPTH, None, None, None, [tables.ROW_ID, "score"]).to_pylist()
-            if r["score"] <= MAX_VECTOR_DISTANCE]
+        try:
+            [vector] = model([query])
+            nearest = [r for r in db.open_table(VECTORS).vector_search(
+                tables.EMBEDDING_COLUMN, vector, k * FUSION_DEPTH, None, None, None, [tables.ROW_ID, "score"]
+            ).to_pylist() if r["score"] <= MAX_VECTOR_DISTANCE]
+        except Exception as e:  # the keyword hits still answer
+            logger.info("infino: vector recall failed, keyword only: %s", e)
+            return keyword[:k]
         fused: dict[str, float] = {}
         for ranked in (keyword, nearest):
             for rank, r in enumerate(ranked):

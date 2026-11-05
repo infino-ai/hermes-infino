@@ -9,7 +9,19 @@ calls is one append, not eleven. No OpenTelemetry collector is involved.
 Hermes scrubs secrets from everything it hands a memory provider, but these
 hooks get tool arguments and results as the tool saw them. So every text
 cell is put through the same scrub (`redact_for_egress`) before it is kept:
-a key a tool printed never reaches the team's database.
+a key a tool printed never reaches the team's database. The text of a
+personal memory written by a tool call is withheld (privacy.py). A model
+call's row keeps the text the model wrote; its tool calls are rows of their
+own.
+
+Which turn a call belongs to, and who the turn is for, are read from the
+turn itself, never from "the latest call": Hermes hands `sync_turn` no turn
+id, but runs it in the context of the turn that ended (its background worker
+carries the caller's context variables). So each turn's own model and tool
+calls note their turn id in a context variable, and `sync_turn` reads that
+one; Hermes's background review, which shares the session id, runs in a
+context of its own and cannot change it. The person is the gateway's sender
+for the turn (the turn's session values), or this machine's owner.
 """
 
 from __future__ import annotations
@@ -19,11 +31,12 @@ import logging
 import threading
 import time
 from collections import OrderedDict
+from contextvars import ContextVar
 from typing import Any
 
 from agent.memory_provider import spawn_context_thread
 
-from . import backend, config, tables
+from . import backend, chats, config, privacy, tables
 
 try:  # Hermes's scrub for anything leaving the agent.
     from agent.redact import redact_for_egress as _scrub
@@ -35,25 +48,29 @@ logger = logging.getLogger(__name__)
 
 # Longest args/result text kept per trace row.
 MAX_TRACE_CELL_CHARS = 4_000
-# Sessions whose turn and person are remembered; a long-running gateway sees
-# many, and only the latest few are still running.
+# How much of a cell is scrubbed: enough that the kept part is scrubbed whole
+# (a secret straddling the cut is dropped with what follows it), not a
+# multi-megabyte tool output scrubbed on the turn's thread.
+SCRUB_CHARS = 2 * MAX_TRACE_CELL_CHARS
+# Sessions whose person is remembered; a long-running gateway sees many, and
+# only the latest few are still running.
 MAX_SESSIONS = 1_024
 
 
 def _clip(value: Any) -> str:
-    """A cell's text: scrubbed of secrets, then cut (so no secret is cut in half and kept)."""
+    """A cell's text: cut to what can be kept, scrubbed of secrets, then cut."""
     if value is None or value == "":
         return ""
-    s = _scrub(value if isinstance(value, str) else json.dumps(value, default=str))
+    s = value if isinstance(value, str) else json.dumps(value, default=str)
+    s = _scrub(s[:SCRUB_CHARS])
     return s if len(s) <= MAX_TRACE_CELL_CHARS else s[:MAX_TRACE_CELL_CHARS]
 
 
-def _remember(table: OrderedDict, session_id: str, value) -> None:
-    """Note a session's latest value, forgetting the oldest sessions past MAX_SESSIONS."""
-    table[session_id] = value
-    table.move_to_end(session_id)
-    while len(table) > MAX_SESSIONS:
-        table.popitem(last=False)
+def _message_text(message: Any) -> Any:
+    """What the model wrote: an assistant message's text, not its tool calls."""
+    if message is None or isinstance(message, (str, dict)):
+        return (message or {}).get("content") if isinstance(message, dict) else message
+    return getattr(message, "content", None)
 
 
 def _tokens(usage: Any) -> tuple[int, int, int]:
@@ -75,34 +92,42 @@ def _tokens(usage: Any) -> tuple[int, int, int]:
     return int(prompt), out, cache_read + cache_write
 
 
-# The turn each session's latest model or tool call belonged to, so the
-# provider's `conversations` rows carry the same `turn_id` as the turn's
-# `traces` rows (Hermes hands the id to these hooks, not to `sync_turn`).
-_last_turn: OrderedDict[str, str] = OrderedDict()
-_last_turn_lock = threading.Lock()
+# The turn running in this context: (session id, turn id), noted by its own
+# model and tool calls.
+_turn: ContextVar[tuple[str, str]] = ContextVar("infino_turn", default=("", ""))
 
 
-def last_turn_id(session_id: str) -> str:
-    """The turn id of the session's latest recorded call; empty for none."""
-    with _last_turn_lock:
-        return _last_turn.get(session_id or "", "")
+def current_turn_id(session_id: str) -> str:
+    """The id of this context's turn of `session_id`; empty when none of its
+    calls named one (or the context is another session's)."""
+    session, turn = _turn.get()
+    return turn if session == (session_id or "") else ""
 
 
-# Who each session's turns are from, and the profile running it. Hermes hands
-# the trace hooks no user identity; the memory provider learns it (at
-# `initialize`, and per turn in `sync_turn`, which Hermes calls before the
-# turn-end hook that flushes a turn's traces) and notes it here.
+# This machine's person for each session the provider started (`initialize`).
+# A gateway turn's person is its sender instead, read from the turn.
 _identity: OrderedDict[str, tuple[str, str]] = OrderedDict()
+_identity_lock = threading.Lock()
 
 
 def note_identity(session_id: str, author: str, profile: str) -> None:
-    with _last_turn_lock:
-        _remember(_identity, session_id or "", (author, profile))
+    with _identity_lock:
+        _identity[session_id or ""] = (author, profile)
+        _identity.move_to_end(session_id or "")
+        while len(_identity) > MAX_SESSIONS:
+            _identity.popitem(last=False)
 
 
 def _identity_of(session_id: str) -> tuple[str, str]:
-    with _last_turn_lock:
+    with _identity_lock:
         return _identity.get(session_id or "", ("", ""))
+
+
+def turn_person(session_id: str) -> str:
+    """Who the running turn is for: the gateway's sender, or this machine's person."""
+    if chats.session("HERMES_SESSION_PLATFORM").lower() not in chats.LOCAL_PLATFORMS:
+        return chats.session("HERMES_SESSION_USER_NAME") or chats.session("HERMES_SESSION_USER_ID")
+    return _identity_of(session_id)[0]
 
 
 class TraceRecorder:
@@ -114,8 +139,7 @@ class TraceRecorder:
         with self._lock:
             self._buffers.setdefault(session_id or "", []).append(row)
         if row["turn_id"]:
-            with _last_turn_lock:
-                _remember(_last_turn, session_id or "", row["turn_id"])
+            _turn.set((session_id or "", row["turn_id"]))
 
     def on_api(self, **kw: Any) -> None:
         inp, out, cached = _tokens(kw.get("usage"))
@@ -137,19 +161,21 @@ class TraceRecorder:
             "output_tokens": out,
             "cached_tokens": cached,
             "args": "",
-            "result": _clip(kw.get("assistant_message") or ""),
+            "result": _clip(_message_text(kw.get("assistant_message"))),
             "created_ms": int(time.time() * 1000),
         })
 
     def on_tool(self, **kw: Any) -> None:
+        tool = str(kw.get("tool_name") or "")
+        personal = privacy.is_personal_call(tool, kw.get("args"))
         self._add(kw.get("session_id", ""), {
             "session_id": str(kw.get("session_id") or ""),
             "turn_id": str(kw.get("turn_id") or ""),
             "request_id": str(kw.get("tool_call_id") or ""),
             "kind": "tool",
-            "name": str(kw.get("tool_name") or ""),
+            "name": tool,
             "model": "",
-            "tool": str(kw.get("tool_name") or ""),
+            "tool": tool,
             "provider": "",
             "status": str(kw.get("status") or ""),
             "error": _clip(kw.get("error_message") or ""),
@@ -157,8 +183,8 @@ class TraceRecorder:
             "input_tokens": 0,
             "output_tokens": 0,
             "cached_tokens": 0,
-            "args": _clip(kw.get("args")),
-            "result": _clip(kw.get("result")),
+            "args": _clip(privacy.withhold(tool, kw.get("args"))),
+            "result": privacy.WITHHELD if personal else _clip(kw.get("result")),
             "created_ms": int(time.time() * 1000),
         })
 
@@ -169,7 +195,7 @@ class TraceRecorder:
         if not rows:
             return
         settings = config.load()  # read in the hook's own profile scope
-        author, profile = _identity_of(session)
+        author, profile = turn_person(session), _identity_of(session)[1]
         for row in rows:
             row["author"] = author
             row["profile"] = profile
