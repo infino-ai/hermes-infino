@@ -8,7 +8,7 @@ When you [sign in](#signing-in), everything is kept in Infino Cloud too. Work go
 
 ## What it stores
 
-The plugin keeps four tables in the team database, and the first three of them in your personal database.
+The plugin keeps four tables.
 
 **`memory`** holds the entries in Hermes's `MEMORY.md` and `USER.md`, including edits you make by hand, plus whatever the agent saves with `infino_remember`. A shared profile on a gateway keeps no `USER.md` entries. `infino_forget` deletes a memory, even one a teammate's agent saved.
 
