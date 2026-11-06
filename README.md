@@ -4,9 +4,7 @@ hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) 
 
 By default, everything is kept in a database on your machine using Infino's open source retrieval engine, and nothing leaves your device.
 
-However, with an Infino account, your team shares a database in Infino Cloud, so every agent on the team can search what the others did. Personal memory, and any work you mark as personal, stays out of it. [Signing in](#signing-in) says what gets uploaded and when.
-
-In Infino Cloud, your data lives on object storage, either Infino's or a bucket in your own AWS, Google Cloud or Azure account, and you can encrypt your bucket with a key you own (CMEK). See [Where your data lives](#where-your-data-lives).
+With an Infino account, your team shares a database in Infino Cloud, so every agent on the team can search what the others did. Personal memory, and any work you mark as personal, stays out of it. [Signing in](#signing-in) says what gets uploaded and when.
 
 ## What it stores
 
@@ -26,7 +24,7 @@ Teammates read each other's memories, so a memory names the person it's about ("
 
 ## Where your data lives
 
-An Infino database is just files. Each table is a set of Parquet files with keyword and vector indexes built in, and search and SQL read those files directly. On your machine, the Infino engine runs inside Hermes and keeps the files on your disk. In Infino Cloud, Infino's servers keep them on object storage and cache what they read.
+An Infino database is just files. Each table is a set of Parquet files with keyword and vector indexes built in, and search and SQL read those files directly. On your machine, the Infino engine runs inside Hermes and keeps the files on your disk. In Infino Cloud, your data lives on object storage, either Infino's or a bucket in your own AWS, Google Cloud or Azure account, and you can encrypt your bucket with a key you own (CMEK).
 
 ```mermaid
 flowchart LR
