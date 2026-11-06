@@ -1,22 +1,22 @@
 # Infinite recall for Hermes agents
 
-hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that gives your agents a memory that lasts. It saves four things into Infino: memory, conversations, traces, and skills, including across teams and Hermes fleets. Before each turn it gives the agent the memories that matter for that turn, and the agent can search the team's history with the Infino tools.
+hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that gives your agents a memory that lasts. It stores four things in Infino: memory, conversations, traces and skills. Before each turn it gives the agent the memories that matter for that turn, and with the Infino tools the agent can search everything stored except what's personal.
 
-By default, everything is kept in a database on your machine using Infino's open source retrieval engine, and nothing leaves your device.
+Without an account, everything stays on your machine, in databases run by Infino's open source engine.
 
-With an [Infino account](#signing-in), your team shares a database in Infino Cloud, so every agent on the team can search what the others did. Personal memory, and any work you mark as personal, stays out of it.
+When you [sign in](#signing-in), everything is kept in Infino Cloud too. Work goes to a team database, and everyone who signs in to the same team database shares it, so every agent on the team can search what the others did. Personal memory, and any work you mark as personal, goes to a personal database of your own instead.
 
 ## What it stores
 
 The plugin keeps four tables.
 
-**`memory`** holds everything in Hermes's `MEMORY.md` and `USER.md`, including edits you make by hand, plus whatever the agent saves with `infino_remember`. `infino_forget` deletes a memory, even one a teammate's agent saved.
+**`memory`** holds the entries in Hermes's `MEMORY.md` and `USER.md`, including edits you make by hand, plus whatever the agent saves with `infino_remember`. A shared profile on a gateway keeps no `USER.md` entries. `infino_forget` deletes a memory, even one a teammate's agent saved.
 
 **`conversations`** logs every message of every session a person has with the agent, and who sent it. Tool calls and tool results have their own columns. A message stays in the log even after context compression or `/undo` removes it from the session. Scheduled jobs and subagents add no conversation rows; their model and tool calls are in `traces`.
 
 **`traces`** records every model call (model, provider, tokens, time) and every tool call (name, arguments, result, status, time). Secrets are masked the same way Hermes masks them for any memory plugin.
 
-**`skills`** holds the skills your agents share with `infino_publish_skill`. Once you sign in, every profile on the team can use them as read-only `infino:<name>` skills. Members of a group chat can't publish, and secrets are masked first. Set `INFINO_TEAM_SKILLS=off` to keep a profile to its own skills.
+**`skills`** holds the skills your agents share with `infino_publish_skill`. Once you sign in, every profile on the team can use them as read-only `infino:<name>` skills, from its next session. Members of a group chat can't publish, and secrets are masked first. Set `INFINO_TEAM_SKILLS=off` to keep a profile to its own skills.
 
 A turn and its traces share a `session_id` and a `turn_id`, so you can join them. Every row has a `row_id`.
 
@@ -112,7 +112,7 @@ Hermes starts the tools inside its own environment, with the Node its installer 
 `hermes infino login` creates a free account, on a platform that offers them, or joins your team with a key a teammate gives you.
 
 ```bash
-hermes infino login                                         # create a free account
+hermes infino login                                         # create a free account, where the platform offers them
 hermes infino login --api-key-file KEY --team-database TEAM  # join a team with a key
 hermes infino status                                        # how far behind the cloud is
 hermes infino sync                                          # send what the cloud doesn't have yet
@@ -223,6 +223,8 @@ mcp_servers:
 ```
 
 With Hermes's [Remote Config](https://github.com/NousResearch/hermes-agent/pull/122509) (Hermes 0.22.6 and later, turned on with `HERMES_CONFIG_BACKEND=remote`), these settings come from the config service instead of a file. An administrator sets the team database once, and every agent on the team starts with it. Remote Config won't store a key written out in full, so keep `INFINO_API_KEY` as a `${INFINO_API_KEY}` reference and put the key in each profile's `.env`. `hermes infino status` shows where the settings came from.
+
+A profile set up this way has no personal database unless you name one with `INFINO_PERSONAL_DATABASE`. Without one, its personal memory and personal work stay on that machine.
 
 ## Settings
 
