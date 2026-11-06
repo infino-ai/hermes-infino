@@ -129,6 +129,8 @@ Before it creates or sends anything, `login` shows you exactly what will be uplo
 
 Once you're signed in, the plugin uploads everything your machine has kept so far, then each new memory, conversation, trace and skill as it happens. Your machine keeps its own copy.
 
+`login` also makes you a personal database, so what's personal is kept in the cloud too, never in the team database. It's a new database named after the team with a random part, such as `hermes-team-personal-3f9a1c2e`, so no two people ever share one, and `login` tells you its name. To use the same one from another machine, sign in there with `--personal-database` and that name. `--no-personal-database` keeps what's personal on your machine only. If the platform won't make the database (a free plan's database limit, say), you're still signed in, and what's personal stays on your machine.
+
 If Hermes is already running, it picks up the sign-in within half a minute, and recall and writes go to the cloud from then on. The Infino tools switch over when Hermes restarts. Until then they search the copy on your machine, which has everything too.
 
 ## Team memory and personal memory
@@ -141,7 +143,7 @@ A memory belongs to the team unless it's about one person. Nobody has to label i
 | Hermes's `MEMORY.md` | Hermes's `USER.md` |
 | `infino_remember`, by default | `infino_remember`, when the agent marks it personal |
 
-Personal memory lives in a database of its own, and the Infino tools never open it, so no other agent and no chat can read it. On your machine it's in `$HERMES_HOME/infino/personal`. When you sign in, it goes to your personal database (`--personal-database`), or stays on your machine if you don't have one. Either way, it never reaches the team database. When the agent saves a personal memory, the tool call still shows up in `conversations` and `traces`, but without the memory's text.
+Personal memory lives in a database of its own, and the Infino tools never open it, so no other agent and no chat can read it. On your machine it's in `$HERMES_HOME/infino/personal`. When you sign in, it goes to your personal database, which `login` makes for you, or stays on your machine if you don't have one. Either way, it never reaches the team database. When the agent saves a personal memory, the tool call still shows up in `conversations` and `traces`, but without the memory's text.
 
 A conversation, on the other hand, is kept as it happened. `conversations` records every message as it was written, including anything personal someone says. To keep a whole conversation out of the team database, mark the work personal (see the next section).
 

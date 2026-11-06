@@ -152,6 +152,74 @@ def test_login_keeps_a_personal_database(home, platform, tmp_path, terminal):
     assert set(platform.databases["me"]) == set(tables.PERSONAL)
 
 
+def personal_database_of(home_dir) -> str:
+    """The personal database a sign-in saved ("" for none)."""
+    return config.read_credentials(home_dir).get("personal_database", "")
+
+
+def login_with_key(platform, key_file, *extra: str) -> int:
+    return run("login", "--url", platform.url, "--api-key-file", str(key_file), "--team-database", TEAM_DB, "--yes",
+               *extra)
+
+
+def test_login_makes_a_personal_database_by_default(home, platform, tmp_path, terminal, capsys):
+    terminal("yes")
+    assert run("login", "--url", platform.url, "--team-database", TEAM_DB) == 0
+    personal = personal_database_of(tmp_path)
+    assert personal.startswith(TEAM_DB + cli.PERSONAL_PART)
+    assert set(platform.databases[personal]) == set(tables.PERSONAL)
+    out = capsys.readouterr().out
+    assert cli.NEW_PERSONAL_DATABASE in out and f"Your personal database is '{personal}'" in out
+
+
+def test_a_key_someone_gave_gets_a_personal_database_too(home, platform, tmp_path, no_terminal, key_file):
+    assert login_with_key(platform, key_file) == 0
+    assert set(platform.databases) == {TEAM_DB, personal_database_of(tmp_path)}
+
+
+def test_each_sign_in_gets_a_new_personal_database(home, platform, tmp_path, no_terminal, key_file):
+    assert login_with_key(platform, key_file) == 0
+    first = personal_database_of(tmp_path)
+    (config.state_dir(tmp_path) / config.CREDENTIALS_FILE).unlink()  # signed out; someone signs in again
+    assert login_with_key(platform, key_file) == 0
+    assert personal_database_of(tmp_path) not in ("", first)
+
+
+def test_a_new_personal_database_is_never_one_that_exists(home, platform, tmp_path, no_terminal, key_file,
+                                                         monkeypatch, capsys):
+    monkeypatch.setattr(cli.secrets, "token_hex", lambda n: "0" * 2 * n)
+    taken = TEAM_DB + cli.PERSONAL_PART + "0" * 2 * cli.PERSONAL_RANDOM_BYTES
+    platform.databases[taken] = {}  # someone else's
+    assert login_with_key(platform, key_file) == 0
+    assert personal_database_of(tmp_path) == "" and platform.databases[taken] == {}
+    assert "No personal database" in capsys.readouterr().err
+
+
+def test_a_long_team_name_still_makes_a_name_the_platform_takes():
+    name = cli._new_personal_name("t" * cli.MAX_DATABASE_NAME)
+    assert len(name) == cli.MAX_DATABASE_NAME and cli.PERSONAL_PART in name
+
+
+def test_no_personal_database_keeps_what_is_personal_here(home, platform, tmp_path, no_terminal, key_file, capsys):
+    assert login_with_key(platform, key_file, "--no-personal-database") == 0
+    assert personal_database_of(tmp_path) == "" and set(platform.databases) == {TEAM_DB}
+    assert "nowhere: it stays on this machine" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("named", [[], ["--personal-database", "mine"]])
+def test_a_personal_database_the_platform_refuses_leaves_the_sign_in_working(home, platform, tmp_path, terminal,
+                                                                             capsys, named):
+    m, _ = make_manager(tmp_path)
+    m.handle_tool_call("infino_remember", {"content": "kept before sign-in"})
+    platform.database_limit = 1  # a free plan with room for the team's database only
+    terminal("yes")
+    assert run("login", "--url", platform.url, "--team-database", TEAM_DB, *named) == 0
+    assert personal_database_of(tmp_path) == "" and set(platform.databases) == {TEAM_DB}
+    assert "No personal database" in capsys.readouterr().err
+    # Without a personal database saved, nothing stops the team's sync.
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["kept before sign-in"]
+
+
 def test_the_upload_notice_says_what_goes_and_what_stays():
     notice = cli._upload_notice("https://x", TEAM_DB, {"memory": 3, "traces": 9}, new_account=True)
     assert "creates a free Infino account on https://x" in notice
