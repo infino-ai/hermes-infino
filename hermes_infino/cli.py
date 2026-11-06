@@ -19,9 +19,10 @@ personal profiles and scheduled jobs) goes to a personal database, which
 `login` makes for this sign-in unless one is named (`--personal-database`) or
 none is wanted (`--no-personal-database`). A database made this way is always
 a new one, named after the team with a random part, so no two people ever
-share one. When the platform will not make it (a free plan's database limit,
-or a key limited to other databases), the sign-in goes on without one and what
-is personal stays on this machine.
+share one. When it cannot be made (a key that may not make that database, or
+a platform that does not answer), the sign-in goes on without one and what is
+personal stays on this machine. The sign-in is saved before that step: the
+platform gives a new account's key only once.
 
 Hermes imports this module to build its command line for every command, so
 the engine and the model are imported only inside the commands that use them.
@@ -92,7 +93,6 @@ def infino_command(args: argparse.Namespace) -> int:
 
 def _status(args) -> int:
     from .backend import Backend
-    from .mirror import REFUSED_FILE
     from . import tables
 
     settings = config.load()
@@ -108,7 +108,13 @@ def _status(args) -> int:
         except Exception as e:
             print(f"   unreadable: {e}")
     try:
-        print(f"   memory vectors {'on (local model)' if b.local.has_vectors() else 'off (the cloud embeds)'}")
+        if b.local.has_vectors():
+            vectors = "on (local model)"
+        elif settings.signed_in:
+            vectors = "off (the cloud embeds)"
+        else:  # local mode: the provider makes them when Hermes starts
+            vectors = "not made yet (Hermes makes them when it starts)"
+        print(f"   memory vectors {vectors}")
     except Exception:
         pass
     if not settings.signed_in:
@@ -129,10 +135,21 @@ def _status(args) -> int:
               "(no personal database)")
     if b.mirror.last_error():
         print(f"last sync        stopped: {b.mirror.last_error()}")
-    if b.mirror.refused():
-        print(f"refused          {b.mirror.refused()} rows the cloud would not take; they stay here "
-              f"(listed in {config.state_dir(settings.home) / REFUSED_FILE})")
+    refused = _refused(b)
+    if refused:
+        print(f"refused          {refused}; they stay here")
     return 0
+
+
+def _refused(b) -> str:
+    """The rows the cloud refused outright, as `status` and `sync` say it;
+    "" when there are none."""
+    from .mirror import REFUSED_FILE
+
+    n = b.mirror.refused()
+    if not n:
+        return ""
+    return f"{n} rows the cloud would not take (listed in {config.state_dir(b.settings.home) / REFUSED_FILE})"
 
 
 # -- login --------------------------------------------------------------------
@@ -183,10 +200,10 @@ def _new_personal_name(team: str) -> str:
 def _personal_database(client: InfinoClient, args, team: str) -> Optional[str]:
     """The personal database this sign-in uses, ready in the cloud: the one
     named (made if missing), else a new one, never one that exists already (it
-    could be anyone's). None with --no-personal-database, or when the platform
-    will not make it: what is personal then stays on this machine, and the
-    sign-in goes on, since a personal database the cloud refuses would stop
-    every sync."""
+    could be anyone's). None with --no-personal-database, or when it cannot be
+    made, for any reason (refused, unreachable, timed out): what is personal
+    then stays on this machine, and the sign-in, saved already, goes on, since
+    a personal database the cloud refuses would stop every sync."""
     if args.no_personal_database:
         return None
     name = args.personal_database or _new_personal_name(team)
@@ -195,8 +212,8 @@ def _personal_database(client: InfinoClient, args, team: str) -> Optional[str]:
             client.ensure_database(name)
         else:
             client.create_database(name)
-    except InfinoError as e:
-        print(f"No personal database: the platform would not make '{name}' ({e}). Personal memory, and the "
+    except Exception as e:
+        print(f"No personal database: '{name}' could not be made ({e}). Personal memory, and the "
               f"conversations and traces of personal profiles and scheduled jobs, stay on this machine.",
               file=sys.stderr)
         return None
@@ -220,10 +237,21 @@ def _local_counts() -> dict:
 def _login(args) -> int:
     current = config.load()
     if current.signed_in:
-        print(f"Already signed in: {current.url} / {current.team_database}. `hermes infino status` shows how far the cloud is.")
+        print(f"Already signed in: {current.url} / {current.team_database}, from the {current.source}. "
+              "`hermes infino status` shows how far the cloud is.")
+        print(f"To sign in again, remove {config.credentials_path()} and run `hermes infino login`. The `env` "
+              f"block of mcp_servers.{current.mcp_server} in the config, and the environment, take precedence "
+              "over a sign-in: change a setting there to change it.")
         return 0
     url = (args.url or current.url or DEFAULT_URL).rstrip("/")
-    database = args.team_database or DEFAULT_DATABASE
+    # The team the profile already names, so the notice, the account and the
+    # rows all name the same one.
+    database = args.team_database or current.team_database or DEFAULT_DATABASE
+    if args.personal_database and args.personal_database == database:
+        print(f"infino: '{database}' is the team database, so it cannot be your personal database: what is "
+              "personal would go into the team's tables. Name another, or leave out --personal-database and "
+              "one is made. Nothing was created or sent.", file=sys.stderr)
+        return 1
     new_account = not args.api_key_file
     counts = _local_counts()
     print(_upload_notice(url, database, counts, new_account, _personal_destination(args)))
@@ -249,10 +277,6 @@ def _login(args) -> int:
                   f"gave you: hermes infino login --api-key-file KEY --team-database TEAM", file=sys.stderr)
             return 1
         api_key, database = str(trial["api_key"]), str(trial.get("database") or database)
-        credit = trial.get("credit_cents")
-        print(f"Created a free account" + (f" with ${int(credit) / 100:.2f} of credit" if credit else "") + ".")
-        if trial.get("console_url"):
-            print(f"   manage it at {trial['console_url']}")
     else:
         try:
             api_key = Path(args.api_key_file).expanduser().read_text().strip()
@@ -263,14 +287,21 @@ def _login(args) -> int:
         client.list_databases()  # the key works before anything is stored
         client.ensure_database(database)
 
-    personal = _personal_database(InfinoClient(api_key, url), args, database)
+    # Saved before anything else can fail: the platform gives a new account's
+    # key only once, and one free account per network.
     creds = {"url": url, "api_key": api_key, "team_database": database,
              "consented_at_ms": int(time.time() * 1000)}
+    path = config.write_credentials(creds)
+    if new_account:
+        credit = trial.get("credit_cents")
+        print(f"Created a free account" + (f" with ${int(credit) / 100:.2f} of credit" if credit else "") + ".")
+        if trial.get("console_url"):
+            print(f"   manage it at {trial['console_url']}")
+    print(f"Signed in; the key is in {path} (owner-only).")
+    personal = _personal_database(InfinoClient(api_key, url), args, database)
     if personal:
         creds["personal_database"] = personal
-    path = config.write_credentials(creds)
-    print(f"Signed in; the key is in {path} (owner-only).")
-    if personal:
+        config.write_credentials(creds)
         print(f"Your personal database is '{personal}'. To use it from another machine too, sign in there "
               f"with --personal-database {personal}.")
     status = _catch_up(config.load())
@@ -334,5 +365,18 @@ def _catch_up(settings: config.Settings) -> int:
         # once they have settled, takes them.
         last_pass = not pushed or time.monotonic() > deadline
         time.sleep(SETTLE_MS / 1000)
-    print(f"\nThe cloud has everything kept here ({total} rows pushed).")
+    # What a sync never sends: what is personal, without a personal database,
+    # and the rows the cloud refused outright.
+    kept_here = []
+    if not settings.personal_database:
+        kept_here.append("what is personal: there is no personal database")
+    refused = _refused(b)
+    if refused:
+        kept_here.append(refused)
+    if not kept_here:
+        print(f"\nThe cloud has everything kept here ({total} rows pushed).")
+        return 0
+    print(f"\nThe cloud has everything kept here except what stays on this machine ({total} rows pushed):")
+    for what in kept_here:
+        print(f"   {what}")
     return 0

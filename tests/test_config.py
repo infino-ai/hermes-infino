@@ -28,6 +28,12 @@ def write_config(home_dir: Path, doc: dict) -> None:
     (home_dir / "config.yaml").write_text(json.dumps(doc))  # JSON is YAML
 
 
+def write_tools_setting(home_dir: Path, line: str) -> None:
+    """A config whose tools block holds one setting, written as a person
+    writes YAML (a bare `off` is a boolean to Hermes's loader)."""
+    (home_dir / "config.yaml").write_text(f"mcp_servers:\n  infino:\n    command: hermes\n    env:\n      {line}\n")
+
+
 def test_nothing_set_is_local_mode_on_the_default_url(home, tmp_path):
     s = config.load(tmp_path)
     assert not s.signed_in and s.source == ""
@@ -45,7 +51,8 @@ def test_the_environment_wins_over_the_sign_in(home, tmp_path):
     home.setenv("INFINO_API_KEY", "env-key")
     home.setenv("INFINO_TEAM_DATABASE", "env-db")
     s = config.load(tmp_path)
-    assert (s.api_key, s.team_database, s.url, s.source) == ("env-key", "env-db", "http://file", "environment")
+    # The sign-in's URL goes with the sign-in's key, not this one.
+    assert (s.api_key, s.team_database, s.url, s.source) == ("env-key", "env-db", DEFAULT_URL, "environment")
 
 
 def test_a_split_source_is_named_by_both(home, tmp_path):
@@ -162,6 +169,65 @@ def test_team_skills_are_on_unless_turned_off(home, tmp_path):
         assert not config.load(tmp_path).team_skills
     home.setenv("INFINO_TEAM_SKILLS", "on")
     assert config.load(tmp_path).team_skills
+
+
+@pytest.mark.parametrize("where", ["environment", "config"])
+def test_a_key_from_elsewhere_never_takes_the_sign_ins_url_or_personal_database(home, tmp_path, where):
+    # A profile that once ran `login`, now given a fleet's key and team.
+    config.write_credentials({"api_key": "a", "team_database": "t1", "url": "http://staging",
+                              "personal_database": "p"}, tmp_path)
+    fleet = {"INFINO_API_KEY": "b", "INFINO_TEAM_DATABASE": "t2"}
+    if where == "config":
+        write_config(tmp_path, {"mcp_servers": {"infino": {"command": "x", "env": fleet}}})
+    else:
+        for name, value in fleet.items():
+            home.setenv(name, value)
+    s = config.load(tmp_path)
+    assert (s.api_key, s.team_database) == ("b", "t2")
+    assert (s.url, s.personal_database) == (DEFAULT_URL, None)
+
+
+def test_the_sign_ins_key_keeps_its_url_and_personal_database(home, tmp_path):
+    config.write_credentials({"api_key": "a", "team_database": "t1", "url": "http://staging",
+                              "personal_database": "p"}, tmp_path)
+    home.setenv("INFINO_TEAM_DATABASE", "t2")
+    s = config.load(tmp_path)
+    assert (s.api_key, s.team_database, s.url, s.personal_database) == ("a", "t2", "http://staging", "p")
+    home.setenv("INFINO_API_KEY", "a")  # the same key, set in .env too
+    s = config.load(tmp_path)
+    assert (s.url, s.personal_database) == ("http://staging", "p")
+
+
+@pytest.mark.parametrize("value", ["off", "no", "false", "0"])
+def test_a_bare_yaml_off_in_the_tools_block_turns_team_skills_off(home, tmp_path, value):
+    write_tools_setting(tmp_path, f"INFINO_TEAM_SKILLS: {value}")
+    assert not config.load(tmp_path).team_skills
+
+
+def test_a_bare_yaml_off_in_the_tools_block_wins_over_the_environment(home, tmp_path):
+    home.setenv("INFINO_PERSONAL_PROFILE", "on")
+    write_tools_setting(tmp_path, "INFINO_PERSONAL_PROFILE: off")
+    assert not config.load(tmp_path).personal_profile
+
+
+def test_a_bare_yaml_on_in_the_tools_block_turns_a_setting_on(home, tmp_path):
+    write_tools_setting(tmp_path, "INFINO_PERSONAL_PROFILE: on")
+    assert config.load(tmp_path).personal_profile
+
+
+@pytest.mark.parametrize("where", ["sign-in", "environment"])
+def test_a_personal_database_that_is_the_team_database_is_none(home, tmp_path, monkeypatch, where):
+    warned = []
+    monkeypatch.setattr(config.logger, "warning", lambda *args: warned.append(args))
+    if where == "sign-in":
+        config.write_credentials({"api_key": "k", "team_database": TEAM_DB, "personal_database": TEAM_DB}, tmp_path)
+    else:
+        for name in ("INFINO_TEAM_DATABASE", "INFINO_PERSONAL_DATABASE"):
+            home.setenv(name, TEAM_DB)
+        home.setenv("INFINO_API_KEY", "k")
+    assert config.load(tmp_path).personal_database is None
+    assert config.load(tmp_path).personal_database is None
+    assert len(warned) == 1  # load runs every turn: one warning is enough
 
 
 # -- the manifests agree with the code ----------------------------------------
