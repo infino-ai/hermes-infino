@@ -1,10 +1,10 @@
-# Durable recall for Hermes agents
+# Infinite recall for Hermes agents
 
-hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that gives your agents a memory that lasts. It saves what they remember, what they say and what they do into Infino, and before every turn it hands the agent the memories that matter for that turn. Your agents can also search all of it with the Infino tools.
+hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that gives your agents a memory that lasts. It saves four things into Infino: memory, conversations, traces, and skills, including across teams and Hermes fleets. Before each turn it gives the agent the memories that matter for that turn, and the agent can search all history with the Infino tools.
 
-You don't need an account. Out of the box, everything goes into a database on your machine, and nothing leaves it.
+By default, everything is kept in a database on your machine using Infino's open source retrieval engine, and nothing leaves your device.
 
-Sign in to Infino Cloud and your team shares one database, so every agent can find what the others learned and did. Personal memory, and any work you mark as personal, stays out of it.
+However, with an Infino account, your team shares a database in Infino Cloud, so every agent on the team can search what the others did. Personal memory, and any work you mark as personal, stays out of it. [Signing in](#signing-in) says what gets uploaded and when.
 
 Infino Cloud is SOC 2 Type II. Your data lives on object storage, either Infino's or a bucket in your own AWS, Google Cloud or Azure account, and you can encrypt your bucket with a key you own (CMEK). See [Where your data lives](#where-your-data-lives).
 
