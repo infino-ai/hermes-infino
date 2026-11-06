@@ -116,6 +116,7 @@ def test_personal_scope_goes_to_the_personal_database(env, platform, tmp_path):
 def test_turns_are_appended_once_each_with_tool_calls_and_results(env, platform, tmp_path):
     hooks = hook_ctx()
     mgr, provider = make_manager(tmp_path)
+    hooks["pre_llm_call"](session_id="s1", turn_id="t1", user_message="check the build")
     hooks["post_api_request"](session_id="s1", turn_id="t1", api_request_id="r1", model="m", usage={})
     messages = [
         {"role": "user", "content": "check the build"},
@@ -125,6 +126,7 @@ def test_turns_are_appended_once_each_with_tool_calls_and_results(env, platform,
     ]
     provider.sync_turn("check the build", "The build passed.", session_id="s1", messages=messages,
                        turn_author={"id": "u1", "name": "alice", "is_bot": False})
+    hooks["pre_llm_call"](session_id="s1", turn_id="t2", user_message="thanks")
     hooks["post_api_request"](session_id="s1", turn_id="t2", api_request_id="r2", model="m", usage={})
     messages += [{"role": "user", "content": "thanks"}, {"role": "assistant", "content": "anytime"}]
     provider.sync_turn("thanks", "anytime", session_id="s1", messages=messages)
@@ -211,7 +213,7 @@ def test_traces_land_locally_then_in_the_cloud(env, platform, tmp_path):
     assert rows[0]["model"] == "claude" and rows[0]["tool"] == ""
     assert rows[1]["tool"] == "terminal" and rows[1]["model"] == ""
     assert rows[1]["args"] == '{"cmd": "ls"}'
-    assert traces.current_turn_id("s1") == "t1"
+    assert {r["turn_id"] for r in rows} == {"t1"}
 
 
 def test_traces_carry_the_turns_author(env, platform, tmp_path):

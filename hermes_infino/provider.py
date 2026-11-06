@@ -49,7 +49,7 @@ from typing import Any, Optional
 from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_thread
 
 from . import backend, chats, config, instructions, privacy, recall, skills, tables
-from .traces import current_turn_id, note_identity
+from .traces import note_identity, turn_id_for
 
 logger = logging.getLogger(__name__)
 
@@ -411,9 +411,8 @@ class InfinoMemoryProvider(MemoryProvider):
             new = [{"role": "user", "content": user_content}, {"role": "assistant", "content": assistant_content}]
         start = self._next_seq[session] if session in self._next_seq else self._stored_next_seq(session)
         self._next_seq[session] = start + len(new)
-        # Read in this turn's own context (Hermes runs sync_turn in it): its id,
-        # as its model and tool calls noted it.
-        turn = current_turn_id(session)
+        # The turn's id, as Hermes announced it when the turn started (traces.py).
+        turn = turn_id_for(session, user_content)
         # A tool message names its call, not always its tool: the call's tool is
         # on the assistant message that made it.
         called = {str(c.get("id")): c.get("function") or {}

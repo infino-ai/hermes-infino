@@ -10,7 +10,7 @@ import pytest
 from plugins.config_backends import remote as remote_config
 from plugins.config_backends.remote import backend as remote_backend, credentials as remote_credentials
 
-from hermes_infino import backend, embed, mirror, privacy, skills
+from hermes_infino import backend, embed, mirror, privacy, skills, traces
 
 from .fake_platform import FakePlatform
 from .helpers import REMOTE_CONFIG_STUB, TEAM_DB, TEST_SYNC_DELAY_S, fake_embed
@@ -30,10 +30,12 @@ def quick(monkeypatch):
     backend._backends.clear()
     skills._loaded_at.clear()
     privacy._sessions.clear()  # what one test noted about its sessions is not another's
+    traces._started.clear()
     yield
     embed.use(None)
     backend._backends.clear()
     privacy._sessions.clear()
+    traces._started.clear()
 
 
 @pytest.fixture
