@@ -6,18 +6,7 @@ By default, everything is kept in a database on your machine using Infino's open
 
 However, with an Infino account, your team shares a database in Infino Cloud, so every agent on the team can search what the others did. Personal memory, and any work you mark as personal, stays out of it. [Signing in](#signing-in) says what gets uploaded and when.
 
-Infino Cloud is SOC 2 Type II. Your data lives on object storage, either Infino's or a bucket in your own AWS, Google Cloud or Azure account, and you can encrypt your bucket with a key you own (CMEK). See [Where your data lives](#where-your-data-lives).
-
-```mermaid
-flowchart LR
-  H[Hermes agent] -- "memory, messages,<br/>model and tool calls" --> P[hermes-infino]
-  P --> T[(Team database)]
-  P --> M[(Personal database)]
-  T -- "relevant memories,<br/>before each turn" --> H
-  M -- "relevant memories,<br/>before each turn" --> H
-  T -- "search, find, sql, ask" --> C[Infino tools]
-  C --> H
-```
+In Infino Cloud, your data lives on object storage, either Infino's or a bucket in your own AWS, Google Cloud or Azure account, and you can encrypt your bucket with a key you own (CMEK). See [Where your data lives](#where-your-data-lives).
 
 ## What it saves
 
