@@ -128,7 +128,7 @@ hermes infino login --url https://api.platform.staging.infino.ai --api-key-file 
 
 Once you're signed in, the plugin uploads what your machine has kept so far, then each new memory, conversation, trace and skill as it happens. Your machine keeps its own copy.
 
-`login` also creates your personal database and prints its name. The name is the team's plus a random suffix, such as `hermes-team-personal-3f9a1c2e`, so no other sign-in uses it. If you signed in with a key your team shares, everyone with that key can read it. To use it from another machine, sign in there with `--personal-database` and that name. To keep personal data on this machine only, add `--no-personal-database`. If the platform can't create the database, for example because a free plan has reached its database limit, you're still signed in, and personal data stays on your machine.
+`login` also creates your personal database and prints its name. The name is the team's plus a random suffix, such as `hermes-team-personal-3f9a1c2e`, so it's never shared with anyone. To use it from another machine, sign in there with `--personal-database` and that name. To keep personal data on this machine only, add `--no-personal-database`. If the platform can't create the database, for example because a free plan has reached its database limit, you're still signed in, and personal data stays on your machine.
 
 A running Hermes picks up the sign-in within half a minute. The Infino tools switch to the cloud when Hermes restarts. Until then they search your machine's copy, which has everything too.
 
@@ -142,9 +142,7 @@ A memory belongs to the team unless it's about one person. Nobody has to label i
 | Hermes's `MEMORY.md` | Hermes's `USER.md` |
 | `infino_remember`, by default | `infino_remember`, when the agent marks it personal |
 
-Personal memory lives in its own database: `$HERMES_HOME/infino/personal` on your machine, and your personal database once you sign in. It never goes to the team database, and recall shows it only in your own sessions. When the agent saves a personal memory, `conversations` and `traces` record the tool call without the memory's text.
-
-Your personal database is only as private as your API key. Once you're signed in, the Infino tools run with the same key as the plugin, and the key can read every database in the account, your personal one included. Anyone else who has the key can read it too.
+Personal memory lives in its own database. On your machine it's in `$HERMES_HOME/infino/personal`, and once you sign in it's in your personal database too. It never goes to the team database. When the agent saves a personal memory, `conversations` and `traces` record the tool call without the memory's text.
 
 `conversations` keeps every message as it was written, including anything personal said in it. To keep a whole conversation out of the team database, [mark the work personal](#keeping-work-personal).
 
