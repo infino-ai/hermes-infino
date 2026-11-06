@@ -1,14 +1,12 @@
 # Durable recall for Hermes agents
 
-A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that stores the agent's memory and history in Infino.
+hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that gives your agents a memory that lasts. It saves what they remember, what they say and what they do into Infino, and before every turn it hands the agent the memories that matter for that turn. Your agents can also search all of it with the Infino tools.
 
-It saves four things: memory, conversations, traces and skills. Before each turn it gives the agent the memories that matter for that turn. The agent can also search everything with the Infino tools.
+You don't need an account. Out of the box, everything goes into a database on your machine, and nothing leaves it.
 
-You don't need an Infino account. Without one, everything is kept in a database on your machine, and nothing leaves it.
+Sign in to Infino Cloud and your team shares one database, so every agent can find what the others learned and did. Personal memory, and any work you mark as personal, stays out of it.
 
-With an Infino account, your team shares a database in Infino Cloud, so every agent on the team can search what the others did. `hermes infino login` creates a free account on a platform that gives them out, or joins your team's with a key a teammate gives you. From then on, the plugin uploads what it has kept on your machine so far, then each new memory, conversation, trace and skill as it happens. Your machine keeps its own copy. Personal memory, and the conversations and traces of work you mark personal, never go to the team database.
-
-Infino Cloud is SOC 2 Type II. It keeps every database on object storage: Infino's, or a bucket in your own AWS, Google Cloud or Azure account, which you can encrypt with a key you own (CMEK). See [How Infino stores your data](#how-infino-stores-your-data).
+Infino Cloud is SOC 2 Type II. Your data lives on object storage, either Infino's or a bucket in your own AWS, Google Cloud or Azure account, and you can encrypt your bucket with a key you own (CMEK). See [Where your data lives](#where-your-data-lives).
 
 ```mermaid
 flowchart LR
@@ -21,9 +19,25 @@ flowchart LR
   C --> H
 ```
 
-## How Infino stores your data
+## What it saves
 
-An Infino database is a set of files. Each table is Parquet files with keyword and vector indexes built into them, and search and SQL read those files directly. On your machine, the Infino engine runs inside Hermes and keeps the files on your disk. In Infino Cloud, Infino's servers keep them on object storage and cache what they read.
+The plugin keeps four tables.
+
+**`memory`** holds everything in Hermes's `MEMORY.md` and `USER.md`, whoever wrote it: the agent, Hermes's background memory review, or you editing the file by hand. It also holds whatever the agent saves with the `infino_remember` tool. `infino_forget` deletes a memory, even one a teammate's agent saved.
+
+**`conversations`** is a log of every message in every session and who sent it, with tool calls and tool results in their own columns. Because it's a log, nothing disappears from it when context compression shortens a session or `/undo` takes back a turn.
+
+**`traces`** records every model call (model, provider, tokens, time taken) and every tool call (name, arguments, result, status, time taken). Secrets in arguments and results are masked the same way Hermes masks anything it hands a memory plugin.
+
+**`skills`** holds the skills your agents share with `infino_publish_skill`. Once you're signed in, every profile on the team can use them as read-only `infino:<name>` skills, and each one's description says who published it. Only a profile's owner can publish (members of a group chat can't), and secrets are masked before a skill is shared. Set `INFINO_TEAM_SKILLS=off` to keep a profile to its own skills.
+
+A conversation turn and its traces share a `session_id` and a `turn_id`, so you can join them, and every row has a `row_id`.
+
+Teammates read each other's memories, so a memory names the person it's about ("Dana prefers…") instead of saying "the user". When recalled memories are added to a turn, they're marked as reference material, so the agent doesn't take them as instructions.
+
+## Where your data lives
+
+An Infino database is just files. Each table is a set of Parquet files with keyword and vector indexes built in, and search and SQL read those files directly. On your machine, the Infino engine runs inside Hermes and keeps the files on your disk. In Infino Cloud, Infino's servers keep them on object storage and cache what they read.
 
 ```mermaid
 flowchart LR
@@ -46,92 +60,17 @@ flowchart LR
   K -.->|"encrypts your bucket"| B
 ```
 
-| Where | Where the files are | Encryption |
+| | Where the files are | How they're encrypted |
 | --- | --- | --- |
-| Your machine | `$HERMES_HOME/infino/`, in folders only your user can read. Every row is written here first, signed in or not. | Whatever your disk has |
-| Infino Cloud | Infino's object storage. Each database has its own prefix, and the server for a database holds a short-lived credential that reaches only that prefix. | AES-256 at rest, with keys the cloud provider manages. The servers' disk caches are encrypted too. |
-| Infino Cloud, in your bucket | Your own Amazon S3, Google Cloud Storage or Azure Blob Storage bucket ([bring your own bucket](https://infino.ai/docs/cloud/bring-your-own-bucket)). Infino reaches it through an identity you grant, and you can take the grant back. | Your bucket's. With [customer-managed keys](https://infino.ai/docs/cloud/customer-managed-keys) (CMEK), that is a key you own in AWS KMS, Google Cloud KMS or Azure Key Vault. Infino never holds the key: disable or revoke it, and Infino can no longer read the data. |
+| **Your machine** | `$HERMES_HOME/infino/`, in folders only your user can read. Every row lands here first, whether or not you're signed in. | However your disk is encrypted |
+| **Infino Cloud** | Infino's object storage. Each database has its own prefix, and the server for a database gets a short-lived credential that reaches only that prefix. | AES-256 at rest, with keys the cloud provider manages. The servers' disk caches are encrypted too. |
+| **Your own bucket** | An Amazon S3, Google Cloud Storage or Azure Blob Storage bucket in your account ([bring your own bucket](https://infino.ai/docs/cloud/bring-your-own-bucket)). Infino reaches it through an identity you grant, and you can take that grant back at any time. | However your bucket is encrypted. With [customer-managed keys](https://infino.ai/docs/cloud/customer-managed-keys) (CMEK), that's a key you own in AWS KMS, Google Cloud KMS or Azure Key Vault. Infino never holds the key: disable or revoke it, and Infino can no longer read the data. |
 
-Infino turns on your own bucket and your own key per account. Create the team database in your bucket first (the bring-your-own-bucket guide shows how), then [sign in](#signing-in) naming it with `--team-database`. `login` uses a database that already exists as it is. A personal database can be in your bucket too.
+Infino turns on your own bucket and your own key per account. To use them, create the team database in your bucket first (the bring-your-own-bucket guide walks you through it), then [sign in](#signing-in) and name it with `--team-database`. `login` uses a database that already exists as it is. Your personal database can live in your bucket too.
 
-Infino Cloud is SOC 2 Type II. The report is available on request at [infino.ai/talk](https://infino.ai/talk).
+Infino Cloud is SOC 2 Type II, and the report is available on request at [infino.ai/talk](https://infino.ai/talk).
 
-## What it saves
-
-| Table | What goes in it |
-| --- | --- |
-| `memory` | Everything in Hermes's `MEMORY.md` and `USER.md`, whoever wrote it: the agent, Hermes's background memory review, or you by hand. And everything saved with the `infino_remember` tool. `infino_forget` deletes a memory, whichever teammate's agent saved it. |
-| `conversations` | Every message in every session, and who sent it. Tool calls and tool results are in their own columns. It is a log: when context compression shortens a session, or `/undo` takes a turn back, what was already said stays. |
-| `traces` | Every model call (model, provider, tokens, time taken) and every tool call (name, arguments, result, status, time taken). Secrets in arguments and results are masked the way Hermes masks what it hands any memory plugin. |
-| `skills` | Skills shared with `infino_publish_skill`. Once signed in, every profile on the team can use them, as read-only `infino:<name>` skills whose description says who published them. Only a profile's owner publishes: members of a group chat cannot. Secrets in a skill are masked before it is shared. `INFINO_TEAM_SKILLS=off` keeps a profile to its own skills. |
-
-A conversation turn and its traces share a `session_id` and `turn_id`, so you can join them. Every row has a `row_id`.
-
-Memories name the person they are about ("Dana prefers…"), never "the user", because teammates read them too. When recalled memories are added to a turn, they are marked as reference material, not as instructions for the agent.
-
-## Team memory and personal memory
-
-Memory belongs to the team unless it is about one person. Nobody has to say "team": the agent decides from what the memory is about.
-
-| Goes to team memory | Goes to personal memory |
-| --- | --- |
-| Decisions, conventions, fixes, who owns what, how things are set up | A person's preferences, credentials, schedule, private matters |
-| Hermes's `MEMORY.md` | Hermes's `USER.md` |
-| `infino_remember` (the default) | `infino_remember` when the agent marks it personal |
-
-```mermaid
-flowchart TD
-  W[New memory] --> Q{Is it about<br/>one person?}
-  Q -- no --> T[(Team database<br/>every agent on the team can read it)]
-  Q -- yes --> P[(Personal database<br/>only your own recall reads it)]
-```
-
-Personal memory lives in a separate database. The Infino tools never open it, so no other agent and no chat can read it. On your machine it is `$HERMES_HOME/infino/personal`. When you sign in it goes to your personal database (`--personal-database`). If you don't have one, it stays on your machine. It never goes to the team database: when the agent saves a personal memory, the tool call is still logged in `conversations` and `traces`, but with the memory's text left out.
-
-What is said in a conversation is the conversation: `conversations` keeps every message as it was written, including anything personal someone says there.
-
-## Personal conversations and traces
-
-Conversations and traces belong to the team, so every agent on the team can see what the others did. Some work is one person's own: a scheduled job that reads your email and sends you a digest, or a profile you keep for private errands. Mark it personal, and its conversations and traces go where personal memory goes: your personal database, or your machine when you have none. They never go to the team database.
-
-| Setting | What becomes personal |
-| --- | --- |
-| `INFINO_PERSONAL_JOBS=email-digest,weekly-finances` | Each run of those scheduled jobs (named by name or id, as `hermes cron list` shows them): every model call and tool call on the way to the output, and the subagents it starts. And the chat its output is delivered into: when Hermes puts the output in the chat's history (`attach_to_session`, `cron.mirror_delivery`, or a continuable thread), or posts it into a group chat (`deliver: room:<id>`), that chat's conversation and traces are personal from then on. |
-| `INFINO_PERSONAL_PROFILE=on` | Every conversation and trace of the profile. |
-
-In a group chat, each member's turn runs as that member's own profile, maybe on another installation, and reads the setting from there. List the job on every member's profile, or once for the team through Remote Config (see [Fleets](#fleets-settings-from-config-or-remote-config)). A member whose profile does not list the job writes the post, and its answer, to the team. Hermes also trims a member's turn to its newest messages: after several long replies, a member can see a reply that quotes the job's output without the job's own post, and that turn goes to the team.
-
-The job itself can still be shared: a skill a personal job uses is the team's like any other skill. What the job reads and writes stays with you. Memory keeps its own rule (team unless it is about one person), whatever the setting.
-
-Personal memory is one person's: the profile owner's, in a database of its own. Nothing separates two people's memories inside one database, so on a gateway, where a profile answers whoever writes to it, a shared profile keeps no personal memory. The agent is told it cannot save something personal there, and recall in those chats shows none. A profile that is one person's (`INFINO_PERSONAL_PROFILE=on`, such as your own bot) keeps your personal memory in its chats too.
-
-## Group chats
-
-When Hermes is in a group chat through the gateway, memory belongs to that chat:
-
-- What members ask the agent to remember is saved for that chat and credited to the person who said it. It never goes into anyone's personal memory.
-- Recall in the group shows that chat's notes and team memory. It does not show anyone's personal memory or other chats' notes.
-- Recall anywhere else (a direct message, another group) does not show that group's notes.
-
-```mermaid
-flowchart LR
-  subgraph TD1 [Team database]
-    TM[Team memory]
-    OPS[Notes from the ops chat]
-    SALES[Notes from the sales chat]
-  end
-  PM[(Dana's personal memory)]
-  R1[Recall in the ops chat] --> TM
-  R1 --> OPS
-  R2[Recall in Dana's DM] --> TM
-  R2 --> PM
-```
-
-Which chat a message comes from, and whether that chat is a group, comes from Hermes: every chat Hermes does not treat as a direct message counts as a group, and no one writes to the owner's personal memory from a group. Hermes's channel memory ([#144822](https://github.com/NousResearch/hermes-agent/pull/144822)) is a proposal that no Hermes release has. In a Hermes that has it, its setting for the chat decides, including whether someone may write to the owner's personal memory from a group.
-
-**The tools are not separated by chat.** Recall keeps each chat's notes to that chat, but the Infino tools search the whole team database, so an agent can find another chat's notes and conversations with them. Separating chats in the tools needs per-chat permissions, which this version does not have.
-
-## On your machine, and in the cloud
+### How your machine and the cloud stay in sync
 
 ```mermaid
 flowchart LR
@@ -139,38 +78,25 @@ flowchart LR
   L -- "sync: a few seconds after each write,<br/>and before Hermes exits<br/>(only after you sign in)" --> C[(Team database<br/>in Infino Cloud)]
 ```
 
-**Without an account**, everything is stored under `$HERMES_HOME/infino/` using the Infino engine. Each memory is embedded on your machine with all-MiniLM-L6-v2 (384 dimensions). Recall uses both keyword search and vector search; while the model is still loading (or could not be downloaded), it uses keyword search alone. Nothing leaves your machine.
+Without an account, everything is stored under `$HERMES_HOME/infino/` and nothing leaves your machine. Each memory is embedded locally with all-MiniLM-L6-v2 (384 dimensions), and recall uses keyword and vector search together. If the model is still loading, or couldn't be downloaded, recall uses keyword search alone.
 
-**After you sign in**:
-- Every row is still written to your machine first. A sync then sends it to the cloud.
-- The sync sends rows in the order they were saved and picks up where it stopped. If the cloud is down, nothing is lost, and a batch whose upload was cut off is checked against the cloud before it is sent again. A row the cloud refuses outright stays on your machine and is listed by `hermes infino status`, which also shows how far behind the cloud is, and why the last sync stopped if it did.
-- A forgotten memory is deleted from the cloud too.
-- The cloud embeds memory itself, so your machine stops embedding.
-- Recall reads the cloud first and adds any rows on your machine that the cloud doesn't have yet. If the cloud can't be reached or is slow to answer, recall searches your machine's own rows by keyword.
+Once you sign in, every row is still written to your machine first, and a sync sends it on to the cloud:
 
-## The Infino tools
-
-Hermes runs the Infino client as an MCP server, started by `hermes infino mcp` (from `mcp_servers.infino` in `config.yaml`). Each time it starts, it checks whether you are signed in:
-- **Not signed in:** `search`, `find`, `sql` and `read`, over the database on your machine.
-- **Signed in:** `ask`, `search`, `find`, `sql` and `join_keys`, over the team's database in the cloud. `ask` is Infino's retrieval agent: it runs the searches and joins for a question and returns the rows it found, with where they came from.
-
-The API key is passed to the client in its environment, never on its command line. Hermes does not show an MCP server's instructions to the model, so the plugin adds them to the system prompt.
-
-Hermes's tool search, on by default, shows the model only each MCP tool's name and the first sentence of its description until the model asks for more. To give the model the Infino tools' full descriptions up front, turn it off:
-
-```bash
-hermes config set tools.tool_search.enabled off
-```
+- Rows go up in the order they were saved, and the sync picks up where it left off. If the cloud is down, nothing is lost. If an upload is cut off partway, the batch is checked against the cloud before it's sent again.
+- If the cloud refuses a row outright, the row stays on your machine and `hermes infino status` lists it. `status` also shows how far behind the cloud is and, if the sync stopped, why.
+- Forgetting a memory deletes it from the cloud too.
+- The cloud embeds memories itself, so your machine stops embedding them.
+- Recall reads the cloud first and adds any rows from your machine that the cloud doesn't have yet. If the cloud can't be reached or is slow to answer, recall searches your machine's own rows by keyword.
 
 ## Install
 
 These steps were run as written on a fresh machine with Hermes's own installer.
 
-**Before you start:**
+**Before you start**, you need:
 - Hermes, installed with its installer: `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`. The plugin is tested on Hermes 0.22.6, 0.22.7 and 0.23.0.
-- Access to the two private repositories, `infino-ai/hermes-infino` and `infino-ai/ask-bench`. Hermes clones the plugin with your GitHub sign-in: run `gh auth login` first, or put `GITHUB_TOKEN=<a token that can read the repos>` in `~/.hermes/.env`.
+- Access to the two private repositories, `infino-ai/hermes-infino` and `infino-ai/ask-bench`. Hermes clones the plugin with your GitHub sign-in, so run `gh auth login` first, or put `GITHUB_TOKEN=<a token that can read the repos>` in `~/.hermes/.env`.
 
-**1. Build the Infino client.** It needs Node.js 22.19 or newer; Hermes's installer already put one in `~/.hermes/tools/`.
+**1. Build the Infino client.** It needs Node.js 22.19 or newer, and Hermes's installer has already put one in `~/.hermes/tools/`.
 
 ```bash
 git clone -b feat/local-database-mode https://github.com/infino-ai/ask-bench.git
@@ -179,15 +105,15 @@ export PATH="$(ls -d ~/.hermes/tools/node-*/bin | head -n 1):$PATH"
 npm ci && npm run build
 ```
 
-This makes `ask-bench/client/dist/cli.js`.
+That gives you `ask-bench/client/dist/cli.js`.
 
-**2. Install the plugin.** Hermes installs its Python dependencies and makes it the memory provider (`memory.provider: infino`):
+**2. Install the plugin.** Hermes installs its Python dependencies and makes it the memory provider (`memory.provider: infino`).
 
 ```bash
 hermes plugins install https://github.com/infino-ai/hermes-infino/tree/main/hermes_infino --enable --yes-deps
 ```
 
-**3. Add the Infino tools,** with the full path to the client you built in step 1:
+**3. Add the Infino tools**, using the full path to the client you built in step 1.
 
 ```bash
 hermes config set mcp_servers.infino.command hermes
@@ -196,11 +122,13 @@ hermes config set mcp_servers.infino.env.INFINO_CLIENT /full/path/to/ask-bench/c
 hermes config set mcp_servers.infino.connect_timeout 120
 ```
 
-Hermes starts the tools with `hermes infino mcp`, inside its own environment, where the plugin's dependencies are, and on the Node its installer keeps (`INFINO_NODE` in the same `env` block picks another).
+Hermes starts the tools with `hermes infino mcp`, inside its own environment (where the plugin's dependencies are) and on the Node its installer keeps. To use a different Node, set `INFINO_NODE` in the same `env` block.
 
-**4. Use it.** Start `hermes` as usual. Everything is kept on your machine until you sign in. The first start downloads the embedding model from Hugging Face in the background (about 90 MB, once). Until it is ready, memories are found by keyword, and the ones saved meanwhile are embedded as soon as it is.
+**4. Start `hermes` as usual.** Everything stays on your machine until you sign in. The first start downloads the embedding model from Hugging Face in the background (about 90 MB, once). Until it's ready, memories are found by keyword, and anything saved in the meantime is embedded as soon as the model is ready.
 
 ## Signing in
+
+`hermes infino login` either creates a free account, on a platform that gives them out, or joins your team with a key a teammate gives you.
 
 ```bash
 hermes infino login                          # create a free account, on a platform that gives them out
@@ -216,13 +144,94 @@ To use a different Infino platform, such as staging, add `--url`:
 hermes infino login --url https://api.platform.staging.infino.ai --api-key-file KEY --team-database TEAM --yes
 ```
 
-Before creating anything or sending anything, `login` tells you exactly what will be uploaded and asks you to confirm. Only a person at a terminal can agree to create an account: with no terminal, it refuses, and no flag can answer for you. When you sign in with a key someone gave you, `--yes` confirms the upload. The key is saved in `$HERMES_HOME/infino/credentials.json`, which only you can read.
+Before it creates or sends anything, `login` shows you exactly what will be uploaded and asks you to confirm. Creating an account always needs a person at a terminal: without one, `login` refuses, and no flag can answer for you. When you sign in with a key someone gave you, `--yes` confirms the upload. The key is saved in `$HERMES_HOME/infino/credentials.json`, which only you can read.
 
-A Hermes that is already running picks up the sign-in within half a minute: recall and writes go to the cloud from then on. The Infino tools switch to the cloud when Hermes restarts. Until then they search the copy on your machine, which has everything too.
+Once you're signed in, the plugin uploads everything your machine has kept so far, then each new memory, conversation, trace and skill as it happens. Your machine keeps its own copy.
 
-## Fleets: settings from config or Remote Config
+If Hermes is already running, it picks up the sign-in within half a minute, and recall and writes go to the cloud from then on. The Infino tools switch over when Hermes restarts. Until then they search the copy on your machine, which has everything too.
 
-A fleet doesn't run `login` on each machine. It puts the team's settings in the `env` block of the Infino tools' entry in `config.yaml`, and the plugin and its tools both read them from there:
+## Team memory and personal memory
+
+A memory belongs to the team unless it's about one person. Nobody has to label it: the agent decides from what the memory says.
+
+| Team memory | Personal memory |
+| --- | --- |
+| Decisions, conventions, fixes, who owns what, how things are set up | A person's preferences, credentials, schedule and private matters |
+| Hermes's `MEMORY.md` | Hermes's `USER.md` |
+| `infino_remember`, by default | `infino_remember`, when the agent marks it personal |
+
+```mermaid
+flowchart TD
+  W[New memory] --> Q{Is it about<br/>one person?}
+  Q -- no --> T[(Team database<br/>every agent on the team can read it)]
+  Q -- yes --> P[(Personal database<br/>only your own recall reads it)]
+```
+
+Personal memory lives in a database of its own, and the Infino tools never open it, so no other agent and no chat can read it. On your machine it's in `$HERMES_HOME/infino/personal`. When you sign in, it goes to your personal database (`--personal-database`), or stays on your machine if you don't have one. Either way, it never reaches the team database. When the agent saves a personal memory, the tool call still shows up in `conversations` and `traces`, but without the memory's text.
+
+A conversation, on the other hand, is kept as it happened. `conversations` records every message as it was written, including anything personal someone says. To keep a whole conversation out of the team database, mark the work personal (see the next section).
+
+Personal memory belongs to one person: the profile's owner. Nothing can separate two people's memories inside one database, so a shared profile on a gateway, which answers whoever writes to it, keeps no personal memory at all. The agent is told it can't save anything personal there, and recall in those chats shows none. A profile that belongs to one person, such as your own bot, can keep your personal memory in its chats too: set `INFINO_PERSONAL_PROFILE=on`, which also keeps its conversations and traces personal.
+
+## Keeping work personal
+
+Conversations and traces belong to the team, so every agent can see what the others did. But some work is just yours: a scheduled job that reads your email and sends you a digest, or a profile you keep for private errands. Mark that work personal, and its conversations and traces go where your personal memory goes: your personal database, or your machine if you don't have one. They never reach the team database.
+
+| Setting | What becomes personal |
+| --- | --- |
+| `INFINO_PERSONAL_JOBS=email-digest,weekly-finances` | Every run of those scheduled jobs (by name or id, as `hermes cron list` shows them), including every model and tool call along the way and any subagents the job starts. The chat the output is delivered into becomes personal too (see below). |
+| `INFINO_PERSONAL_PROFILE=on` | Every conversation and trace of the profile |
+
+A job's output can land in a chat. When Hermes adds it to the chat's history (`attach_to_session`, `cron.mirror_delivery`, or a continuable thread), or posts it into a group chat (`deliver: room:<id>`), that chat's conversation and traces are personal from then on.
+
+Group chats need one more step. Each member's turn runs as that member's own profile, possibly on another machine, and reads the setting from there. So list the job on every member's profile, or once for the whole team through Remote Config (see [Running a fleet](#running-a-fleet)). If a member's profile doesn't list the job, that member's turn, including the job's post and the answer to it, goes to the team. Hermes also trims each member's turn to its newest messages, so after several long replies a member may see a reply that quotes the job's output without the job's own post, and that turn goes to the team.
+
+A personal job still uses the team's skills like any other, but what it reads and writes stays with you. Memory keeps its own rule (team unless it's about one person), whatever these settings say.
+
+## Group chats
+
+When Hermes is in a group chat through the gateway, memory belongs to that chat:
+
+- What members ask the agent to remember is saved for that chat and credited to whoever said it. It never goes into anyone's personal memory.
+- Recall in the group shows that chat's notes and the team's memory, never anyone's personal memory or other chats' notes.
+- Recall anywhere else, in a direct message or another group, doesn't show that group's notes.
+
+```mermaid
+flowchart LR
+  subgraph TD1 [Team database]
+    TM[Team memory]
+    OPS[Notes from the ops chat]
+    SALES[Notes from the sales chat]
+  end
+  PM[(Dana's personal memory)]
+  R1[Recall in the ops chat] --> TM
+  R1 --> OPS
+  R2[Recall in Dana's DM] --> TM
+  R2 --> PM
+```
+
+Hermes tells the plugin which chat a message came from and whether it's a group. Any chat Hermes doesn't treat as a direct message counts as a group, and nobody writes to the owner's personal memory from a group. Hermes's channel memory ([#144822](https://github.com/NousResearch/hermes-agent/pull/144822)) is a proposal and isn't in any Hermes release. In a Hermes that has it, its setting for the chat decides instead, including whether someone may write to the owner's personal memory from a group.
+
+**The Infino tools don't separate chats.** Recall keeps each chat's notes to that chat, but the tools search the whole team database, so an agent can use them to find another chat's notes and conversations. Separating chats in the tools needs per-chat permissions, which this version doesn't have.
+
+## The Infino tools
+
+Hermes runs the Infino client as an MCP server, started with `hermes infino mcp` from the `mcp_servers.infino` entry in `config.yaml`. Each time it starts, it checks whether you're signed in:
+
+- **Not signed in:** `search`, `find`, `sql` and `read`, over the database on your machine.
+- **Signed in:** `ask`, `search`, `find`, `sql` and `join_keys`, over your team's database in the cloud. `ask` is Infino's retrieval agent: give it a question, and it runs the searches and joins and returns the rows it found, with where they came from.
+
+The API key reaches the client through its environment, never its command line. Hermes doesn't show an MCP server's instructions to the model, so the plugin adds them to the system prompt.
+
+Hermes's tool search is on by default. It shows the model only each MCP tool's name and the first sentence of its description until the model asks for more. To give the model the Infino tools' full descriptions up front, turn it off:
+
+```bash
+hermes config set tools.tool_search.enabled off
+```
+
+## Running a fleet
+
+You don't have to run `login` on every machine. Put the team's settings in the `env` block of the Infino tools' entry in `config.yaml`, and the plugin and its tools both read them from there:
 
 ```yaml
 memory:
@@ -238,7 +247,7 @@ mcp_servers:
     connect_timeout: 120
 ```
 
-With Hermes's [Remote Config](https://github.com/NousResearch/hermes-agent/pull/122509) (in Hermes 0.22.6 and later, turned on with `HERMES_CONFIG_BACKEND=remote`), the same keys come from the config service instead of a file, so an administrator sets the team database once, at the team (group) level, and every agent on the team starts with it. Remote Config refuses a key written out in full, so `INFINO_API_KEY` stays a `${INFINO_API_KEY}` reference, and the key goes in each profile's `.env`. `hermes infino status` says where the settings came from ("from the config").
+With Hermes's [Remote Config](https://github.com/NousResearch/hermes-agent/pull/122509) (Hermes 0.22.6 and later, turned on with `HERMES_CONFIG_BACKEND=remote`), the same keys come from the config service instead of a file. An administrator sets the team database once, at the team (group) level, and every agent on the team starts with it. Remote Config refuses a key written out in full, so leave `INFINO_API_KEY` as a `${INFINO_API_KEY}` reference and put the key itself in each profile's `.env`. `hermes infino status` tells you where the settings came from ("from the config").
 
 ```mermaid
 flowchart LR
@@ -252,24 +261,25 @@ flowchart LR
 
 ## Settings
 
-Settings are read from three places; the first that has a value wins:
-1. the `env` block of `mcp_servers.infino` in the profile's config (a file or Remote Config);
-2. the profile's environment (`.env`);
-3. the sign-in `hermes infino login` saved.
+The plugin takes each setting from the first of these that has a value:
 
-The config block comes first because Hermes starts the Infino tools with that block as their environment, so the plugin and its tools always use the same team. A `${VAR}` reference whose variable isn't set counts as not set.
+1. the `env` block of `mcp_servers.infino` in the profile's config (a file or Remote Config)
+2. the profile's environment (`.env`)
+3. the sign-in saved by `hermes infino login`
+
+The config block comes first because Hermes starts the Infino tools with that block as their environment, so the plugin and its tools always agree on the team. A `${VAR}` reference to a variable that isn't set counts as not set.
 
 | Variable | What it is |
 | --- | --- |
 | `INFINO_API_KEY` | The Infino API key for this person or bot |
 | `INFINO_TEAM_DATABASE` | The team's database |
-| `INFINO_PERSONAL_DATABASE` | This person's database. Leave it unset for bots and shared profiles. |
+| `INFINO_PERSONAL_DATABASE` | This person's own database. Leave it unset for bots and shared profiles. |
 | `INFINO_AUTHOR` | Who this profile's messages and memories are from, when Hermes doesn't say. In a chat, the sender is always the author, and a message with no sender is saved without one. |
-| `INFINO_MCP_SERVER` | The client's name under `mcp_servers` (default `infino`). Environment only, since it names the config block. |
+| `INFINO_MCP_SERVER` | The client's name under `mcp_servers` (default `infino`). Set it in the environment only, since it names the config block. |
 | `INFINO_URL` | The Infino Cloud URL (default `https://api.platform.infino.ws`) |
 | `INFINO_TEAM_SKILLS` | `off` stops this profile loading the skills teammates publish (default on) |
-| `INFINO_PERSONAL_PROFILE` | `on` keeps every conversation and trace of this profile out of the team database (default off), and keeps personal memory in its gateway chats too, as one person's. See [Personal conversations and traces](#personal-conversations-and-traces). |
-| `INFINO_PERSONAL_JOBS` | Scheduled jobs (ids or names, comma-separated) whose runs, and the chats their output is delivered into, are kept out of the team database |
+| `INFINO_PERSONAL_PROFILE` | `on` keeps every conversation and trace of this profile out of the team database, and lets its gateway chats keep personal memory as one person's (default off). See [Keeping work personal](#keeping-work-personal). |
+| `INFINO_PERSONAL_JOBS` | Scheduled jobs (names or ids, comma-separated) whose runs, and the chats their output is delivered into, stay out of the team database |
 
 ## Development
 
@@ -279,4 +289,4 @@ From a Hermes checkout, with its environment activated (`source ./activate`) and
 PYTHONPATH=$PWD:$PYTHONPATH python -m pytest tests
 ```
 
-There is one test file per module (`tests/test_<module>.py`), plus `tests/test_plugin.py`, which runs the plugin end to end. The tests use Hermes's own `MemoryManager`, the real Infino engine for the local database (with a stand-in for the embedding model), and a fake Infino Cloud.
+Each module has its own test file (`tests/test_<module>.py`), and `tests/test_plugin.py` runs the plugin end to end. The tests use Hermes's own `MemoryManager`, the real Infino engine for the local database (with a stand-in for the embedding model), and a fake Infino Cloud.
