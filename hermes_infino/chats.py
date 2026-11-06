@@ -16,7 +16,10 @@ prefixes it. Whether the chat is a group is Hermes's to decide:
 - without it, the chat type decides, as Hermes itself then does: anything but
   a DM is a group.
 
-A CLI, TUI or desktop session has no gateway chat: it is never a group.
+The owner's own surfaces (OWNER_PLATFORMS) have no gateway chat: a session
+there is never a group. Hermes's hosted Group Chat rooms and turns another
+profile forwards (MULTI_PARTY_PLATFORMS) have none either, though several
+parties share them: the provider treats them as a group from their platform.
 """
 
 from __future__ import annotations
@@ -38,8 +41,17 @@ try:  # The chat types Hermes itself treats as a one-to-one chat ("" included).
     from gateway.slash_access import _DM_CHAT_TYPES as DM_TYPES
 except ImportError:  # the same set, for a Hermes that does not name it
     DM_TYPES = frozenset({"dm", "direct", "private", ""})
-# Platforms whose sessions are this machine's own, never a gateway chat.
-LOCAL_PLATFORMS = frozenset({"", "local", "cli", "tui"})
+# The owner's own surfaces, the one place they are named: this machine's person
+# at a terminal ("cli", "tui", "local", or none named), in Hermes's Desktop chat
+# panel ("desktop") or an editor ("acp"), and the owner's scheduled jobs
+# ("cron"). Never a gateway chat: on any other platform the turn itself says
+# who wrote it.
+OWNER_PLATFORMS = frozenset({"", "local", "cli", "tui", "desktop", "acp", "cron"})
+# Where several parties share one conversation with no gateway chat to say so:
+# Hermes's hosted Group Chat rooms ("bot_room") and turns another profile
+# forwards (A2A, "a2a"). A group for every personal decision, on a profile that
+# is one person's too.
+MULTI_PARTY_PLATFORMS = frozenset({"bot_room", "a2a"})
 
 
 @dataclass(frozen=True)
@@ -78,7 +90,7 @@ def chat_key(platform: str, chat_id: str, thread_id: str = "", parent_chat_id: s
 def current() -> Chat:
     """The chat of the turn running now (call it on the turn's own thread)."""
     platform = session("HERMES_SESSION_PLATFORM").lower()
-    if platform in LOCAL_PLATFORMS:
+    if platform in OWNER_PLATFORMS:
         return NO_CHAT
     key = chat_key(platform, session("HERMES_SESSION_CHAT_ID"), session("HERMES_SESSION_THREAD_ID"),
                    session("HERMES_SESSION_PARENT_CHAT_ID"), session("HERMES_SESSION_SCOPE_ID"))

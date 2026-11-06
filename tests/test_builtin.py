@@ -4,7 +4,8 @@ runs with every memory provider switched off), or a person by hand."""
 
 from __future__ import annotations
 
-from hermes_infino import builtin, tables
+from hermes_infino import builtin, config, tables
+from hermes_infino.provider import GATEWAY_MARK
 
 from .helpers import (DM, GROUP, PERSONAL_DB, TEAM_DB, in_session, local_rows, make_manager, personal_rows,
                       wait_for)
@@ -112,14 +113,64 @@ def test_what_the_review_wrote_before_a_start_is_caught_up_at_the_start(env, pla
     assert contents(platform.rows(TEAM_DB, tables.MEMORY)) == ["written while no session ran"]
 
 
-def test_a_group_chats_review_entry_is_the_chats(env, platform, tmp_path, monkeypatch):
+def test_a_review_entry_found_during_a_group_turn_is_neither_that_chats_nor_its_senders(env, platform, tmp_path,
+                                                                                      monkeypatch):
+    # The review may have written it after another chat's conversation: the
+    # comparison cannot say which, nor who said it.
+    env.setenv("INFINO_AUTHOR", "owner-name")
     mgr, provider = make_manager(tmp_path, platform="telegram")
     in_session(monkeypatch, GROUP)
     write_file(tmp_path, "memory", ["the build is flaky on Fridays"])
     turn(provider)
     provider.shutdown()
     [row] = platform.rows(TEAM_DB, tables.MEMORY)
-    assert (row["chat"], row["author"]) == ("telegram:-100", "mallory")
+    assert (row["content"], row["chat"], row["author"], row["scope"]) == (
+        "the build is flaky on Fridays", "", "owner-name", "team")
+
+
+def test_without_a_configured_name_a_review_entry_is_credited_to_the_profile(home, tmp_path, monkeypatch):
+    mgr, provider = make_manager(tmp_path, platform="telegram", agent_identity="ops")
+    in_session(monkeypatch, GROUP)
+    write_file(tmp_path, "memory", ["the build is flaky on Fridays"])
+    turn(provider)
+    [row] = local_rows(tmp_path, tables.MEMORY)
+    assert (row["chat"], row["author"]) == ("", "ops")
+
+
+def test_a_personal_profiles_user_entry_found_during_a_group_turn_waits_for_the_owner(home, tmp_path, monkeypatch):
+    home.setenv("INFINO_PERSONAL_PROFILE", "on")
+    home.setenv("INFINO_AUTHOR", "dana")
+    mgr, provider = make_manager(tmp_path, platform="telegram")
+    in_session(monkeypatch, GROUP)
+    write_file(tmp_path, "user", ["works from Lisbon"])
+    turn(provider)
+    # Nothing of it in the team's tables, nor (yet) in the owner's.
+    assert [r for r in local_rows(tmp_path, tables.MEMORY) if "Lisbon" in r["content"]] == []
+    assert personal_rows(tmp_path) == []
+    in_session(monkeypatch, DM)  # the owner's own chat
+    turn(provider, 2)
+    assert [(r["content"], r["author"]) for r in personal_rows(tmp_path)] == [("About dana: works from Lisbon", "dana")]
+
+
+def test_a_user_entry_is_the_owners_after_a_scheduled_job_ran(home, tmp_path):
+    # A cron run is the owner's own: it never makes the profile a shared gateway's.
+    home.setenv("INFINO_AUTHOR", "dana")
+    make_manager(tmp_path, platform="cron", agent_context="cron", session_id="cron_a1b2c3_20261105_070000")
+    write_file(tmp_path, "user", ["prefers short answers"])
+    _, at_the_terminal = make_manager(tmp_path, session_id="cli")
+    turn(at_the_terminal)
+    assert [(r["content"], r["author"]) for r in personal_rows(tmp_path)] == [
+        ("About dana: prefers short answers", "dana")]
+
+
+def test_a_mark_an_earlier_version_left_empty_is_still_honored(home, tmp_path):
+    mark = config.state_dir(tmp_path) / GATEWAY_MARK
+    mark.parent.mkdir(parents=True, exist_ok=True)
+    mark.touch()
+    write_file(tmp_path, "user", ["works from Lisbon"])
+    _, at_the_terminal = make_manager(tmp_path, session_id="cli")
+    turn(at_the_terminal)
+    assert personal_rows(tmp_path) == []
 
 
 def test_a_shared_profiles_user_file_is_never_taken_for_the_owners_memory(env, platform, tmp_path, monkeypatch):
@@ -140,14 +191,15 @@ def test_a_shared_profiles_user_file_is_never_taken_for_the_owners_memory(env, p
     assert contents(platform.rows(TEAM_DB, tables.MEMORY)) == ["deploys are on Tuesdays"]
 
 
-def test_a_personal_profiles_dm_user_entry_is_its_persons(env, platform, tmp_path, monkeypatch):
+def test_a_personal_profiles_dm_user_entry_is_its_owners(env, platform, tmp_path, monkeypatch):
     env.setenv("INFINO_PERSONAL_DATABASE", PERSONAL_DB)
     env.setenv("INFINO_PERSONAL_PROFILE", "on")
+    env.setenv("INFINO_AUTHOR", "dana")
     mgr, provider = make_manager(tmp_path, platform="telegram")
-    in_session(monkeypatch, DM)
+    in_session(monkeypatch, DM)  # whoever sent the turn, the entry is the owner's
     write_file(tmp_path, "user", ["works from Lisbon"])
     turn(provider)
     provider.shutdown()
     assert wait_for(lambda: len(platform.rows(PERSONAL_DB, tables.MEMORY)) == 1)
     [row] = platform.rows(PERSONAL_DB, tables.MEMORY)
-    assert (row["content"], row["author"]) == ("About owner: works from Lisbon", "owner")
+    assert (row["content"], row["author"]) == ("About dana: works from Lisbon", "dana")

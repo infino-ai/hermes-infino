@@ -391,6 +391,43 @@ def test_after_a_session_switch_the_search_marks_the_new_session(home, tmp_path)
     assert team_rows_of(tmp_path, "s2") == [] and len(team_rows_of(tmp_path, "s1")) == 2
 
 
+@pytest.mark.parametrize("reason", ["branch", "compression"])
+def test_a_session_that_continues_one_that_searched_is_personal(home, tmp_path, reason):
+    # /branch, and compaction that starts a new session, carry the history on under a new id.
+    mgr, p = make_manager(tmp_path, session_id="s1")
+    search(p, query="Dr. Lee")
+    mgr.on_session_switch("s1-next", parent_session_id="s1", reset=False, reason=reason)
+    p.sync_turn("and the bank?", "Nothing from the bank.", session_id="s1-next")
+    p._drain()
+    assert team_rows_of(tmp_path, "s1-next") == [] and len(personal_rows_of(tmp_path, "s1-next")) == 2
+
+
+def test_a_branch_of_a_session_kept_personal_before_a_restart_is_personal(home, tmp_path):
+    _, p = make_manager(tmp_path, session_id="s1")
+    search(p, query="Dr. Lee")
+    p.sync_turn("did my doctor write?", "No.", session_id="s1")
+    p._drain()
+    p.shutdown()
+    backend._backends.clear()  # a new process: only the stored rows say s1 is personal
+    privacy._sessions.clear()
+    mgr, again = make_manager(tmp_path, session_id="s1")
+    mgr.on_session_switch("s1-branch", parent_session_id="s1", reset=False, reason="branch")
+    again.sync_turn("and the bank?", "Nothing from the bank.", session_id="s1-branch")
+    again._drain()
+    assert team_rows_of(tmp_path, "s1-branch") == [] and len(personal_rows_of(tmp_path, "s1-branch")) == 2
+
+
+@pytest.mark.parametrize("switch", [{"reset": False, "reason": "resume"}, {"reset": True, "reason": "new_session"}])
+def test_resuming_another_session_or_starting_a_new_one_carries_nothing_over(home, tmp_path, switch):
+    # Hermes names the session left as the parent of /resume and /new; neither carries its history on.
+    mgr, p = make_manager(tmp_path, session_id="s1")
+    search(p, query="Dr. Lee")
+    mgr.on_session_switch("s2", parent_session_id="s1", **switch)
+    p.sync_turn("standup at ten?", "Yes.", session_id="s2")
+    p._drain()
+    assert len(team_rows_of(tmp_path, "s2")) == 2
+
+
 def test_the_session_stays_personal_after_a_restart(home, tmp_path):
     _, p = make_manager(tmp_path, session_id="s1")
     search(p, query="Dr. Lee")

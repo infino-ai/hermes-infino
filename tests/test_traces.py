@@ -13,7 +13,7 @@ from agent.memory_manager import _redact_for_provider
 
 from hermes_infino import privacy, tables, traces
 
-from .helpers import GROUP, hook_ctx, in_session, local, local_rows, wait_for
+from .helpers import GROUP, hook_ctx, in_session, local, local_rows, make_manager, wait_for
 
 # A credential shaped the way Hermes's redaction recognizes one.
 SECRET = "sk-ant-api03-" + "A1b2C3d4E5f6G7h8I9j0" * 4
@@ -254,3 +254,36 @@ def test_only_the_latest_sessions_are_remembered(monkeypatch):
         traces.note_identity(f"cap-{i}", f"person-{i}", "p")
     assert traces._identity_of("cap-0") == ("", "") and traces._identity_of("cap-4") == ("person-4", "p")
     assert len([k for k in traces._identity if k.startswith("cap-")]) <= 3
+
+
+def test_rows_a_fork_adds_after_the_turn_are_written_at_shutdown(home, tmp_path):
+    _, provider = make_manager(tmp_path, session_id="s1")
+    hooks = hook_ctx()
+    hooks["post_api_request"](session_id="s1", turn_id="t1", model="m")
+    hooks["on_session_end"](session_id="s1")
+    assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 1)
+    # Hermes's background review: the session's id, after the turn ended, and no end of its own.
+    hooks["post_api_request"](session_id="s1", turn_id="the-review", model="m")
+    hooks["post_tool_call"](session_id="s1", turn_id="the-review", tool_name="memory")
+    provider.shutdown()
+    assert len(local_rows(tmp_path, tables.TRACES)) == 3
+
+
+def test_the_oldest_sessions_waiting_rows_are_written_not_dropped(hooks, tmp_path, monkeypatch):
+    monkeypatch.setattr(traces, "MAX_SESSIONS", 2)
+    for session in ("a", "b", "c"):  # a long-running gateway: sessions whose rows wait for no end
+        hooks["post_api_request"](session_id=session, turn_id="t1", model="m")
+    assert wait_for(lambda: [r["session_id"] for r in local_rows(tmp_path, tables.TRACES)] == ["a"])
+    assert len(traces._buffers) <= 2
+
+
+def test_a_subagents_rows_carry_the_identity_of_the_session_that_started_it(home, tmp_path):
+    home.setenv("INFINO_AUTHOR", "alice")
+    make_manager(tmp_path, agent_identity="ops", session_id="s1")
+    hooks = hook_ctx()
+    hooks["subagent_start"](parent_session_id="s1", child_session_id="child-1")
+    hooks["post_tool_call"](session_id="child-1", turn_id="c1", tool_name="terminal")
+    hooks["on_session_end"](session_id="child-1")
+    assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 1)
+    [row] = local_rows(tmp_path, tables.TRACES)
+    assert (row["author"], row["profile"]) == ("alice", "ops")
