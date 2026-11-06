@@ -14,6 +14,15 @@ there is no flag that agrees to creating an account, and without a terminal
 it refuses. Using a key someone gave you (`--api-key-file`) may be agreed to
 with `--yes`, since that person chose to hand it over.
 
+What is personal (personal memory, and the conversations and traces of
+personal profiles and scheduled jobs) goes to a personal database, which
+`login` makes for this sign-in unless one is named (`--personal-database`) or
+none is wanted (`--no-personal-database`). A database made this way is always
+a new one, named after the team with a random part, so no two people ever
+share one. When the platform will not make it (a free plan's database limit,
+or a key limited to other databases), the sign-in goes on without one and what
+is personal stays on this machine.
+
 Hermes imports this module to build its command line for every command, so
 the engine and the model are imported only inside the commands that use them.
 """
@@ -21,10 +30,12 @@ the engine and the model are imported only inside the commands that use them.
 from __future__ import annotations
 
 import argparse
+import secrets
 import sys
 import time
 import urllib.error
 from pathlib import Path
+from typing import Optional
 
 from . import config
 from .client import DEFAULT_URL, InfinoClient, InfinoError, request_trial
@@ -38,6 +49,12 @@ NO_FREE_ACCOUNTS = 501
 FREE_ACCOUNT_TAKEN = 409
 # Seconds `login` and `sync` keep catching up while rows are still arriving.
 CATCH_UP_S = 60.0
+# A personal database `login` makes: `<team><PERSONAL_PART><random hex>`.
+PERSONAL_PART = "-personal-"
+# Random bytes in that name (hex: twice as many characters).
+PERSONAL_RANDOM_BYTES = 4
+# The longest database name the platform takes.
+MAX_DATABASE_NAME = 128
 
 
 def register_cli(parser: argparse.ArgumentParser) -> None:
@@ -47,7 +64,10 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     login.add_argument("--url", default="", help=f"platform URL (default {DEFAULT_URL})")
     login.add_argument("--api-key-file", default="", help="use this key (a team's) instead of creating an account")
     login.add_argument("--team-database", default="", help=f"the team's database (default {DEFAULT_DATABASE})")
-    login.add_argument("--personal-database", default="", help="your personal database (optional)")
+    login.add_argument("--personal-database", default="",
+                       help="your personal database, made if it is missing (default: a new one for this sign-in)")
+    login.add_argument("--no-personal-database", action="store_true",
+                       help="make no personal database: what is personal stays on this machine")
     login.add_argument("--yes", action="store_true", help="agree to the upload when using --api-key-file")
     sub.add_parser("sync", help="push what the cloud does not have yet")
     sub.add_parser("mcp", help="the Infino tools' MCP server, which Hermes starts (mcp_servers.infino)")
@@ -124,18 +144,63 @@ def _ask(question: str) -> bool:
         return False
 
 
-def _upload_notice(url: str, database: str, counts: dict, new_account: bool) -> str:
+# Where what is personal goes, as the upload notice says it, when login makes
+# the personal database.
+NEW_PERSONAL_DATABASE = "a personal database of your own, made now"
+
+
+def _personal_destination(args) -> str:
+    """Where what is personal goes, in the upload notice's words."""
+    if args.no_personal_database:
+        return "nowhere: it stays on this machine (--no-personal-database)"
+    if args.personal_database:
+        return f"your personal database '{args.personal_database}'"
+    return NEW_PERSONAL_DATABASE
+
+
+def _upload_notice(url: str, database: str, counts: dict, new_account: bool,
+                   personal: str = NEW_PERSONAL_DATABASE) -> str:
     kept = ", ".join(f"{n} {t}" for t, n in counts.items()) or "nothing yet"
     return "\n".join([
         f"Signing in {'creates a free Infino account on' if new_account else 'connects this profile to'} {url}",
         f"and uploads to the database '{database}':",
         f"  - everything kept on this machine so far ({kept}), except personal memory and the",
-        "    conversations and traces of personal profiles and scheduled jobs, which go only to a",
-        "    personal database (--personal-database) and otherwise stay here;",
+        "    conversations and traces of personal profiles and scheduled jobs, which go only to",
+        f"    {personal};",
         "  - and from then on, every memory, conversation (tool calls and their results included),",
         "    trace and published skill this profile writes.",
         "It stays on this machine too.",
     ])
+
+
+def _new_personal_name(team: str) -> str:
+    """A new personal database's name: the team's, then a random part, within
+    the platform's length."""
+    token = secrets.token_hex(PERSONAL_RANDOM_BYTES)
+    return team[:MAX_DATABASE_NAME - len(PERSONAL_PART) - len(token)] + PERSONAL_PART + token
+
+
+def _personal_database(client: InfinoClient, args, team: str) -> Optional[str]:
+    """The personal database this sign-in uses, ready in the cloud: the one
+    named (made if missing), else a new one, never one that exists already (it
+    could be anyone's). None with --no-personal-database, or when the platform
+    will not make it: what is personal then stays on this machine, and the
+    sign-in goes on, since a personal database the cloud refuses would stop
+    every sync."""
+    if args.no_personal_database:
+        return None
+    name = args.personal_database or _new_personal_name(team)
+    try:
+        if args.personal_database:
+            client.ensure_database(name)
+        else:
+            client.create_database(name)
+    except InfinoError as e:
+        print(f"No personal database: the platform would not make '{name}' ({e}). Personal memory, and the "
+              f"conversations and traces of personal profiles and scheduled jobs, stay on this machine.",
+              file=sys.stderr)
+        return None
+    return name
 
 
 def _local_counts() -> dict:
@@ -161,7 +226,7 @@ def _login(args) -> int:
     database = args.team_database or DEFAULT_DATABASE
     new_account = not args.api_key_file
     counts = _local_counts()
-    print(_upload_notice(url, database, counts, new_account))
+    print(_upload_notice(url, database, counts, new_account, _personal_destination(args)))
     if new_account or not args.yes:
         # Creating an account is a question only the person at the terminal answers.
         if not sys.stdin.isatty():
@@ -198,12 +263,16 @@ def _login(args) -> int:
         client.list_databases()  # the key works before anything is stored
         client.ensure_database(database)
 
+    personal = _personal_database(InfinoClient(api_key, url), args, database)
     creds = {"url": url, "api_key": api_key, "team_database": database,
              "consented_at_ms": int(time.time() * 1000)}
-    if args.personal_database:
-        creds["personal_database"] = args.personal_database
+    if personal:
+        creds["personal_database"] = personal
     path = config.write_credentials(creds)
     print(f"Signed in; the key is in {path} (owner-only).")
+    if personal:
+        print(f"Your personal database is '{personal}'. To use it from another machine too, sign in there "
+              f"with --personal-database {personal}.")
     status = _catch_up(config.load())
     # The launcher picks the database when Hermes starts the tool server, and a
     # running Hermes (its gateway) keeps the one it started.

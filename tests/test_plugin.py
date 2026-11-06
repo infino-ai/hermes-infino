@@ -632,7 +632,7 @@ def test_hermes_infino_mcp_starts_the_tools_inside_hermes(home, tmp_path, monkey
 
 def test_login_asks_and_refuses_without_a_terminal(home, platform, tmp_path, monkeypatch):
     monkeypatch.setattr("sys.stdin", io.StringIO(""))  # not a terminal
-    args = SimpleNamespace(url=platform.url, api_key_file="", team_database=TEAM_DB, personal_database="", yes=True)
+    args = SimpleNamespace(url=platform.url, api_key_file="", team_database=TEAM_DB, personal_database="", no_personal_database=False, yes=True)
     assert cli._login(args) == 1
     assert platform.trials == 0
     assert config.read_credentials(tmp_path) == {}
@@ -641,7 +641,7 @@ def test_login_asks_and_refuses_without_a_terminal(home, platform, tmp_path, mon
 def test_login_declined_creates_nothing(home, platform, tmp_path, monkeypatch):
     monkeypatch.setattr("sys.stdin", SimpleNamespace(isatty=lambda: True))
     monkeypatch.setattr("builtins.input", lambda _q: "n")
-    args = SimpleNamespace(url=platform.url, api_key_file="", team_database=TEAM_DB, personal_database="", yes=False)
+    args = SimpleNamespace(url=platform.url, api_key_file="", team_database=TEAM_DB, personal_database="", no_personal_database=False, yes=False)
     assert cli._login(args) == 0
     assert platform.trials == 0 and config.read_credentials(tmp_path) == {}
 
@@ -652,7 +652,7 @@ def test_login_creates_an_account_and_stores_the_key_privately(home, platform, t
     provider._drain()
     monkeypatch.setattr("sys.stdin", SimpleNamespace(isatty=lambda: True))
     monkeypatch.setattr("builtins.input", lambda _q: "y")
-    args = SimpleNamespace(url=platform.url, api_key_file="", team_database=TEAM_DB, personal_database="", yes=False)
+    args = SimpleNamespace(url=platform.url, api_key_file="", team_database=TEAM_DB, personal_database="", no_personal_database=False, yes=False)
     assert cli._login(args) == 0
     assert platform.trials == 1
     creds = config.read_credentials(tmp_path)

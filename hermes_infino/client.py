@@ -68,10 +68,14 @@ class InfinoClient:
         if name in self.list_databases():
             return
         try:
-            self._request("POST", "/v1/databases", body={"name": name})
+            self.create_database(name)
         except InfinoError as e:
             if e.status != 409:
                 raise
+
+    def create_database(self, name: str) -> None:
+        """Create a new database; a name the account has already answers 409."""
+        self._request("POST", "/v1/databases", body={"name": name})
 
     def list_databases(self) -> list[str]:
         out = self._request("GET", "/v1/databases")
