@@ -7,7 +7,8 @@ personal memory carries the private text in its arguments - `infino_remember`
 with scope "personal", or Hermes's own `memory` tool on its `user` target
 (USER.md) - so the text is withheld from those rows: the call is kept, with
 WITHHELD in place of the text, and so is its result, which can echo the
-entries.
+entries. A call that reads the person's own database (`infino_personal_search`)
+is withheld the same way: what it asked, and all it answered.
 
 What a person says in a conversation is the conversation, and is kept as
 said; this covers the memory written from it.
@@ -26,7 +27,9 @@ instead of the team's, when:
   (the backend sees that its earlier turns were kept personal);
 - a personal job's output was posted into a group chat (`deliver: room:<id>`):
   Hermes shows the post in a member's turn, labelled with the job's name. The
-  member's own profile has to list the job.
+  member's own profile has to list the job;
+- the session read the person's own database (`infino_personal_search`): what
+  it read is in the session now, so the session is personal from then on.
 
 Everything else stays the team's, as before. Which job a run belongs to is
 Hermes's to say (`cron.execution_identity`); a job is named by its id or its
@@ -43,10 +46,12 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
-# What stands in for the text of a personal memory.
-WITHHELD = "[personal memory, kept out of the team's tables]"
-# The text fields of the memory tools' arguments.
-TEXT_FIELDS = ("content", "old_text", "new_text")
+# What stands in for personal text: a personal memory's, or a personal search's.
+WITHHELD = "[personal, kept out of the team's tables]"
+# The text fields of the memory tools' arguments, and of the personal search's.
+TEXT_FIELDS = ("content", "old_text", "new_text", "query")
+# The tools that read the person's own database: every call of one is personal.
+PERSONAL_READ_TOOLS = ("infino_personal_search",)
 
 # How Hermes labels a scheduled job's output when it mirrors it into a chat's
 # transcript: a user message whose first line is "[Cron delivery: <job>]", the
@@ -82,7 +87,10 @@ def _args(arguments: Any) -> Any:
 
 
 def is_personal_call(tool_name: str, arguments: Any) -> bool:
-    """Whether a tool call writes, changes or deletes personal memory."""
+    """Whether a tool call writes, changes or deletes personal memory, or
+    reads the person's own database."""
+    if tool_name in PERSONAL_READ_TOOLS:
+        return True
     args = _args(arguments)
     if not isinstance(args, dict):
         return False
@@ -98,6 +106,8 @@ def withhold(tool_name: str, arguments: Any) -> Any:
     came in (JSON text or a dict); others unchanged."""
     if not is_personal_call(tool_name, arguments):
         return arguments
+    if not isinstance(_args(arguments), dict):  # nothing to tell apart: all of it
+        return WITHHELD
     args = dict(_args(arguments))
     for field_name in TEXT_FIELDS:
         if field_name in args:

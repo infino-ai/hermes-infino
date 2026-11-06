@@ -13,7 +13,12 @@ person's, in a personal profile) once signed in (`backend.py`):
   results included, to `conversations` - the person's own, not the team's,
   for a personal session (privacy.py);
 - skills: `infino_publish_skill` shares one of the profile's skills with the
-  team (`skills`).
+  team (`skills`);
+- personal search: `infino_personal_search` searches the person's own
+  memory, conversations and traces, offered only where the turn is the
+  owner's: a session on this machine, or a profile that is one person's, and
+  never in a group chat. A session that uses it is personal from then on
+  (privacy.py): what it read never reaches the team's tables through it.
 
 A turn's messages are the ones from its user message on: Hermes hands
 `sync_turn` the whole list, which compaction and `/undo` shorten in place
@@ -83,6 +88,17 @@ PRIMARY_CONTEXT = "primary"
 # subagent or a scheduled job saving what it found writes like a session does.
 # A flush run is Hermes saving its own memory before compaction: not here.
 TOOL_WRITE_CONTEXTS = (PRIMARY_CONTEXT, "subagent", "cron")
+# The tool that searches the person's own database.
+PERSONAL_SEARCH_TOOL = privacy.PERSONAL_READ_TOOLS[0]
+# Rows a personal search returns when the call names no number, and the most it may ask for.
+PERSONAL_SEARCH_K = 10
+MAX_PERSONAL_SEARCH_K = 50
+# Longest cell of a personal search's rows, so one long message or tool result
+# cannot crowd out the rest of the answer.
+PERSONAL_RESULT_CELL_CHARS = 1_000
+# What a personal search answers where the turn is not the owner's own.
+NO_PERSONAL_SEARCH_HERE = ("your personal data is not searched here: only in your own sessions, or on a "
+                           "profile that is one person's, and never in a group chat")
 # Beside the plugin's databases once the profile has answered a gateway: its
 # USER.md may then hold entries about anyone who wrote in.
 GATEWAY_MARK = "served_a_gateway"
@@ -324,6 +340,15 @@ class InfinoMemoryProvider(MemoryProvider):
         if not self._gateway():
             return True
         return bool((self._settings and self._settings.personal_profile) or (chat.group and chat.owner_writes))
+
+    def _offers_personal_search(self) -> bool:
+        """Whether this session may search the person's own database: a
+        person's own session (never a scheduled job's or a subagent's run, whose
+        rows may be the team's), on this machine or on a profile that is one
+        person's. A group chat is refused per call (handle_tool_call)."""
+        if not self._settings or self._agent_context != PRIMARY_CONTEXT:
+            return False
+        return not self._gateway() or self._settings.personal_profile
 
     def _shared_gateway_profile(self) -> bool:
         """Whether this profile answers a gateway's people without being one
@@ -591,6 +616,25 @@ class InfinoMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         scope = {"type": "string", "enum": [TEAM, PERSONAL],
                  "description": "team (the default: work knowledge) or personal (about one person)"}
+        personal_search = [{
+            "name": PERSONAL_SEARCH_TOOL,
+            "description": "Search your own personal data, which the Infino tools do not: your personal memory, "
+                           "and the conversations and traces of your personal work (personal scheduled jobs, the "
+                           "chats their output went to, a personal profile). Keyword search, best rows first, "
+                           "with when each was written. Once you use it, this session's conversation and traces "
+                           "are kept personal.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "the words to search for"},
+                    "table": {"type": "string", "enum": list(tables.PERSONAL),
+                              "description": f"which of your tables to search (default {tables.CONVERSATIONS})"},
+                    "k": {"type": "integer", "description": f"rows to return (default {PERSONAL_SEARCH_K}, "
+                                                            f"at most {MAX_PERSONAL_SEARCH_K})"},
+                },
+                "required": ["query"],
+            },
+        }] if self._offers_personal_search() else []
         return [
             {
                 "name": "infino_remember",
@@ -624,7 +668,7 @@ class InfinoMemoryProvider(MemoryProvider):
                     "required": ["name"],
                 },
             },
-        ]
+        ] + personal_search
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         if not self._settings:
@@ -676,9 +720,35 @@ class InfinoMemoryProvider(MemoryProvider):
                                                              f"the most a team skill may be is {skills.MAX_SKILL_CHARS}"})
                 self._append(tables.SKILLS, [skills.skill_row(name, text, self._person(), self._profile)])
                 return json.dumps({"ok": True, "published": name})
+            if tool_name == PERSONAL_SEARCH_TOOL:
+                return self._personal_search(args, chat)
         except Exception as e:  # a tool reports its failure; it never raises into Hermes
             return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"})
         return json.dumps({"ok": False, "error": f"unknown tool {tool_name}"})
+
+    def _personal_search(self, args: dict[str, Any], chat: chats.Chat) -> str:
+        """`infino_personal_search`: the best rows of one of the person's own
+        tables. Refused where the turn is not the owner's own; a session that
+        searches is personal from then on, so nothing it read is written to
+        the team's tables."""
+        assert self._backend is not None
+        if not self._offers_personal_search() or chat.group:
+            return json.dumps({"ok": False, "error": NO_PERSONAL_SEARCH_HERE})
+        table = str(args.get("table") or tables.CONVERSATIONS)
+        if table not in tables.PERSONAL:
+            return json.dumps({"ok": False, "error": f"table must be one of {', '.join(tables.PERSONAL)}, "
+                                                     f"not {table!r}"})
+        k = max(1, min(int(args.get("k") or PERSONAL_SEARCH_K), MAX_PERSONAL_SEARCH_K))
+        privacy.note_personal(self._session_id)
+        rows = self._backend.search_personal(table, str(args["query"]), k)
+        people = self._people()
+        if table == tables.MEMORY and people is not None:
+            # As recall shows it: the owner's own, not what an earlier version
+            # kept for a gateway's senders.
+            rows = [r for r in rows if r.get("author") in people]
+        return json.dumps({"ok": True, "table": table, "rows": [
+            {c: (v[:PERSONAL_RESULT_CELL_CHARS] if isinstance(v, str) else v)
+             for c, v in r.items() if v not in (None, "")} for r in rows]}, default=str)
 
     # -- lifecycle -----------------------------------------------------------
 

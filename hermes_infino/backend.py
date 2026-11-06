@@ -3,10 +3,11 @@ the cloud databases once signed in, caught up by the mirror.
 
 Two local databases: the team's tables (`infino/db`), which the Infino tools
 read, and the person's own (`infino/personal`): their memory, and the
-conversations and traces kept personal (privacy.py), which only the plugin
-opens. Nothing personal is ever in a database a tool or a group chat can
-reach: locally it is in its own, and in the cloud in the personal database,
-or nowhere when the person has none.
+conversations and traces kept personal (privacy.py). Nothing personal is ever
+in the team's database: locally it is in its own, and in the cloud in the
+personal database, or nowhere when the person has none. The person's own
+database is read by recall and by `infino_personal_search`, both only where
+the turn is the owner's (provider.py).
 
 One backend per profile home, shared by the memory provider, the trace hooks
 and the skills loader. Writes land locally and return; when signed in they
@@ -38,6 +39,21 @@ FLUSH_TIMEOUT_S = 30.0
 # The tables whose rows follow their session: personal sessions' go to the
 # person's own database.
 TRANSCRIPT_TABLES = (tables.CONVERSATIONS, tables.TRACES)
+# Seconds a search of the personal cloud database may take before this
+# machine's copy answers: a turn is waiting on it.
+PERSONAL_SEARCH_TIMEOUT_S = recall.RECALL_TIMEOUT_S
+
+
+def _best(results: list[list[dict]], k: int) -> list[dict]:
+    """The `k` best rows of several searches, each row once (at its best
+    score), best first."""
+    best: dict[str, dict] = {}
+    for rows in results:
+        for r in rows:
+            key = str(r.get(tables.ROW_ID))
+            if key not in best or float(r.get("score") or 0.0) > float(best[key].get("score") or 0.0):
+                best[key] = r
+    return sorted(best.values(), key=lambda r: -float(r.get("score") or 0.0))[:k]
 
 
 class Backend:
@@ -298,6 +314,24 @@ class Backend:
         # Recall is waited on by the turn: a short timeout and no retries.
         cloud = InfinoClient(s.api_key, s.url, timeout=recall.RECALL_TIMEOUT_S, retries=0)
         return recall.Recaller(sources, cloud)
+
+    def search_personal(self, table: str, query: str, k: int) -> list[dict]:
+        """The `k` best rows of one of the person's own tables for `query`, by
+        keyword over each of its full-text columns, best first: from the
+        personal cloud database when there is one (every machine's rows), and
+        from this machine's copy when there is none or it does not answer."""
+        schema, indexes = tables.PERSONAL_TABLES[table]
+        columns = indexes["fts"]
+        projection = [f["name"] for f in schema if f["type"] != "embedding"]
+        s = self.settings
+        if self.mirror is not None and s.personal_database:
+            client = InfinoClient(s.api_key, s.url, timeout=PERSONAL_SEARCH_TIMEOUT_S, retries=0)
+            try:
+                return _best([client.bm25_search(s.personal_database, table, query, field=c, k=k,
+                                                 projection=projection + ["score"]) for c in columns], k)
+            except Exception as e:  # this machine's copy answers instead
+                logger.info("infino: the personal database did not answer a search: %s", e)
+        return _best([self.personal.keyword_search(table, c, query, k, projection) for c in columns], k)
 
     def query(self, sql: str, timeout_s: Optional[float] = None) -> list[dict]:
         """SQL over the team's tables: the cloud's when signed in, else local."""

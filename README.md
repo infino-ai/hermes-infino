@@ -1,6 +1,6 @@
 # Infinite recall for Hermes agents
 
-hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that gives your agents a memory that lasts. It stores four things in Infino: memory, conversations, traces and skills. Before each turn it gives the agent the memories that matter for that turn, and with the Infino tools the agent can search everything stored except what's personal.
+hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that gives your agents a memory that lasts. It stores four things in Infino: memory, conversations, traces and skills. Before each turn it gives the agent the memories that matter for that turn, and the agent can search everything stored: the team's data with the Infino tools, and your personal data with `infino_personal_search`, in your own sessions.
 
 Without an account, everything stays on your machine, in databases run by Infino's open source engine.
 
@@ -8,7 +8,7 @@ When you [sign in](#signing-in), everything is kept in Infino Cloud too. Work go
 
 ## What it stores
 
-The plugin keeps four tables in each database.
+The plugin keeps four tables in the team database, and the first three of them in your personal database.
 
 **`memory`** holds the entries in Hermes's `MEMORY.md` and `USER.md`, including edits you make by hand, plus whatever the agent saves with `infino_remember`. A shared profile on a gateway keeps no `USER.md` entries. `infino_forget` deletes a memory, even one a teammate's agent saved.
 
@@ -195,6 +195,8 @@ Hermes runs the Infino client as an MCP server, started with `hermes infino mcp`
 
 - **Not signed in:** `search`, `find`, `sql` and `read`, over the database on your machine.
 - **Signed in:** `ask`, `search`, `find`, `sql` and `join_keys`, over your team's database in the cloud. `ask` is Infino's retrieval agent: give it a question, and it returns the rows that answer it, with where they came from.
+
+The Infino tools search the team database. Your personal data is searched with `infino_personal_search`, a tool of the plugin's own: keyword search over your personal memory, conversations and traces. The agent has it in your own sessions, and on a profile marked personal, but never in a group chat or on a shared profile. A session that uses it becomes personal, so what it reads never ends up in the team database.
 
 The API key reaches the client through its environment, never its command line. Hermes doesn't pass an MCP server's instructions to the model, so the plugin puts them in the system prompt.
 
