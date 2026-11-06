@@ -50,6 +50,13 @@ TEXT_FIELDS = ("content", "old_text", "new_text")
 # job named by its name, or its id when it has none.
 DELIVERY_PREFIX = "[Cron delivery: "
 DELIVERY_SUFFIX = "]"
+# How Hermes shows a scheduled job's output posted into a group chat
+# (`deliver: room:<id>`) in a member's turn: a line of its own,
+# `Scheduled job "<job>" (automated post, not the user): <output>`, the job
+# named by its name, or its id when it has none. A person's lines there start
+# "User (user): " and a member's "@<handle>: ", so neither can begin with it.
+ROOM_DELIVERY_PREFIX = 'Scheduled job "'
+ROOM_DELIVERY_MARK = '" (automated post, not the user):'
 # A cron run's session id when Hermes's scheduler names it: cron_<job id>_<date>_<time>.
 CRON_SESSION = re.compile(r"^cron_(.+)_\d{8}_\d{6}$")
 # Hermes's record of the scheduled job the running code belongs to. Read only
@@ -141,8 +148,10 @@ def _job_ref(ref: str) -> tuple[str, str]:
 
 def delivered_jobs(messages: Iterable[dict]) -> list[str]:
     """The jobs (as their labels name them) whose output Hermes delivered into
-    these messages. A label may begin any line: Hermes merges consecutive user
-    messages, so a delivery can share one with what the person wrote next."""
+    these messages: mirrored into a chat, or posted into a group chat. A label
+    may begin any line: Hermes merges consecutive user messages, so a delivery
+    can share one with what the person wrote next, and a group chat member's
+    turn lists the room's new messages one per line."""
     found = []
     for m in messages or ():
         if not isinstance(m, dict) or m.get("role") != "user":
@@ -151,6 +160,8 @@ def delivered_jobs(messages: Iterable[dict]) -> list[str]:
             line = line.strip()
             if line.startswith(DELIVERY_PREFIX) and line.endswith(DELIVERY_SUFFIX):
                 found.append(line[len(DELIVERY_PREFIX):-len(DELIVERY_SUFFIX)].strip())
+            elif line.startswith(ROOM_DELIVERY_PREFIX) and ROOM_DELIVERY_MARK in line:
+                found.append(line[len(ROOM_DELIVERY_PREFIX):line.index(ROOM_DELIVERY_MARK)].strip())
     return found
 
 

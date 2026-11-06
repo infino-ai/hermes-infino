@@ -192,6 +192,43 @@ def test_a_delivered_chats_traces_are_personal(chat, tmp_path):
     assert texts(local(tmp_path), tables.TRACES) == []
 
 
+def room_turn(job_name: str, output: str) -> str:
+    """A group chat member's turn prompt, as Hermes builds one when a scheduled
+    job posts its output into the room (`deliver: room:<id>`)."""
+    return "\n".join([
+        '[Discussion: "Family"] You are @helper, one participant with @planner and the user.', "",
+        "New messages in this thread since your last turn (oldest first):",
+        f'  Scheduled job "{job_name}" (automated post, not the user): {output}',
+        "  User (user): Can you draft the reply?", "",
+        "Rules for this Discussion:",
+        "- Reply with one conversational message only when you have something new worth adding."])
+
+
+def test_a_group_chat_a_personal_jobs_output_was_posted_into_is_personal(chat, tmp_path):
+    _, p = chat
+    prompt = room_turn(DIGEST["name"], TRIAGE)
+    p.sync_turn(prompt, "Drafted a reply to Dr. Lee.", session_id="room-1",
+                messages=turn(prompt, "Drafted a reply to Dr. Lee."))
+    p._drain()
+    assert texts(local(tmp_path), tables.CONVERSATIONS) == []
+    assert len(texts(personal(tmp_path), tables.CONVERSATIONS)) == 2
+
+
+def test_a_group_chat_a_team_jobs_output_was_posted_into_stays_the_teams(chat, tmp_path):
+    _, p = chat
+    prompt = room_turn(REPORT["name"], "12 deploys this week.")
+    p.sync_turn(prompt, "The Tuesday deploy failed.", session_id="room-1",
+                messages=turn(prompt, "The Tuesday deploy failed."))
+    p._drain()
+    assert len(texts(local(tmp_path), tables.CONVERSATIONS)) == 2
+    assert texts(personal(tmp_path), tables.CONVERSATIONS) == []
+
+
+def test_a_person_quoting_a_room_label_mid_line_names_no_job():
+    said = 'User (user): it printed Scheduled job "email-digest" (automated post, not the user): hi'
+    assert privacy.delivered_jobs([{"role": "user", "content": said}]) == []
+
+
 def test_a_chat_a_team_jobs_output_was_delivered_into_stays_the_teams(chat, tmp_path):
     _, p = chat
     messages = [{"role": "user", "content": "[Cron delivery: weekly-report]\n12 deploys this week."}] + turn(
