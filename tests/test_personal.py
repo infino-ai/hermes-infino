@@ -224,7 +224,7 @@ def test_a_group_chat_a_team_jobs_output_was_posted_into_stays_the_teams(chat, t
     assert texts(personal(tmp_path), tables.CONVERSATIONS) == []
 
 
-def hermes_room_turn(tmp_path, job_name: str, output: str) -> str:
+def hermes_room_turn(tmp_path, job: dict, output: str) -> str:
     """The turn prompt Hermes itself builds for a group chat member that a
     scheduled job's post @mentions: the room store, the job's post and the
     Discussion planner are Hermes's own (in Hermes 0.23 and later)."""
@@ -236,7 +236,7 @@ def hermes_room_turn(tmp_path, job_name: str, output: str) -> str:
     db = tmp_path / "rooms.db"
     hosted_rooms.create_room(db, room_id="room-family", name="Family", members=members,
                              authority_gateway_id=hosted_rooms.local_authority_gateway_id(), now=1)
-    room_context.post_scheduled_message(db, room_id="room-family", job_id=DIGEST["id"], job_name=job_name,
+    room_context.post_scheduled_message(db, room_id="room-family", job_id=job["id"], job_name=job["name"],
                                         run_key="run-1", text=f"@helper {output}")
     room = hosted_rooms.room_state(db, room_id="room-family")
     room["members"] = members
@@ -248,12 +248,25 @@ def hermes_room_turn(tmp_path, job_name: str, output: str) -> str:
 @pytest.mark.parametrize("job, personal_rows, team_rows", [(DIGEST, 2, 0), (REPORT, 0, 2)])
 def test_a_group_chat_post_as_hermes_builds_it_follows_the_job(chat, tmp_path, job, personal_rows, team_rows):
     _, p = chat
-    prompt = hermes_room_turn(tmp_path, job["name"], TRIAGE)
+    prompt = hermes_room_turn(tmp_path, job, TRIAGE)
     p.sync_turn(prompt, "Drafted a reply to Dr. Lee.", session_id="room-1",
                 messages=turn(prompt, "Drafted a reply to Dr. Lee."))
     p._drain()
     assert len(texts(personal(tmp_path), tables.CONVERSATIONS)) == personal_rows
     assert len(texts(local(tmp_path), tables.CONVERSATIONS)) == team_rows
+
+
+def test_a_group_chat_member_whose_profile_does_not_list_the_job_writes_to_the_team(home, tmp_path, monkeypatch):
+    """The setting is read per profile: a member's turn runs as its own profile,
+    and this one does not list the job."""
+    in_session(monkeypatch, DM)
+    _, p = make_manager(tmp_path, platform="telegram", session_id="room-1")
+    prompt = hermes_room_turn(tmp_path, DIGEST, TRIAGE)
+    p.sync_turn(prompt, "Drafted a reply to Dr. Lee.", session_id="room-1",
+                messages=turn(prompt, "Drafted a reply to Dr. Lee."))
+    p._drain()
+    assert texts(personal(tmp_path), tables.CONVERSATIONS) == []
+    assert len(texts(local(tmp_path), tables.CONVERSATIONS)) == 2
 
 
 def test_a_person_quoting_a_room_label_mid_line_names_no_job():

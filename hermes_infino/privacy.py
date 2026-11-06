@@ -23,7 +23,10 @@ instead of the team's, when:
   mirrors a delivered job's output into the chat's transcript, labelled with
   the job's name, and what follows in that chat is about it. The session
   stays personal from then on, even once compaction has dropped the label
-  (the backend sees that its earlier turns were kept personal).
+  (the backend sees that its earlier turns were kept personal);
+- a personal job's output was posted into a group chat (`deliver: room:<id>`):
+  Hermes shows the post in a member's turn, labelled with the job's name. The
+  member's own profile has to list the job.
 
 Everything else stays the team's, as before. Which job a run belongs to is
 Hermes's to say (`cron.execution_identity`); a job is named by its id or its
@@ -53,8 +56,9 @@ DELIVERY_SUFFIX = "]"
 # How Hermes shows a scheduled job's output posted into a group chat
 # (`deliver: room:<id>`) in a member's turn: a line of its own,
 # `Scheduled job "<job>" (automated post, not the user): <output>`, the job
-# named by its name, or its id when it has none. A person's lines there start
-# "User (user): " and a member's "@<handle>: ", so neither can begin with it.
+# named by its name, or its id when it has none. A person's or a member's
+# message keeps its own newlines, so a later line of one can begin with the
+# label too; that only ever makes the session personal, never the team's.
 ROOM_DELIVERY_PREFIX = 'Scheduled job "'
 ROOM_DELIVERY_MARK = '" (automated post, not the user):'
 # A cron run's session id when Hermes's scheduler names it: cron_<job id>_<date>_<time>.
