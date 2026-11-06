@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +32,7 @@ class FakePlatform:
         self.refused_marker = None     # an append carrying a row with this text answers refused_status
         self.refused_status = 400
         self.no_embedder = False       # create_table refuses embedding columns with 403
+        self.schema_patch_refused = False  # a schema patch (adding a column) answers 403
         self.database_limit = None     # like a free plan: creates past this count answer 403
         self.trial_status = None       # /v1/trial answers this status (501: no free accounts; 409: one per network)
         self.trial_without_key = False  # /v1/trial answers 200 with no api_key
@@ -122,6 +124,12 @@ class FakePlatform:
         if op == "list_tables":
             return 200, list(tables), None
         if op == "schema":
+            if body.get("patch") is not None:
+                if self.schema_patch_refused:
+                    return 403, {"error": "this key may not manage the database"}, None
+                schema = self.schemas.setdefault((db, body["table_name"]), [])
+                have = {f["name"] for f in schema}
+                schema += [f for f in body["patch"].get("fields", []) if f["name"] not in have]
             return 200, self.schemas.get((db, body["table_name"]), []), None
         if op == "create_table":
             if body["table_name"] in tables:
@@ -157,17 +165,9 @@ class FakePlatform:
             if self.failed_deletes > 0:
                 self.failed_deletes -= 1
                 return 500, {"error": "delete error"}, None
-            predicate = params["predicate"]
-            m = re.fullmatch(r"content = '((?:[^']|'')*)'", predicate)
-            if m:
-                target = m.group(1).replace("''", "'")
-                gone = lambda r: r.get("content") == target  # noqa: E731
-            else:
-                m = re.fullmatch(r"row_id IN \((.*)\)", predicate)
-                ids = {v.replace("''", "'") for v in re.findall(r"'((?:[^']|'')*)'", m.group(1))}
-                gone = lambda r: r.get("row_id") in ids  # noqa: E731
             rows = tables[params["table"]]
-            kept = [r for r in rows if not gone(r)]
+            gone = {id(r) for r in self._where(db, params["table"], rows, params["predicate"])}
+            kept = [r for r in rows if id(r) not in gone]
             matched = len(rows) - len(kept)
             tables[params["table"]] = kept
             return 200, {"matched": matched, "n_tombstoned": matched, "n_not_found": 0}, None
@@ -190,17 +190,35 @@ class FakePlatform:
             hits.sort(key=lambda h: -h["score"])
             return 200, {"data": hits[: body["k"]]}, None
         if op == "query_sql":
-            # Only the statements the plugin runs: a table's rows (the skills
-            # load), and rows or a count by row_id (the mirror's checks).
-            m = re.match(r"SELECT (.*?) FROM (\w+)(?: WHERE row_id (?:= (.*)|IN \((.*)\)))?", body["query"])
+            # The statements the plugin runs: a table's rows (the skills load,
+            # whose ORDER BY and LIMIT are not applied), and rows or a count
+            # where a predicate holds (the mirror's checks, a forget's lookup).
+            m = re.match(r"SELECT (.*?) FROM (\w+)(?: WHERE (.*?))?(?: ORDER BY .*)?$", body["query"], re.S)
             if m.group(2) not in tables:
                 return 400, {"error": f"table '{m.group(2)}' not found"}, None
             rows = list(tables[m.group(2)])
-            wanted = m.group(3) or m.group(4)
-            if wanted is not None:
-                ids = {v.replace("''", "'") for v in re.findall(r"'((?:[^']|'')*)'", wanted)}
-                rows = [r for r in rows if r.get("row_id") in ids]
+            if m.group(3) is not None:
+                rows = self._where(db, m.group(2), rows, m.group(3))
             if m.group(1).startswith("count(*)"):
                 return 200, {"data": [{"n": len(rows)}]}, None
             return 200, {"data": rows}, None
         return 404, {"error": f"no route {op}"}, None
+
+    def _where(self, db: str, table: str, rows: list[dict], predicate: str) -> list[dict]:
+        """The rows a SQL predicate holds for, evaluated by SQLite over the
+        table's columns (its schema's and its rows'), with the engine's
+        `ends_with` function."""
+        if not rows:
+            return []
+        columns = sorted({f["name"] for f in self.schemas.get((db, table), [])} | {k for r in rows for k in r})
+        con = sqlite3.connect(":memory:")
+        con.create_function("ends_with", 2,
+                            lambda s, t: None if s is None or t is None else int(str(s).endswith(str(t))))
+        quoted = ", ".join('"' + c + '"' for c in columns)
+        con.execute(f"CREATE TABLE t (_i INTEGER, {quoted})")
+        con.executemany(f"INSERT INTO t VALUES ({', '.join('?' * (len(columns) + 1))})",
+                        [(i, *[r.get(c) if not isinstance(r.get(c), (dict, list)) else json.dumps(r.get(c))
+                               for c in columns]) for i, r in enumerate(rows)])
+        keep = {i for (i,) in con.execute(f"SELECT _i FROM t WHERE {predicate}")}
+        con.close()
+        return [r for i, r in enumerate(rows) if i in keep]

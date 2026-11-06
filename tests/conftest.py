@@ -31,11 +31,13 @@ def quick(monkeypatch):
     skills._loaded_at.clear()
     privacy._sessions.clear()  # what one test noted about its sessions is not another's
     traces._started.clear()
+    traces._buffers.clear()
     yield
     embed.use(None)
     backend._backends.clear()
     privacy._sessions.clear()
     traces._started.clear()
+    traces._buffers.clear()
 
 
 @pytest.fixture

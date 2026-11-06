@@ -8,6 +8,7 @@ import io
 import json
 import os
 import stat
+import time
 from types import SimpleNamespace
 
 import infino
@@ -23,6 +24,9 @@ from hermes_infino.local import arrow_schema, index_spec
 
 from .helpers import (DM, GROUP, OTHER_GROUP, PERSONAL_DB, SKILL_MD, TEAM_DB, hook_ctx, in_session, local,
                       local_rows, make_manager, personal_rows, wait_for)
+
+# Seconds that put a save after a forget's `stored_ms` bound.
+LATER_S = 0.01
 
 
 # -- signed in ----------------------------------------------------------------
@@ -463,13 +467,41 @@ def test_a_group_chat_forgets_only_what_it_can_recall(env, platform, tmp_path, m
     assert [r["chat"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["telegram:-100"]
 
 
-def test_a_cloud_table_from_an_older_version_is_refused_by_name(env, platform, tmp_path):
+def test_a_cloud_table_from_an_older_version_gains_the_new_column(env, platform, tmp_path):
     client = InfinoClient("k", platform.url)
     client.ensure_database(TEAM_DB)
     older = [f for f in tables.MEMORY_SCHEMA if f["name"] != tables.CHAT]
     client.ensure_table(TEAM_DB, tables.MEMORY, older, tables.MEMORY_INDEXES)
-    with pytest.raises(tables.OutdatedTable, match="has no chat"):
+    tables.ensure_all(client, TEAM_DB)
+    assert tables.CHAT in client.column_names(TEAM_DB, tables.MEMORY)
+
+
+def test_a_cloud_table_that_cannot_gain_its_column_is_refused_by_name_and_gets_no_rows(env, platform, tmp_path):
+    client = InfinoClient("k", platform.url)
+    client.ensure_database(TEAM_DB)
+    older = [f for f in tables.MEMORY_SCHEMA if f["name"] != tables.CHAT]
+    client.ensure_table(TEAM_DB, tables.MEMORY, older, tables.MEMORY_INDEXES)
+    platform.schema_patch_refused = True
+    with pytest.raises(tables.OutdatedTable, match="has no chat") as refused:
         tables.ensure_all(client, TEAM_DB)
+    assert "drop" not in str(refused.value)
+    # The provider keeps every row here, and pushes none while the table is wrong.
+    mgr, provider = make_manager(tmp_path)
+    mgr.handle_tool_call("infino_remember", {"content": "kept on this machine"})
+    provider.shutdown()
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    assert [r["content"] for r in local_rows(tmp_path, tables.MEMORY)] == ["kept on this machine"]
+    assert "has no chat" in provider._backend.mirror.last_error()
+    # Once the column can be added, the rows go.
+    platform.schema_patch_refused = False
+    monkey_retry_now(provider._backend.mirror)
+    provider._backend.mirror.sync(wait=True)
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["kept on this machine"]
+
+
+def monkey_retry_now(m: mirror.Mirror) -> None:
+    """Let the next sync try the cloud tables again at once (not after ENSURE_RETRY_S)."""
+    m._tables_failed_at = 0.0
 
 
 def test_a_local_table_from_an_older_version_gains_the_new_column(home, tmp_path):
@@ -684,3 +716,98 @@ def test_remote_config_signs_the_plugin_in(remote, home, platform, tmp_path):
     assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["Deploys freeze on December 20"]
     assert [r for r in remote.requests if r["method"] == "GET"]  # read from the service
     assert not (tmp_path / "config.yaml").exists()  # never from a local file
+
+
+# -- forgets across machines ----------------------------------------------------
+
+def teammate(env, tmp_path, name: str):
+    """Another machine on the team: its own profile home, the same team database."""
+    home = tmp_path / name
+    home.mkdir()
+    env.setenv("HERMES_HOME", str(home))
+    backend._backends.clear()
+    return home, make_manager(home, agent_identity=name)
+
+
+def test_a_teammates_memory_is_forgotten_from_another_machine(env, platform, tmp_path):
+    _, (mgr_a, prov_a) = teammate(env, tmp_path, "a")
+    mgr_a.handle_tool_call("infino_remember", {"content": "The on-call rota lives in the ops wiki"})
+    prov_a.shutdown()
+    _, (mgr_b, prov_b) = teammate(env, tmp_path, "b")
+    assert "on-call rota" in prov_b.prefetch("where does the on-call rota live")
+    out = json.loads(mgr_b.handle_tool_call("infino_forget", {"content": "The on-call rota lives in the ops wiki"}))
+    assert out["matched"] == 1
+    prov_b.shutdown()
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    assert "on-call rota" not in prov_b.prefetch("where does the on-call rota live")
+
+
+def test_a_forget_the_cloud_cannot_answer_is_queued_and_keeps_a_later_save(env, platform, tmp_path, monkeypatch):
+    _, (mgr_a, prov_a) = teammate(env, tmp_path, "a")
+    mgr_a.handle_tool_call("infino_remember", {"content": "use pnpm"})
+    prov_a.shutdown()
+    _, (mgr_b, prov_b) = teammate(env, tmp_path, "b")
+
+    def unanswered(*args, **kwargs):
+        raise TimeoutError("no answer")
+
+    monkeypatch.setattr(prov_b._backend.mirror, "matching_ids", unanswered)
+    mgr_b.handle_tool_call("infino_forget", {"content": "use pnpm"})
+    time.sleep(LATER_S)  # a later save is stored after the forget's bound
+    mgr_b.handle_tool_call("infino_remember", {"content": "use pnpm"})
+    prov_b.shutdown()
+    # Machine a's copy is gone; machine b's, saved after the forget, is kept.
+    assert [(r["content"], r["profile"]) for r in platform.rows(TEAM_DB, tables.MEMORY)] == [("use pnpm", "b")]
+
+
+# -- personal memory on a gateway profile ----------------------------------------
+
+def test_a_gateway_senders_personal_memory_stays_out_of_the_owners_own_sessions(home, tmp_path, monkeypatch):
+    home.setenv("INFINO_AUTHOR", "owner-name")
+    mgr_gw, prov_gw = make_manager(tmp_path, platform="telegram", session_id="gw-alice")
+    in_session(monkeypatch, {**DM, "HERMES_SESSION_USER_NAME": "alice", "HERMES_SESSION_USER_ID": "333"})
+    mgr_gw.handle_tool_call("infino_remember", {"content": "Alice's door badge PIN is 4421", "scope": "personal"})
+    prov_gw.shutdown()
+    in_session(monkeypatch, {})
+    mgr_cli, prov_cli = make_manager(tmp_path, platform="cli", session_id="cli", user_id="uid:1000")
+    mgr_cli.handle_tool_call("infino_remember", {"content": "the owner's badge PIN is 9911", "scope": "personal"})
+    # A row an earlier version wrote under the machine's user id is the owner's too.
+    prov_cli._backend.personal.append(tables.MEMORY, [{"content": "the owner's locker is 12", "scope": "personal",
+                                                       "author": "uid:1000"}])
+    block = prov_cli.prefetch("badge PIN locker")
+    assert "9911" in block and "locker is 12" in block and "4421" not in block
+    out = json.loads(mgr_cli.handle_tool_call("infino_forget", {"content": "Alice's door badge PIN is 4421"}))
+    assert out["matched"] == 0  # nor can the owner's sessions delete it
+    in_session(monkeypatch, {**DM, "HERMES_SESSION_USER_NAME": "alice", "HERMES_SESSION_USER_ID": "333"})
+    assert "4421" in prov_gw.prefetch("door badge PIN")  # still Alice's, in her own chat
+
+
+# -- publishing skills ---------------------------------------------------------
+
+def a_skill(tmp_path, text: str = SKILL_MD):
+    skill = tmp_path / "skills" / "release-checklist" / "SKILL.md"
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text(text)
+
+
+def test_a_group_member_cannot_publish_a_skill_to_the_team(env, platform, tmp_path, monkeypatch):
+    a_skill(tmp_path)
+    mgr, provider = make_manager(tmp_path, platform="telegram")
+    in_session(monkeypatch, GROUP)
+    out = json.loads(mgr.handle_tool_call("infino_publish_skill", {"name": "release-checklist"}))
+    assert out["ok"] is False and "owner" in out["error"]
+    # The owner, admitted by Hermes to write their own memory from the group, may.
+    in_session(monkeypatch, GROUP, binding=SimpleNamespace(owner_writes=True))
+    assert json.loads(mgr.handle_tool_call("infino_publish_skill", {"name": "release-checklist"}))["ok"] is True
+    provider.shutdown()
+    assert len(platform.rows(TEAM_DB, tables.SKILLS)) == 1
+
+
+def test_a_published_skill_is_scrubbed_of_secrets(env, platform, tmp_path):
+    secret = "sk-ant-api03-" + "A1b2C3d4E5f6G7h8I9j0" * 4
+    a_skill(tmp_path, SKILL_MD + f"\nDeploy with {secret}\n")
+    mgr, provider = make_manager(tmp_path)
+    assert json.loads(mgr.handle_tool_call("infino_publish_skill", {"name": "release-checklist"}))["ok"] is True
+    provider.shutdown()
+    [row] = platform.rows(TEAM_DB, tables.SKILLS)
+    assert secret not in row["content"] and "Deploy with" in row["content"]

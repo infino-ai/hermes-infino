@@ -101,6 +101,17 @@ def test_each_session_flushes_only_its_own_rows(hooks, tmp_path):
     assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 2)
 
 
+def test_a_turns_rows_survive_hermes_registering_the_hooks_again(hooks, tmp_path):
+    # Hermes registers a plugin's hooks anew for every agent it builds (a
+    # gateway: every message), while another chat's turn is still running.
+    hooks["post_api_request"](session_id="chat-a", turn_id="ta", model="m")
+    rebuilt = hook_ctx()
+    rebuilt["post_tool_call"](session_id="chat-a", turn_id="ta", tool_name="terminal")
+    rebuilt["on_session_end"](session_id="chat-a")
+    assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 2)
+    assert sorted(r["kind"] for r in local_rows(tmp_path, tables.TRACES)) == ["model", "tool"]
+
+
 def test_a_turn_is_noted_when_it_starts(hooks):
     hooks["pre_llm_call"](session_id="s7", turn_id="t1", user_message="check the build")
     assert traces.turn_id_for("s7", "check the build") == "t1"

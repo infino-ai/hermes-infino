@@ -133,11 +133,16 @@ def test_login_with_a_key_the_platform_refuses_stores_nothing(home, platform, tm
     assert config.read_credentials(tmp_path) == {}
 
 
-def test_login_where_no_free_account_is_offered(home, platform, tmp_path, terminal, capsys):
+@pytest.mark.parametrize("status, why", [(501, "gives out no free accounts"),
+                                         (409, "already gave this network its free account")])
+def test_login_where_no_free_account_is_given_says_how_to_sign_in(home, platform, tmp_path, terminal, capsys,
+                                                                  status, why):
     terminal("y")
-    platform.trial_status = 501
+    platform.trial_status = status
     assert run("login", "--url", platform.url, "--team-database", TEAM_DB) == 1
-    assert "HTTP 501" in capsys.readouterr().err and config.read_credentials(tmp_path) == {}
+    err = capsys.readouterr().err
+    assert why in err and "--api-key-file" in err and "nothing was sent" in err
+    assert config.read_credentials(tmp_path) == {}
 
 
 def test_login_keeps_a_personal_database(home, platform, tmp_path, terminal):

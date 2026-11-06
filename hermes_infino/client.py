@@ -102,6 +102,11 @@ class InfinoClient:
         fields = out.get("fields", out.get("schema", [])) if isinstance(out, dict) else out
         return [f.get("name", "") for f in fields or [] if isinstance(f, dict)]
 
+    def add_columns(self, database: str, table: str, fields: list[dict]) -> None:
+        """`POST /v1/schema/{db}` with a patch: add columns to an existing
+        table (a key that may manage the database)."""
+        self._request("POST", f"/v1/schema/{_q(database)}", body={"table_name": table, "patch": {"fields": fields}})
+
     def drop_table(self, database: str, table: str) -> None:
         self._request("POST", f"/v1/drop_table/{_q(database)}", body={"table_name": table})
 

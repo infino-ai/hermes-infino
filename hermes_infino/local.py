@@ -42,7 +42,7 @@ from typing import Any, Optional
 import infino
 import pyarrow as pa
 
-from . import embed, tables
+from . import config, embed, tables
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +118,9 @@ class LocalStore:
         return cls(Path(state_dir) / folder)
 
     def _connect(self):
-        self.path.mkdir(parents=True, exist_ok=True)
+        if not self.path.is_dir():
+            config.make_private_dir(self.path.parent)
+            self.path.mkdir(mode=config.PRIVATE_DIR_MODE, exist_ok=True)
         return infino.connect(str(self.path))
 
     def ensure_tables(self, with_vectors: bool, only: tuple[str, ...] = tables.ALL) -> None:
@@ -323,6 +325,12 @@ class LocalStore:
         """How many rows `rows_after` would give with no limit."""
         found = self.query_sql(f"SELECT count(*) AS n FROM {table} WHERE {_after(mark, until_ms)}")
         return int(found[0]["n"]) if found else 0
+
+    def pushed_ids(self, table: str, upto_ms: int, limit: int) -> list[str]:
+        """The `row_id`s of the latest `limit` rows stored at or before `upto_ms`."""
+        found = self.query_sql(f"SELECT {tables.ROW_ID} FROM {table} WHERE {tables.STORED} <= {int(upto_ms)} "
+                               f"ORDER BY {tables.STORED} DESC, {tables.ROW_ID} DESC LIMIT {int(limit)}")
+        return [str(r[tables.ROW_ID]) for r in found]
 
     def has_row(self, table: str, row_id: str) -> bool:
         found = self.query_sql(f"SELECT count(*) AS n FROM {table} WHERE {tables.ROW_ID} = {tables.sql_string(row_id)}")

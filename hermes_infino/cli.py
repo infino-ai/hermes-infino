@@ -28,9 +28,14 @@ from pathlib import Path
 
 from . import config
 from .client import DEFAULT_URL, InfinoClient, InfinoError, request_trial
+from .tables import OutdatedTable
 
 # The team database a new account registers when none is named.
 DEFAULT_DATABASE = "hermes-team"
+# The platform's answers to a free-account request that refuse it: it gives
+# out none, or this network already had one.
+NO_FREE_ACCOUNTS = 501
+FREE_ACCOUNT_TAKEN = 409
 # Seconds `login` and `sync` keep catching up while rows are still arriving.
 CATCH_UP_S = 60.0
 
@@ -54,6 +59,8 @@ def infino_command(args: argparse.Namespace) -> int:
         return {"status": _status, "login": _login, "sync": _sync, "mcp": _mcp}[action](args)
     except InfinoError as e:
         print(f"infino: the platform refused: {e}", file=sys.stderr)
+    except OutdatedTable as e:
+        print(f"infino: {e}", file=sys.stderr)
     except urllib.error.URLError as e:
         print(f"infino: could not reach the platform: {e.reason}", file=sys.stderr)
     except TimeoutError:
@@ -166,7 +173,16 @@ def _login(args) -> int:
             return 0
 
     if new_account:
-        trial = request_trial(url, database)
+        try:
+            trial = request_trial(url, database)
+        except InfinoError as e:
+            if e.status not in (NO_FREE_ACCOUNTS, FREE_ACCOUNT_TAKEN):
+                raise
+            why = ("gives out no free accounts" if e.status == NO_FREE_ACCOUNTS
+                   else "already gave this network its free account")
+            print(f"{url} {why}, so no account was created and nothing was sent. Sign in with a key someone "
+                  f"gave you: hermes infino login --api-key-file KEY --team-database TEAM", file=sys.stderr)
+            return 1
         api_key, database = str(trial["api_key"]), str(trial.get("database") or database)
         credit = trial.get("credit_cents")
         print(f"Created a free account" + (f" with ${int(credit) / 100:.2f} of credit" if credit else "") + ".")

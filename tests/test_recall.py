@@ -173,10 +173,11 @@ def test_personal_memory_shows_only_to_its_person(team_local, personal_local):
     personal_local.append(tables.MEMORY, [{"content": "dentist on Tuesday", "author": "ana", "scope": "personal"},
                                           {"content": "dentist on Friday", "author": "ben", "scope": "personal"}])
     r = Recaller([Source(recall.TEAM, team_local), Source(recall.PERSONAL, personal_local)])
-    ana, _ = r.recall("dentist", person="ana")
+    ana, _ = r.recall("dentist", people=("ana",))
     assert "Tuesday" in ana and "Friday" not in ana
-    assert r.recall("dentist", person="")[1] == 0  # a sender nobody named reads no one's
-    assert r.recall("dentist")[1] == 2  # this machine's own session: its owner's, all of it
+    assert r.recall("dentist", people=())[1] == 0  # a sender nobody named reads no one's
+    assert r.recall("dentist", people=("ana", "uid:1000"))[1] == 1  # an owner known by several names
+    assert r.recall("dentist")[1] == 2  # no one named: everyone's
 
 
 @pytest.mark.parametrize("row, mark, past", [

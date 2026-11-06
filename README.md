@@ -6,7 +6,7 @@ It saves four things: memory, conversations, traces and skills. Before each turn
 
 You don't need an Infino account. Without one, everything is kept in a database on your machine, and nothing leaves it.
 
-With an Infino account, your team shares a database in Infino Cloud, so every agent on the team can search what the others did. `hermes infino login` creates a free account, or joins your team's with a key a teammate gives you. From then on, the plugin uploads what it has kept on your machine so far, then each new memory, conversation, trace and skill as it happens. Your machine keeps its own copy. Personal memory, and the conversations and traces of work you mark personal, never go to the team database.
+With an Infino account, your team shares a database in Infino Cloud, so every agent on the team can search what the others did. `hermes infino login` creates a free account on a platform that gives them out, or joins your team's with a key a teammate gives you. From then on, the plugin uploads what it has kept on your machine so far, then each new memory, conversation, trace and skill as it happens. Your machine keeps its own copy. Personal memory, and the conversations and traces of work you mark personal, never go to the team database.
 
 ```mermaid
 flowchart LR
@@ -23,10 +23,10 @@ flowchart LR
 
 | Table | What goes in it |
 | --- | --- |
-| `memory` | Everything written to Hermes's `MEMORY.md` and `USER.md`, and everything saved with the `infino_remember` tool. `infino_forget` deletes a memory. |
+| `memory` | Everything in Hermes's `MEMORY.md` and `USER.md`, whoever wrote it: the agent, Hermes's background memory review, or you by hand. And everything saved with the `infino_remember` tool. `infino_forget` deletes a memory, whichever teammate's agent saved it. |
 | `conversations` | Every message in every session, and who sent it. Tool calls and tool results are in their own columns. It is a log: when context compression shortens a session, or `/undo` takes a turn back, what was already said stays. |
 | `traces` | Every model call (model, provider, tokens, time taken) and every tool call (name, arguments, result, status, time taken). Secrets in arguments and results are masked the way Hermes masks what it hands any memory plugin. |
-| `skills` | Skills shared with `infino_publish_skill`. Once signed in, every profile on the team can use them, as read-only `infino:<name>` skills whose description says who published them. `INFINO_TEAM_SKILLS=off` keeps a profile to its own skills. |
+| `skills` | Skills shared with `infino_publish_skill`. Once signed in, every profile on the team can use them, as read-only `infino:<name>` skills whose description says who published them. Only a profile's owner publishes: members of a group chat cannot. Secrets in a skill are masked before it is shared. `INFINO_TEAM_SKILLS=off` keeps a profile to its own skills. |
 
 A conversation turn and its traces share a `session_id` and `turn_id`, so you can join them. Every row has a `row_id`.
 
@@ -64,7 +64,7 @@ Conversations and traces belong to the team, so every agent on the team can see 
 
 The job itself can still be shared: a skill a personal job uses is the team's like any other skill. What the job reads and writes stays with you. Memory keeps its own rule (team unless it is about one person), whatever the setting.
 
-On a gateway, where one profile answers several people, each person's personal memory is saved under their name and recalled only in their own chats with the agent.
+On a gateway, where one profile answers several people, each person's personal memory is saved under their name and recalled only in their own chats with the agent: not in other people's chats, and not in the profile owner's own sessions.
 
 ## Group chats
 
@@ -88,7 +88,7 @@ flowchart LR
   R2 --> PM
 ```
 
-Which chat a message comes from, and whether that chat is a group, comes from Hermes: every chat Hermes does not treat as a direct message counts as a group, and no one writes to the owner's personal memory from a group. Hermes's proposed channel memory ([#144822](https://github.com/NousResearch/hermes-agent/pull/144822)) is supported too: in a Hermes that has it, its setting for the chat decides, including whether someone may write to the owner's personal memory from a group.
+Which chat a message comes from, and whether that chat is a group, comes from Hermes: every chat Hermes does not treat as a direct message counts as a group, and no one writes to the owner's personal memory from a group. Hermes's channel memory ([#144822](https://github.com/NousResearch/hermes-agent/pull/144822)) is a proposal that no Hermes release has. In a Hermes that has it, its setting for the chat decides, including whether someone may write to the owner's personal memory from a group.
 
 **The tools are not separated by chat.** Recall keeps each chat's notes to that chat, but the Infino tools search the whole team database, so an agent can find another chat's notes and conversations with them. Separating chats in the tools needs per-chat permissions, which this version does not have.
 
@@ -164,7 +164,7 @@ Hermes starts the tools with `hermes infino mcp`, inside its own environment, wh
 ## Signing in
 
 ```bash
-hermes infino login                          # create a free Infino account
+hermes infino login                          # create a free account, on a platform that gives them out
 hermes infino login --api-key-file KEY \
   --team-database TEAM [--personal-database ME]   # join a team with a key someone gave you
 hermes infino status                         # how far behind the cloud is

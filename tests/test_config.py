@@ -14,6 +14,7 @@ import pytest
 import yaml
 
 from hermes_infino import config
+from hermes_infino.backend import Backend
 from hermes_infino.client import DEFAULT_URL
 
 from .helpers import TEAM_DB
@@ -118,6 +119,16 @@ def test_a_left_over_temporary_file_never_widens_the_sign_ins_mode(home, tmp_pat
     os.chmod(tmp, 0o644)
     path = config.write_credentials({"api_key": "k"}, tmp_path)
     assert stat.S_IMODE(os.stat(path).st_mode) == config.CREDENTIALS_MODE
+
+
+def test_the_state_directory_is_owner_only_even_when_it_was_not(home, tmp_path):
+    # Hermes leaves a container's home as the umask made it; the plugin's own
+    # directory holds every conversation and personal memory.
+    state = config.state_dir(tmp_path)
+    state.mkdir(parents=True)
+    os.chmod(state, 0o755)
+    Backend(config.load(tmp_path))
+    assert stat.S_IMODE(os.stat(state).st_mode) == config.PRIVATE_DIR_MODE
 
 
 def test_the_home_is_hermes_home(home, tmp_path):

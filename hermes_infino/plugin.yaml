@@ -41,14 +41,10 @@ optional_env:
   - name: INFINO_PERSONAL_JOBS
     description: "Scheduled jobs (ids or names, comma-separated) whose runs and delivered output are personal"
     password: false
+# The plugin hooks registered (traces.py); the memory provider's own methods are not hooks.
 hooks:
-  - prefetch
-  - sync_turn
-  - on_memory_write
-  - on_session_end
-  - on_session_switch
-  - system_prompt_block
   - pre_llm_call
   - post_api_request
   - post_tool_call
   - subagent_start
+  - on_session_end

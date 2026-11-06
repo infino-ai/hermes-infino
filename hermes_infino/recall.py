@@ -18,8 +18,10 @@ else's agent wrote.
 A recall shows what the chat it runs in may see (chats.py): the team's
 memories, plus, in a group chat, that chat's own - never another chat's, and
 in a group chat never the person's own memory, which would put one member's
-notes in front of every member. On a gateway, where one profile can answer
-several people, personal memory shows only to the person it came from.
+notes in front of every member. Personal memory shows only to the person it
+came from: on a gateway, where one profile answers several people, the
+sender; in the profile owner's own sessions, the owner (the names the
+owner's rows are written under), never a gateway sender's.
 
 Hermes waits 8 s for a recall. The cloud searches run side by side and get
 RECALL_BUDGET_S between them; a source whose cloud has not answered by then
@@ -122,12 +124,12 @@ class Recaller:
         return self.search_cloud(src.database, query, RECALL_K * CHAT_FILTER_DEPTH)
 
     def _from(self, src: Source, query: str, chat: chats.Chat, cloud_rows: Optional[list[dict]],
-              person: Optional[str]) -> list[dict]:
+              people: Optional[tuple[str, ...]]) -> list[dict]:
         """A source's rows for `query` that `chat` (and, for personal memory,
-        `person`) may see, best first. `cloud_rows` is what its cloud answered,
+        `people`) may see, best first. `cloud_rows` is what its cloud answered,
         None when it did not answer in time or has no cloud."""
         def visible(r: dict) -> bool:
-            return _visible(r, chat) and (src.scope != PERSONAL or person is None or r.get("author") == person)
+            return _visible(r, chat) and (src.scope != PERSONAL or people is None or r.get("author") in people)
 
         cloud: list[dict] = []
         if cloud_rows is not None:
@@ -145,11 +147,12 @@ class Recaller:
             local = [r for r in local if str(r.get(tables.ROW_ID)) not in seen and _past(r, mark)]
         return cloud + local
 
-    def recall(self, query: str, chat: chats.Chat = chats.NO_CHAT, person: Optional[str] = None) -> tuple[str, int]:
-        """The block for `query` in `chat`, and its row count. `person` is who
-        asks on a gateway (their personal memory only; "" for nobody known:
-        none), None on this machine's own sessions (its owner's)."""
-        sources = [s for s in self._sources if s.scope != PERSONAL or (not chat.group and person != "")]
+    def recall(self, query: str, chat: chats.Chat = chats.NO_CHAT,
+               people: Optional[tuple[str, ...]] = None) -> tuple[str, int]:
+        """The block for `query` in `chat`, and its row count. `people` are
+        the authors whose personal memory may show: a gateway's sender, or the
+        names of this profile's owner; none for nobody known; None for all."""
+        sources = [s for s in self._sources if s.scope != PERSONAL or (not chat.group and people != ())]
         deadline = time.monotonic() + RECALL_BUDGET_S
         asked = {id(s): _pool.submit(self._cloud_rows, s, query)
                  for s in sources if s.database and self._cloud is not None}
@@ -161,7 +164,7 @@ class Recaller:
                     cloud_rows = asked[id(src)].result(timeout=max(0.0, deadline - time.monotonic()))
                 except Exception as e:  # not in time, or failed: this machine answers instead
                     logger.info("infino: recall from %s did not answer: %s", src.database, e or "timed out")
-            rows += [(src.scope, r) for r in self._from(src, query, chat, cloud_rows, person)]
+            rows += [(src.scope, r) for r in self._from(src, query, chat, cloud_rows, people)]
         lines, used = [], 0
         for scope, r in rows:
             label = "this chat" if r.get(tables.CHAT) else scope

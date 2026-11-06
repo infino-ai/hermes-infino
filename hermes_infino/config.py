@@ -91,6 +91,16 @@ STATE_DIR = Path("infino")
 CREDENTIALS_FILE = "credentials.json"
 # Owner read/write only: the file holds an API key.
 CREDENTIALS_MODE = 0o600
+# Owner only: the state directory holds every conversation, and personal
+# memory. Hermes keeps its home owner-only too, but not in a container
+# (unless HERMES_HOME_MODE says so), where a data directory is often shared.
+PRIVATE_DIR_MODE = 0o700
+
+
+def make_private_dir(path: Path) -> None:
+    """Create `path` (and its parents) and make it owner-only."""
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, PRIVATE_DIR_MODE)
 
 
 def home() -> Path:
@@ -151,7 +161,7 @@ def read_credentials(home_dir: Optional[Path] = None) -> dict:
 def write_credentials(creds: dict, home_dir: Optional[Path] = None) -> Path:
     """Store the sign-in with owner-only permissions; returns its path."""
     path = state_dir(home_dir) / CREDENTIALS_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
+    make_private_dir(path.parent)
     tmp = path.with_suffix(".tmp")
     # A file left by a crash keeps its own mode through os.open: start a new one.
     tmp.unlink(missing_ok=True)

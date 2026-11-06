@@ -9,7 +9,11 @@ output was delivered into from the turn's history before its first model call
 
 Rows are buffered per session and written once per turn (Hermes's plugin
 `on_session_end` hook fires at each turn's end), so a turn with ten tool
-calls is one append, not eleven. No OpenTelemetry collector is involved.
+calls is one append, not eleven. No OpenTelemetry collector is involved. The
+buffers belong to the process, not to one registration of the hooks: Hermes
+registers them anew each time it builds an agent (a gateway builds one per
+message), and a turn still running in one chat keeps its rows when another
+chat's message arrives.
 
 Hermes scrubs secrets from everything it hands a memory provider, but these
 hooks get tool arguments and results as the tool saw them. So every text
@@ -72,6 +76,11 @@ TURNS_KEPT = 16
 # How Hermes marks a message's images when it flattens the message for a
 # memory provider: "[1 image] what is this?".
 IMAGES_MARK = re.compile(r"^\[\d+ images?\]\s*")
+
+
+def scrub(text: str) -> str:
+    """`text` scrubbed of secrets, as Hermes scrubs everything leaving the agent."""
+    return _scrub(text)
 
 
 def _clip(value: Any) -> str:
@@ -191,16 +200,17 @@ def turn_person(session_id: str) -> str:
     return _identity_of(session_id)[0]
 
 
-class TraceRecorder:
-    def __init__(self) -> None:
-        self._buffers: dict[str, list[dict]] = {}
-        self._lock = threading.Lock()
+# Each session's rows not written yet, shared by every registration of the hooks.
+_buffers: dict[str, list[dict]] = {}
+_buffers_lock = threading.Lock()
 
+
+class TraceRecorder:
     def _add(self, session_id: str, row: dict) -> None:
         # Read in the call's own context: a scheduled job's run says which job it is.
         privacy.note_cron_job(session_id or "")
-        with self._lock:
-            self._buffers.setdefault(session_id or "", []).append(row)
+        with _buffers_lock:
+            _buffers.setdefault(session_id or "", []).append(row)
 
     def on_llm_call(self, **kw: Any) -> None:
         """As a turn starts, before its first model call: note the turn's id
@@ -264,8 +274,8 @@ class TraceRecorder:
 
     def on_turn_end(self, **kw: Any) -> None:
         session = str(kw.get("session_id") or "")
-        with self._lock:
-            rows = self._buffers.pop(session, [])
+        with _buffers_lock:
+            rows = _buffers.pop(session, [])
         if not rows:
             return
         settings = config.load()  # read in the hook's own profile scope
