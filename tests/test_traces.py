@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import contextvars
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
 
+from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.memory_manager import _redact_for_provider
 
 from hermes_infino import privacy, tables, traces
@@ -100,18 +101,82 @@ def test_each_session_flushes_only_its_own_rows(hooks, tmp_path):
     assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 2)
 
 
-def test_the_turn_id_ignores_calls_that_name_no_turn(hooks):
-    hooks["post_api_request"](session_id="s7", turn_id="t1", model="m")
-    hooks["post_tool_call"](session_id="s7", turn_id="", tool_name="x")
-    assert traces.current_turn_id("s7") == "t1"
-    assert traces.current_turn_id("never-seen") == ""
+def test_a_turns_rows_survive_hermes_registering_the_hooks_again(hooks, tmp_path):
+    # Hermes registers a plugin's hooks anew for every agent it builds (a
+    # gateway: every message), while another chat's turn is still running.
+    hooks["post_api_request"](session_id="chat-a", turn_id="ta", model="m")
+    rebuilt = hook_ctx()
+    rebuilt["post_tool_call"](session_id="chat-a", turn_id="ta", tool_name="terminal")
+    rebuilt["on_session_end"](session_id="chat-a")
+    assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 2)
+    assert sorted(r["kind"] for r in local_rows(tmp_path, tables.TRACES)) == ["model", "tool"]
 
 
-def test_a_call_in_another_context_never_moves_this_turns_id(hooks):
-    # Hermes's background review shares the session id but runs in a context of its own.
-    hooks["post_api_request"](session_id="s8", turn_id="the-turn", model="m")
-    contextvars.copy_context().run(hooks["post_api_request"], session_id="s8", turn_id="the-review", model="m")
-    assert traces.current_turn_id("s8") == "the-turn"
+def test_a_turn_is_noted_when_it_starts(hooks):
+    hooks["pre_llm_call"](session_id="s7", turn_id="t1", user_message="check the build")
+    assert traces.turn_id_for("s7", "check the build") == "t1"
+    assert traces.turn_id_for("never-seen", "check the build") == ""
+
+
+def test_a_turns_start_reaches_its_sync_from_hermess_hook_thread(hooks):
+    # Hermes runs pre_llm_call on a thread of its own with a copy of the turn's
+    # context; the sync runs on another thread again.
+    hooks["pre_llm_call"](session_id="s7", turn_id="t1", user_message="q")
+    found = []
+    worker = threading.Thread(target=lambda: found.append(traces.turn_id_for("s7", "q")))
+    worker.start()
+    worker.join()
+    assert found == ["t1"]
+
+
+def test_a_sync_takes_its_own_turn_when_the_next_has_started(hooks):
+    # Hermes syncs a turn on a background worker: the person's next message may
+    # start the next turn first.
+    hooks["pre_llm_call"](session_id="s7", turn_id="t1", user_message="first")
+    hooks["pre_llm_call"](session_id="s7", turn_id="t2", user_message="second")
+    assert traces.turn_id_for("s7", "first") == "t1"
+    assert traces.turn_id_for("s7", "second") == "t2"
+
+
+def test_a_turn_that_is_never_synced_is_dropped_by_a_later_one(hooks):
+    # An interrupted turn, or one with no reply, is never synced.
+    hooks["pre_llm_call"](session_id="s7", turn_id="t1", user_message="stop that")
+    hooks["pre_llm_call"](session_id="s7", turn_id="t2", user_message="try again")
+    assert traces.turn_id_for("s7", "try again") == "t2"
+    assert traces.turn_id_for("s7", "stop that") == ""
+
+
+def test_a_message_sent_again_belongs_to_the_later_turn(hooks):
+    # Interrupted, then sent again: the turn that is synced is the later one.
+    hooks["pre_llm_call"](session_id="s7", turn_id="t1", user_message="deploy")
+    hooks["pre_llm_call"](session_id="s7", turn_id="t2", user_message="deploy")
+    assert traces.turn_id_for("s7", "deploy") == "t2"
+
+
+def test_model_and_tool_calls_never_move_a_turn(hooks):
+    # Hermes's background review shares the session id and makes model and tool
+    # calls of its own, but starts no turn (Hermes fires no pre_llm_call for it).
+    hooks["pre_llm_call"](session_id="s8", turn_id="the-turn", user_message="q")
+    hooks["post_api_request"](session_id="s8", turn_id="the-review", model="m")
+    hooks["post_tool_call"](session_id="s8", turn_id="the-review", tool_name="memory")
+    assert traces.turn_id_for("s8", "q") == "the-turn"
+
+
+def test_a_message_hermes_scrubs_or_flattens_still_finds_its_turn(hooks):
+    # sync_turn is handed the user message flattened to text and scrubbed of
+    # secrets, by Hermes's own functions.
+    with_secret = f"deploy with {SECRET}"
+    hooks["pre_llm_call"](session_id="s9", turn_id="t1", user_message=with_secret)
+    assert traces.turn_id_for("s9", _redact_for_provider(with_secret)) == "t1"
+    parts = [{"type": "text", "text": "what is in this picture?"},
+             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
+    hooks["pre_llm_call"](session_id="s9", turn_id="t2", user_message=parts)
+    assert traces.turn_id_for("s9", _summarize_user_message_for_log(parts, sep="\n")) == "t2"
+
+
+def test_a_sync_whose_message_matches_no_turn_takes_the_latest(hooks):
+    hooks["pre_llm_call"](session_id="s9", turn_id="t1", user_message="q")
+    assert traces.turn_id_for("s9", "a message no turn started with") == "t1"
 
 
 def test_a_gateway_turns_rows_are_the_senders(hooks, tmp_path, monkeypatch):

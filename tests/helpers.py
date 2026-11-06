@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import hermes_cli
 
 from agent.memory_manager import MemoryManager
+from hermes_cli.plugins import PluginManager
 
 from hermes_infino import chats, config, embed, traces
 from hermes_infino.local import PERSONAL_DB_DIR, LocalStore
@@ -73,14 +74,21 @@ def wait_for(predicate, timeout: float = WRITE_WAIT_S):
 
 
 def hook_ctx():
-    hooks = {}
+    """The plugin's trace hooks, each called the way Hermes calls a plugin's
+    hooks: through Hermes's own plugin manager, which runs most of them on a
+    thread of their own with a copy of the caller's context."""
+    manager = PluginManager()
 
     class Ctx:
         def register_hook(self, name, fn):
-            hooks[name] = fn
+            manager._hooks.setdefault(name, []).append(fn)
 
     traces.register_hooks(Ctx())
-    return hooks
+
+    def caller(name):
+        return lambda **kw: manager.invoke_hook(name, **kw)
+
+    return {name: caller(name) for name in manager._hooks}
 
 
 def local(tmp_path) -> LocalStore:

@@ -151,17 +151,20 @@ def chat_predicate(visible: tuple[str, ...]) -> str:
 
 
 class OutdatedTable(Exception):
-    """A cloud table lacks a column this version writes; the platform cannot add one."""
+    """A cloud table lacks a column this version writes, and it could not be added."""
 
 
 def ensure_all(client: InfinoClient, database: str, personal: bool = False) -> None:
     """Create the database and its tables unless they exist. Where the
     account has no embedding server, `memory` is created keyword-only.
 
-    A table that exists must have every column this version writes: the
-    platform adds no column to an existing table, and a row pushed without
-    its `chat` would read as the whole team's memory, so an older table is
-    refused by name rather than written around."""
+    A table that exists must have every column this version writes: a row
+    pushed into a `memory` without its `chat` would read as the whole team's
+    memory. A missing column is added (nullable: the rows already there read
+    it as null). When the platform refuses that - a key that may not manage
+    the database - the table is refused by name, and the mirror pushes
+    nothing to the database until it is fixed: every row stays on this
+    machine meanwhile."""
     client.ensure_database(database)
     for table, (schema, indexes) in (PERSONAL_TABLES if personal else TEAM_TABLES).items():
         try:
@@ -171,8 +174,14 @@ def ensure_all(client: InfinoClient, database: str, personal: bool = False) -> N
                 raise
             client.ensure_table(database, MEMORY, MEMORY_SCHEMA_KEYWORD_ONLY, MEMORY_INDEXES)
         have = set(client.column_names(database, table))
-        missing = [f["name"] for f in schema if f["type"] != "embedding" and f["name"] not in have]
-        if missing:
-            raise OutdatedTable(f"{database}.{table} has no {', '.join(missing)}: it was created by an older "
-                                f"hermes-infino; drop it, and each machine pushes the rows it keeps to the new "
-                                f"table at its next start")
+        missing = [f for f in schema if f["type"] != "embedding" and f["name"] not in have]
+        if not missing:
+            continue
+        try:
+            client.add_columns(database, table, [{"name": f["name"], "type": f["type"], "nullable": True}
+                                                 for f in missing])
+        except InfinoError as e:
+            names = ", ".join(f["name"] for f in missing)
+            raise OutdatedTable(f"{database}.{table} has no {names}, and adding it was refused ({e}). Add it as a "
+                                f"nullable column with a key that may manage {database}; until then nothing is "
+                                f"pushed to {database}, and every row stays on this machine") from None

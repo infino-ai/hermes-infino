@@ -280,6 +280,73 @@ def test_a_table_another_machine_made_again_gets_this_machines_rows(m, platform)
                                                                                   "this machine's"]
 
 
+def test_a_teammates_forget_of_this_machines_rows_never_looks_like_a_lost_table(m, platform):
+    # Another machine's infino_forget deleted the mark's row and the oldest from the cloud.
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: f"r{i}", "content": f"m{i}"} for i in range(5)])
+    m.sync(wait=True)
+    [first] = m.local.rows_after(tables.MEMORY, None, 2 ** 62, 1)
+    mark = m.marks()[m.mark_of(tables.MEMORY)]
+    platform.databases[TEAM_DB][tables.MEMORY] = [r for r in platform.rows(TEAM_DB, tables.MEMORY)
+                                                  if r["row_id"] not in (mark[1], first[tables.ROW_ID])]
+    m.ensure_cloud_tables()
+    m.sync(wait=True)
+    assert len(platform.rows(TEAM_DB, tables.MEMORY)) == 3  # nothing pushed again
+
+
+def test_nothing_is_pushed_while_a_cloud_table_lacks_a_column_it_cannot_get(home, platform, tmp_path):
+    client_rows = [f for f in tables.MEMORY_SCHEMA if f["name"] != tables.CHAT]
+    settings = sign_in(tmp_path, platform)
+    state = config.state_dir(tmp_path)
+    team, personal = LocalStore.under(state), LocalStore.under(state, PERSONAL_DB_DIR)
+    team.ensure_tables(with_vectors=False)
+    personal.ensure_tables(with_vectors=False, only=tables.PERSONAL)
+    m = Mirror(settings, team, personal)
+    m.client.ensure_database(TEAM_DB)
+    m.client.ensure_table(TEAM_DB, tables.MEMORY, client_rows, tables.MEMORY_INDEXES)
+    platform.schema_patch_refused = True
+    m.local.append(tables.MEMORY, [{"content": "kept for a chat", tables.CHAT: "telegram:-100"}])
+    with pytest.raises(tables.OutdatedTable):
+        m.sync(wait=True)
+    assert requests_to(platform, "append") == 0
+    assert "has no chat" in m.last_error()
+    platform.schema_patch_refused = False
+    m._tables_failed_at = 0.0  # try again now, not after ENSURE_RETRY_S
+    m.sync(wait=True)
+    assert [r[tables.CHAT] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["telegram:-100"]
+
+
+def test_a_forget_queued_as_its_match_keeps_a_row_saved_later(m, platform):
+    m.local.append(tables.MEMORY, [{"content": "use pnpm"}])
+    m.sync(wait=True)
+    m.forget_matching(tables.MEMORY, TEAM_DB, f"content = 'use pnpm' AND {tables.STORED} <= 1")
+    m.sync(wait=True)
+    assert len(platform.rows(TEAM_DB, tables.MEMORY)) == 1  # stored after the bound: kept
+    m.forget_matching(tables.MEMORY, TEAM_DB, f"content = 'use pnpm' AND {tables.STORED} <= {2 ** 62}")
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    assert (m.dir / mirror.FORGET_FILE).read_text() == ""
+
+
+def test_a_forget_queued_while_the_queue_is_applied_neither_waits_nor_is_lost(m, platform, monkeypatch):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "1", "content": "a"}, {tables.ROW_ID: "2", "content": "b"}])
+    m.sync(wait=True)
+    m.forget(tables.MEMORY, TEAM_DB, ["1"])
+    real = m.client.delete
+    queued = []
+
+    def delete_and_queue_another(db, table, predicate):
+        if not queued:  # a tool call's forget arrives mid-apply; the queue's lock is free
+            queued.append(True)
+            m.forget(tables.MEMORY, TEAM_DB, ["2"])
+        return real(db, table, predicate)
+
+    monkeypatch.setattr(m.client, "delete", delete_and_queue_another)
+    m.sync(wait=True)
+    assert '"2"' in (m.dir / mirror.FORGET_FILE).read_text()
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+
+
 def test_the_state_file_is_replaced_whole(m, platform):
     m.local.append(tables.MEMORY, [{"content": "x"}])
     m.sync(wait=True)

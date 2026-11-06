@@ -9,7 +9,11 @@ output was delivered into from the turn's history before its first model call
 
 Rows are buffered per session and written once per turn (Hermes's plugin
 `on_session_end` hook fires at each turn's end), so a turn with ten tool
-calls is one append, not eleven. No OpenTelemetry collector is involved.
+calls is one append, not eleven. No OpenTelemetry collector is involved. The
+buffers belong to the process, not to one registration of the hooks: Hermes
+registers them anew each time it builds an agent (a gateway builds one per
+message), and a turn still running in one chat keeps its rows when another
+chat's message arrives.
 
 Hermes scrubs secrets from everything it hands a memory provider, but these
 hooks get tool arguments and results as the tool saw them. So every text
@@ -19,24 +23,27 @@ personal memory written by a tool call is withheld (privacy.py). A model
 call's row keeps the text the model wrote; its tool calls are rows of their
 own.
 
-Which turn a call belongs to, and who the turn is for, are read from the
-turn itself, never from "the latest call": Hermes hands `sync_turn` no turn
-id, but runs it in the context of the turn that ended (its background worker
-carries the caller's context variables). So each turn's own model and tool
-calls note their turn id in a context variable, and `sync_turn` reads that
-one; Hermes's background review, which shares the session id, runs in a
-context of its own and cannot change it. The person is the gateway's sender
-for the turn (the turn's session values), or this machine's owner.
+Hermes hands `sync_turn` no turn id, so the conversation rows take theirs
+from the turn's start: `pre_llm_call` fires once as each turn starts, with
+the turn's id and its user message, and never for Hermes's background review
+(a fork that shares the session id and makes model and tool calls of its
+own). Each start is noted where every thread can read it: Hermes runs hooks
+on threads of their own, each with a copy of the turn's context, so nothing a
+hook sets in a context variable reaches `sync_turn`. `sync_turn` takes the
+turn whose user message it was handed, since the person's next message may
+start the next turn before the last one's sync runs. The person is the
+gateway's sender for the turn (the turn's session values), or this machine's
+owner.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from collections import OrderedDict
-from contextvars import ContextVar
 from typing import Any
 
 from agent.memory_provider import spawn_context_thread
@@ -60,6 +67,20 @@ SCRUB_CHARS = 2 * MAX_TRACE_CELL_CHARS
 # Sessions whose person is remembered; a long-running gateway sees many, and
 # only the latest few are still running.
 MAX_SESSIONS = 1_024
+# How much of a turn's user message ties the turn's start to its sync.
+TURN_KEY_CHARS = 200
+# Turns remembered per session: those started and not synced yet. A turn
+# Hermes never syncs (interrupted, or with no reply) is dropped once a later
+# turn of the session is synced.
+TURNS_KEPT = 16
+# How Hermes marks a message's images when it flattens the message for a
+# memory provider: "[1 image] what is this?".
+IMAGES_MARK = re.compile(r"^\[\d+ images?\]\s*")
+
+
+def scrub(text: str) -> str:
+    """`text` scrubbed of secrets, as Hermes scrubs everything leaving the agent."""
+    return _scrub(text)
 
 
 def _clip(value: Any) -> str:
@@ -97,16 +118,60 @@ def _tokens(usage: Any) -> tuple[int, int, int]:
     return int(prompt), out, cache_read + cache_write
 
 
-# The turn running in this context: (session id, turn id), noted by its own
-# model and tool calls.
-_turn: ContextVar[tuple[str, str]] = ContextVar("infino_turn", default=("", ""))
+# The turns each session started and has not synced yet, oldest first:
+# (the user message's key, turn id).
+_started: OrderedDict[str, list[tuple[str, str]]] = OrderedDict()
+_started_lock = threading.Lock()
 
 
-def current_turn_id(session_id: str) -> str:
-    """The id of this context's turn of `session_id`; empty when none of its
-    calls named one (or the context is another session's)."""
-    session, turn = _turn.get()
-    return turn if session == (session_id or "") else ""
+def _turn_key(text: str) -> str:
+    """A user message as a turn's key: its text without Hermes's image mark."""
+    return IMAGES_MARK.sub("", (text or "").strip()).strip()[:TURN_KEY_CHARS]
+
+
+def _message_key(user_message: Any) -> str:
+    """The key of a user message as `pre_llm_call` hands it, made the way
+    `sync_turn` will be handed the same message: its text parts joined, then
+    scrubbed of secrets as Hermes scrubs what it hands a memory provider."""
+    if isinstance(user_message, list):
+        text = "\n".join(p["text"] for p in user_message if isinstance(p, dict) and isinstance(p.get("text"), str))
+    else:
+        text = user_message if isinstance(user_message, str) else ""
+    return _turn_key(_scrub(text))
+
+
+def note_turn_start(session_id: str, turn_id: str, user_message: Any) -> None:
+    """A turn of `session_id` started: remember its id under its user message."""
+    if not turn_id:
+        return
+    key = _message_key(user_message)
+    with _started_lock:
+        turns = _started.setdefault(session_id or "", [])
+        turns.append((key, turn_id))
+        del turns[:-TURNS_KEPT]
+        _started.move_to_end(session_id or "")
+        while len(_started) > MAX_SESSIONS:
+            _started.popitem(last=False)
+
+
+def turn_id_for(session_id: str, user_content: str) -> str:
+    """The id of the turn of `session_id` whose user message `sync_turn` was
+    handed as `user_content`: the latest started with that message (a message
+    sent again after an interrupted turn belongs to the later turn). That turn
+    and those started before it are forgotten: Hermes syncs a session's turns
+    in order. With no turn of that message, the latest started (it is kept);
+    with none at all, empty."""
+    key = _turn_key(user_content)
+    with _started_lock:
+        turns = _started.get(session_id or "")
+        if not turns:
+            return ""
+        for i in range(len(turns) - 1, -1, -1):
+            if turns[i][0] == key:
+                turn = turns[i][1]
+                del turns[:i + 1]
+                return turn
+        return turns[-1][1]
 
 
 # This machine's person for each session the provider started (`initialize`).
@@ -135,22 +200,23 @@ def turn_person(session_id: str) -> str:
     return _identity_of(session_id)[0]
 
 
-class TraceRecorder:
-    def __init__(self) -> None:
-        self._buffers: dict[str, list[dict]] = {}
-        self._lock = threading.Lock()
+# Each session's rows not written yet, shared by every registration of the hooks.
+_buffers: dict[str, list[dict]] = {}
+_buffers_lock = threading.Lock()
 
+
+class TraceRecorder:
     def _add(self, session_id: str, row: dict) -> None:
         # Read in the call's own context: a scheduled job's run says which job it is.
         privacy.note_cron_job(session_id or "")
-        with self._lock:
-            self._buffers.setdefault(session_id or "", []).append(row)
-        if row["turn_id"]:
-            _turn.set((session_id or "", row["turn_id"]))
+        with _buffers_lock:
+            _buffers.setdefault(session_id or "", []).append(row)
 
     def on_llm_call(self, **kw: Any) -> None:
-        """Before a turn's first model call: note any job output delivered
-        into this chat, which the turn's history holds."""
+        """As a turn starts, before its first model call: note the turn's id
+        for its conversation rows, and any job output delivered into this
+        chat, which the turn's history holds."""
+        note_turn_start(str(kw.get("session_id") or ""), str(kw.get("turn_id") or ""), kw.get("user_message"))
         history = list(kw.get("conversation_history") or [])
         history.append({"role": "user", "content": kw.get("user_message")})
         privacy.note_deliveries(str(kw.get("session_id") or ""), history)
@@ -208,8 +274,8 @@ class TraceRecorder:
 
     def on_turn_end(self, **kw: Any) -> None:
         session = str(kw.get("session_id") or "")
-        with self._lock:
-            rows = self._buffers.pop(session, [])
+        with _buffers_lock:
+            rows = _buffers.pop(session, [])
         if not rows:
             return
         settings = config.load()  # read in the hook's own profile scope

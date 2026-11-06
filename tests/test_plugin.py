@@ -8,6 +8,7 @@ import io
 import json
 import os
 import stat
+import time
 from types import SimpleNamespace
 
 import infino
@@ -23,6 +24,9 @@ from hermes_infino.local import arrow_schema, index_spec
 
 from .helpers import (DM, GROUP, OTHER_GROUP, PERSONAL_DB, SKILL_MD, TEAM_DB, hook_ctx, in_session, local,
                       local_rows, make_manager, personal_rows, wait_for)
+
+# Seconds that put a save after a forget's `stored_ms` bound.
+LATER_S = 0.01
 
 
 # -- signed in ----------------------------------------------------------------
@@ -116,6 +120,7 @@ def test_personal_scope_goes_to_the_personal_database(env, platform, tmp_path):
 def test_turns_are_appended_once_each_with_tool_calls_and_results(env, platform, tmp_path):
     hooks = hook_ctx()
     mgr, provider = make_manager(tmp_path)
+    hooks["pre_llm_call"](session_id="s1", turn_id="t1", user_message="check the build")
     hooks["post_api_request"](session_id="s1", turn_id="t1", api_request_id="r1", model="m", usage={})
     messages = [
         {"role": "user", "content": "check the build"},
@@ -125,6 +130,7 @@ def test_turns_are_appended_once_each_with_tool_calls_and_results(env, platform,
     ]
     provider.sync_turn("check the build", "The build passed.", session_id="s1", messages=messages,
                        turn_author={"id": "u1", "name": "alice", "is_bot": False})
+    hooks["pre_llm_call"](session_id="s1", turn_id="t2", user_message="thanks")
     hooks["post_api_request"](session_id="s1", turn_id="t2", api_request_id="r2", model="m", usage={})
     messages += [{"role": "user", "content": "thanks"}, {"role": "assistant", "content": "anytime"}]
     provider.sync_turn("thanks", "anytime", session_id="s1", messages=messages)
@@ -211,7 +217,7 @@ def test_traces_land_locally_then_in_the_cloud(env, platform, tmp_path):
     assert rows[0]["model"] == "claude" and rows[0]["tool"] == ""
     assert rows[1]["tool"] == "terminal" and rows[1]["model"] == ""
     assert rows[1]["args"] == '{"cmd": "ls"}'
-    assert traces.current_turn_id("s1") == "t1"
+    assert {r["turn_id"] for r in rows} == {"t1"}
 
 
 def test_traces_carry_the_turns_author(env, platform, tmp_path):
@@ -409,6 +415,7 @@ def test_a_group_chats_memory_is_never_a_persons(env, platform, tmp_path, monkey
 
 def test_a_group_chats_notes_are_recalled_there_only(env, platform, tmp_path, monkeypatch):
     env.setenv("INFINO_PERSONAL_DATABASE", PERSONAL_DB)
+    env.setenv("INFINO_PERSONAL_PROFILE", "on")  # one person's profile: its DMs keep their personal memory
     mgr, provider = make_manager(tmp_path, platform="telegram")
     in_session(monkeypatch, DM)
     mgr.handle_tool_call("infino_remember", {"content": "release freeze starts December 20", "scope": "team"})
@@ -435,16 +442,17 @@ def test_hermes_channel_memory_decides_who_writes_the_owners_memory(env, platfor
     # The owner in a group, admitted to write their own memory from it.
     in_session(monkeypatch, GROUP, binding=SimpleNamespace(owner_writes=True))
     provider.on_memory_write("add", "user", "Prefers short answers")
-    # A confirmed one-to-one chat: Hermes binds nothing.
+    # A confirmed one-to-one chat (Hermes binds nothing) on a shared profile:
+    # whoever it is with, no personal memory is kept for them.
     in_session(monkeypatch, DM, binding=None)
     provider.on_memory_write("add", "user", "Works from Lisbon")
     # A member Hermes keeps out of the owner's memory.
     in_session(monkeypatch, GROUP, binding=SimpleNamespace(owner_writes=False))
     provider.on_memory_write("add", "user", "Is the release owner")
     provider.shutdown()
-    # The owner's own entries, named after the person the gateway says sent them.
+    # The owner's own entry, named after the person the gateway says sent it.
     personal = sorted(r["content"] for r in platform.rows(PERSONAL_DB, tables.MEMORY))
-    assert personal == ["About mallory: Prefers short answers", "About owner: Works from Lisbon"]
+    assert personal == ["About mallory: Prefers short answers"]
     [team] = platform.rows(TEAM_DB, tables.MEMORY)
     assert team["content"].endswith("Is the release owner") and team["chat"] == "telegram:-100"
 
@@ -461,13 +469,41 @@ def test_a_group_chat_forgets_only_what_it_can_recall(env, platform, tmp_path, m
     assert [r["chat"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["telegram:-100"]
 
 
-def test_a_cloud_table_from_an_older_version_is_refused_by_name(env, platform, tmp_path):
+def test_a_cloud_table_from_an_older_version_gains_the_new_column(env, platform, tmp_path):
     client = InfinoClient("k", platform.url)
     client.ensure_database(TEAM_DB)
     older = [f for f in tables.MEMORY_SCHEMA if f["name"] != tables.CHAT]
     client.ensure_table(TEAM_DB, tables.MEMORY, older, tables.MEMORY_INDEXES)
-    with pytest.raises(tables.OutdatedTable, match="has no chat"):
+    tables.ensure_all(client, TEAM_DB)
+    assert tables.CHAT in client.column_names(TEAM_DB, tables.MEMORY)
+
+
+def test_a_cloud_table_that_cannot_gain_its_column_is_refused_by_name_and_gets_no_rows(env, platform, tmp_path):
+    client = InfinoClient("k", platform.url)
+    client.ensure_database(TEAM_DB)
+    older = [f for f in tables.MEMORY_SCHEMA if f["name"] != tables.CHAT]
+    client.ensure_table(TEAM_DB, tables.MEMORY, older, tables.MEMORY_INDEXES)
+    platform.schema_patch_refused = True
+    with pytest.raises(tables.OutdatedTable, match="has no chat") as refused:
         tables.ensure_all(client, TEAM_DB)
+    assert "drop" not in str(refused.value)
+    # The provider keeps every row here, and pushes none while the table is wrong.
+    mgr, provider = make_manager(tmp_path)
+    mgr.handle_tool_call("infino_remember", {"content": "kept on this machine"})
+    provider.shutdown()
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    assert [r["content"] for r in local_rows(tmp_path, tables.MEMORY)] == ["kept on this machine"]
+    assert "has no chat" in provider._backend.mirror.last_error()
+    # Once the column can be added, the rows go.
+    platform.schema_patch_refused = False
+    monkey_retry_now(provider._backend.mirror)
+    provider._backend.mirror.sync(wait=True)
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["kept on this machine"]
+
+
+def monkey_retry_now(m: mirror.Mirror) -> None:
+    """Let the next sync try the cloud tables again at once (not after ENSURE_RETRY_S)."""
+    m._tables_failed_at = 0.0
 
 
 def test_a_local_table_from_an_older_version_gains_the_new_column(home, tmp_path):
@@ -483,15 +519,16 @@ def test_a_local_table_from_an_older_version_gains_the_new_column(home, tmp_path
 # -- personal memory ----------------------------------------------------------
 
 def test_personal_memory_is_never_in_the_database_the_tools_read(home, tmp_path, monkeypatch):
-    mgr, provider = make_manager(tmp_path, platform="telegram")
-    in_session(monkeypatch, DM)
+    mgr, provider = make_manager(tmp_path)
     mgr.handle_tool_call("infino_remember", {"content": "my staging credentials expire Friday", "scope": "personal"})
     provider._drain()
     assert local_rows(tmp_path, tables.MEMORY) == []  # the tool server's database
     assert [r["content"] for r in personal_rows(tmp_path)] == ["my staging credentials expire Friday"]
     assert "credentials" in provider.prefetch("staging credentials")
+    # The same profile answering a group chat through a gateway never shows it.
+    _, on_gateway = make_manager(tmp_path, platform="telegram", session_id="g")
     in_session(monkeypatch, GROUP)
-    assert "credentials" not in provider.prefetch("staging credentials")
+    assert "credentials" not in on_gateway.prefetch("staging credentials")
 
 
 def test_without_a_personal_database_personal_memory_stays_on_this_machine(env, platform, tmp_path):
@@ -682,3 +719,100 @@ def test_remote_config_signs_the_plugin_in(remote, home, platform, tmp_path):
     assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["Deploys freeze on December 20"]
     assert [r for r in remote.requests if r["method"] == "GET"]  # read from the service
     assert not (tmp_path / "config.yaml").exists()  # never from a local file
+
+
+# -- forgets across machines ----------------------------------------------------
+
+def teammate(env, tmp_path, name: str):
+    """Another machine on the team: its own profile home, the same team database."""
+    home = tmp_path / name
+    home.mkdir()
+    env.setenv("HERMES_HOME", str(home))
+    backend._backends.clear()
+    return home, make_manager(home, agent_identity=name)
+
+
+def test_a_teammates_memory_is_forgotten_from_another_machine(env, platform, tmp_path):
+    _, (mgr_a, prov_a) = teammate(env, tmp_path, "a")
+    mgr_a.handle_tool_call("infino_remember", {"content": "The on-call rota lives in the ops wiki"})
+    prov_a.shutdown()
+    _, (mgr_b, prov_b) = teammate(env, tmp_path, "b")
+    assert "on-call rota" in prov_b.prefetch("where does the on-call rota live")
+    out = json.loads(mgr_b.handle_tool_call("infino_forget", {"content": "The on-call rota lives in the ops wiki"}))
+    assert out["matched"] == 1
+    prov_b.shutdown()
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    assert "on-call rota" not in prov_b.prefetch("where does the on-call rota live")
+
+
+def test_a_forget_the_cloud_cannot_answer_is_queued_and_keeps_a_later_save(env, platform, tmp_path, monkeypatch):
+    _, (mgr_a, prov_a) = teammate(env, tmp_path, "a")
+    mgr_a.handle_tool_call("infino_remember", {"content": "use pnpm"})
+    prov_a.shutdown()
+    _, (mgr_b, prov_b) = teammate(env, tmp_path, "b")
+
+    def unanswered(*args, **kwargs):
+        raise TimeoutError("no answer")
+
+    monkeypatch.setattr(prov_b._backend.mirror, "matching_ids", unanswered)
+    mgr_b.handle_tool_call("infino_forget", {"content": "use pnpm"})
+    time.sleep(LATER_S)  # a later save is stored after the forget's bound
+    mgr_b.handle_tool_call("infino_remember", {"content": "use pnpm"})
+    prov_b.shutdown()
+    # Machine a's copy is gone; machine b's, saved after the forget, is kept.
+    assert [(r["content"], r["profile"]) for r in platform.rows(TEAM_DB, tables.MEMORY)] == [("use pnpm", "b")]
+
+
+# -- personal memory on a gateway profile ----------------------------------------
+
+def test_a_shared_profiles_personal_database_holds_its_owners_memory_alone(home, tmp_path, monkeypatch):
+    home.setenv("INFINO_AUTHOR", "owner-name")
+    mgr_gw, prov_gw = make_manager(tmp_path, platform="telegram", session_id="gw-alice")
+    in_session(monkeypatch, {**DM, "HERMES_SESSION_USER_NAME": "alice", "HERMES_SESSION_USER_ID": "333"})
+    out = json.loads(mgr_gw.handle_tool_call("infino_remember",
+                                             {"content": "Alice's door badge PIN is 4421", "scope": "personal"}))
+    assert out["ok"] is False  # a gateway sender's: no database is hers
+    in_session(monkeypatch, {})
+    mgr_cli, prov_cli = make_manager(tmp_path, platform="cli", session_id="cli", user_id="uid:1000")
+    mgr_cli.handle_tool_call("infino_remember", {"content": "the owner's badge PIN is 9911", "scope": "personal"})
+    # What an earlier version kept: a gateway sender's row, and the owner's under the machine's user id.
+    prov_cli._backend.personal.append(tables.MEMORY, [
+        {"content": "Bob's door badge PIN is 5512", "scope": "personal", "author": "bob"},
+        {"content": "the owner's locker is 12", "scope": "personal", "author": "uid:1000"}])
+    block = prov_cli.prefetch("badge PIN locker")
+    assert "9911" in block and "locker is 12" in block and "5512" not in block and "4421" not in block
+    out = json.loads(mgr_cli.handle_tool_call("infino_forget", {"content": "Bob's door badge PIN is 5512"}))
+    assert out["matched"] == 0  # nor do the owner's sessions delete it
+    in_session(monkeypatch, {**DM, "HERMES_SESSION_USER_NAME": "bob", "HERMES_SESSION_USER_ID": "444"})
+    assert "PIN" not in prov_gw.prefetch("door badge PIN")  # and a gateway chat shows none of it
+
+
+# -- publishing skills ---------------------------------------------------------
+
+def a_skill(tmp_path, text: str = SKILL_MD):
+    skill = tmp_path / "skills" / "release-checklist" / "SKILL.md"
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text(text)
+
+
+def test_a_group_member_cannot_publish_a_skill_to_the_team(env, platform, tmp_path, monkeypatch):
+    a_skill(tmp_path)
+    mgr, provider = make_manager(tmp_path, platform="telegram")
+    in_session(monkeypatch, GROUP)
+    out = json.loads(mgr.handle_tool_call("infino_publish_skill", {"name": "release-checklist"}))
+    assert out["ok"] is False and "owner" in out["error"]
+    # The owner, admitted by Hermes to write their own memory from the group, may.
+    in_session(monkeypatch, GROUP, binding=SimpleNamespace(owner_writes=True))
+    assert json.loads(mgr.handle_tool_call("infino_publish_skill", {"name": "release-checklist"}))["ok"] is True
+    provider.shutdown()
+    assert len(platform.rows(TEAM_DB, tables.SKILLS)) == 1
+
+
+def test_a_published_skill_is_scrubbed_of_secrets(env, platform, tmp_path):
+    secret = "sk-ant-api03-" + "A1b2C3d4E5f6G7h8I9j0" * 4
+    a_skill(tmp_path, SKILL_MD + f"\nDeploy with {secret}\n")
+    mgr, provider = make_manager(tmp_path)
+    assert json.loads(mgr.handle_tool_call("infino_publish_skill", {"name": "release-checklist"}))["ok"] is True
+    provider.shutdown()
+    [row] = platform.rows(TEAM_DB, tables.SKILLS)
+    assert secret not in row["content"] and "Deploy with" in row["content"]

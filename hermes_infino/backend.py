@@ -44,6 +44,10 @@ class Backend:
     def __init__(self, settings: config.Settings):
         self.settings = settings
         state = config.state_dir(settings.home)
+        try:
+            config.make_private_dir(state)
+        except OSError as e:  # a home this process may not change keeps its mode
+            logger.warning("infino: could not make %s owner-only: %s", state, e)
         self.local = LocalStore.under(state)
         self.personal = LocalStore.under(state, PERSONAL_DB_DIR)
         self.mirror = Mirror(settings, self.local, self.personal) if settings.signed_in else None
@@ -138,13 +142,22 @@ class Backend:
         return False
 
     def forget_memory(self, content: str, scope: Optional[str] = None, visible: tuple[str, ...] = ("",),
-                      person: Optional[str] = None, about_prefix: str = "") -> int:
+                      people: Optional[tuple[str, ...]] = None, about_prefix: str = "",
+                      everywhere: bool = False) -> int:
         """Delete memories with exactly this text, of the chats in `visible`
         ("" is no chat), in `scope` when given: a chat forgets only what it
-        can recall. `person` (a gateway turn's sender) limits personal
-        memory to theirs. `about_prefix` also matches the text after any
-        "About <name>: " prefix of that shape (a group's entries about its
-        members, whoever wrote them)."""
+        can recall. `people` limits personal memory to the rows of those
+        authors (none: no personal memory; None: all of it). `about_prefix`
+        also matches the text after any "About <name>: " prefix of that shape
+        (a group's entries about its members, whoever wrote them).
+
+        This machine's rows are deleted here and, signed in, in the cloud by
+        their ids. With `everywhere` (`infino_forget`) so is every matching
+        row in the cloud, whichever machine saved it: the cloud is asked
+        which rows match, and when it does not answer the forget is queued as
+        its match, bounded to rows stored by now (one saved later is kept).
+        Returns how many rows were found."""
+        now = int(time.time() * 1000)
         text = tables.sql_string(content)
         match = f"content = {text}"
         if about_prefix:
@@ -155,18 +168,68 @@ class Backend:
             predicate += f" AND scope = {tables.sql_string(scope)}"
         team = self.local.delete(tables.MEMORY, predicate) if scope != recall.PERSONAL else []
         # A group chat never reaches the person's own memory (`visible` holds a chat).
-        reaches_personal = scope in (None, recall.PERSONAL) and visible == ("",) and person != ""
-        if person:
-            predicate += f" AND author = {tables.sql_string(person)}"
-        personal = self.personal.delete(tables.MEMORY, predicate) if reaches_personal else []
+        reaches_personal = scope in (None, recall.PERSONAL) and visible == ("",) and people != ()
+        personal_predicate = predicate
+        if people:
+            personal_predicate += f" AND author IN ({', '.join(tables.sql_string(p) for p in people)})"
+        personal = self.personal.delete(tables.MEMORY, personal_predicate) if reaches_personal else []
+        found = {str(r[tables.ROW_ID]) for r in team} | {str(r[tables.ROW_ID]) for r in personal}
+        if self.mirror is None:
+            return len(found)
+        # Each row is deleted from the cloud database its source went to.
+        s = self.settings
+        targets = [(s.team_database, predicate, team)] if scope != recall.PERSONAL else []
+        if reaches_personal and s.personal_database:
+            targets.append((s.personal_database, personal_predicate, personal))
+        for database, where, rows in targets:
+            ids = {str(r[tables.ROW_ID]) for r in rows}
+            if everywhere:
+                try:
+                    ids |= self.mirror.matching_ids(tables.MEMORY, database, where)
+                except Exception as e:  # unanswered: the match goes to the queue instead
+                    logger.info("infino: the cloud did not say which memories match; the forget is queued: %s", e)
+                    self.mirror.forget_matching(tables.MEMORY, database, f"{where} AND {tables.STORED} <= {now}")
+            self.mirror.forget(tables.MEMORY, database, sorted(ids))
+            found |= ids
+        self.schedule_sync()
+        return len(found)
+
+    # -- Hermes's built-in memory files (builtin.py) --------------------------
+
+    def builtin_rows(self, target: str) -> list[tuple[bool, dict]]:
+        """This machine's `memory` rows kept from one of Hermes's built-in
+        memory files, each with whether it is in the person's own database."""
+        sql = (f"SELECT {tables.ROW_ID}, content FROM {tables.MEMORY} "
+               f"WHERE origin = {tables.sql_string('builtin:' + target)}")
+        return ([(False, r) for r in self.local.query_sql(sql)]
+                + [(True, r) for r in self.personal.query_sql(sql)])
+
+    def has_memory(self, row: dict) -> bool:
+        """Whether this machine already keeps a memory row like `row` (its text,
+        origin, chat and, for personal memory, author)."""
+        where = (f"content = {tables.sql_string(row['content'])} AND origin = {tables.sql_string(row['origin'])} "
+                 f"AND {tables.chat_predicate((str(row.get(tables.CHAT) or ''),))}")
+        store = self.local
+        if row.get("scope") == recall.PERSONAL:
+            store = self.personal
+            where += f" AND author = {tables.sql_string(str(row.get('author') or ''))}"
+        found = store.query_sql(f"SELECT count(*) AS n FROM {tables.MEMORY} WHERE {where}")
+        return bool(found and found[0]["n"])
+
+    def forget_rows(self, rows: list[tuple[bool, dict]]) -> None:
+        """Delete this machine's memory rows by id (each flagged personal or
+        not, as `builtin_rows` gives them), here and in the cloud."""
+        for personal, store in ((False, self.local), (True, self.personal)):
+            ids = [str(r[tables.ROW_ID]) for p, r in rows if p == personal]
+            if not ids:
+                continue
+            store.delete(tables.MEMORY, f"{tables.ROW_ID} IN ({', '.join(tables.sql_string(i) for i in ids)})")
+            if self.mirror is not None:
+                database = self.settings.personal_database if personal else self.settings.team_database
+                if database:
+                    self.mirror.forget(tables.MEMORY, database, ids)
         if self.mirror is not None:
-            # Each row is deleted from the cloud database its source went to.
-            s = self.settings
-            self.mirror.forget(tables.MEMORY, s.team_database, [str(r[tables.ROW_ID]) for r in team])
-            if s.personal_database:
-                self.mirror.forget(tables.MEMORY, s.personal_database, [str(r[tables.ROW_ID]) for r in personal])
             self.schedule_sync()
-        return len(team) + len(personal)
 
     # -- sync ----------------------------------------------------------------
 

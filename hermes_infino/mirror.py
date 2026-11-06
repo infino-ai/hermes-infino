@@ -19,10 +19,15 @@ still committing in another process is not passed by the mark.
 
 A mark belongs to one cloud database and table (`<database>/<table>`): a
 profile moved to another team database pushes everything there. And a mark
-is dropped when the cloud has lost the row it points at while this machine
-still has it - the cloud table was dropped and made again - so the new table
-gets this machine's rows. (A forgotten memory is deleted here too, so its
-mark never looks lost.)
+is dropped when the cloud has lost this machine's rows while this machine
+still has them - the cloud table was dropped and made again - so the new
+table gets this machine's rows. A teammate's `infino_forget` deletes rows of
+this machine from the cloud too, so a table counts as lost only when none of
+the last LOST_CHECK_ROWS rows pushed, nor the first, is in the cloud.
+
+Nothing is pushed until the cloud tables are right (`tables.ensure_all`): a
+database whose tables lack a column this version writes, and cannot be given
+it, gets no rows, and the sync says why.
 
 A batch whose append was never answered may still have reached the cloud (a
 timeout after the platform committed it, or a process killed mid-append). A
@@ -43,7 +48,10 @@ A memory deleted locally (`infino_forget`, or Hermes replacing a built-in
 memory) is deleted in the cloud by its `row_id`s, from a small queue applied
 after each sync's pushes: by id, so a memory saved again later is never
 deleted with it, and after the pushes, so a row pushed while it was being
-deleted is deleted too.
+deleted is deleted too. A forget the cloud could not be asked about at the
+time (no answer) is queued as its match instead, bounded by `stored_ms` so a
+memory saved again later is still kept. The queue's lock is held only to
+read and rewrite the file, never across a request to the cloud.
 
 One sync runs at a time per profile (a file lock); the others skip.
 """
@@ -84,6 +92,14 @@ PUSH_BATCH = 200
 PUSH_MAX_BYTES = 2_000_000
 # Row ids per cloud delete.
 FORGET_BATCH = 100
+# The latest rows pushed that a table's loss is checked against (with the
+# first): a table is lost only when the cloud holds none of them.
+LOST_CHECK_ROWS = 32
+# Seconds a forget waits for the cloud to say which rows match before it is
+# queued as its match instead.
+FORGET_LOOKUP_TIMEOUT_S = 5.0
+# Seconds between attempts to make the cloud tables right after one failed.
+ENSURE_RETRY_S = 60.0
 # The person's own sources, one per personal table: the team's are named by
 # their tables, these by the table after this prefix.
 PERSONAL_SOURCE_PREFIX = "personal_"
@@ -125,6 +141,11 @@ class Mirror:
         self.personal = personal
         self.client = client or InfinoClient(settings.api_key, settings.url)
         self.dir = config.state_dir(settings.home)
+        # Whether the cloud tables are right (ensure_cloud_tables), and when
+        # and why the last attempt failed.
+        self._tables_ready = False
+        self._tables_failed_at = 0.0
+        self._tables_error: Optional[Exception] = None
 
     # -- where rows go -------------------------------------------------------
 
@@ -142,17 +163,32 @@ class Mirror:
         return out
 
     def ensure_cloud_tables(self) -> None:
-        tables.ensure_all(self.client, self.settings.team_database)
-        if self.settings.personal_database:
-            tables.ensure_all(self.client, self.settings.personal_database, personal=True)
-        self._drop_lost_marks()
+        try:
+            tables.ensure_all(self.client, self.settings.team_database)
+            if self.settings.personal_database:
+                tables.ensure_all(self.client, self.settings.personal_database, personal=True)
+            self._drop_lost_marks()
+        except Exception as e:
+            self._tables_failed_at, self._tables_error = time.monotonic(), e
+            raise
+        self._tables_ready, self._tables_error = True, None
+
+    def _ensure_before_push(self) -> None:
+        """Make the cloud tables right before a sync pushes anything; while
+        they cannot be, the sync stops with why (retried every ENSURE_RETRY_S)."""
+        if self._tables_ready:
+            return
+        if self._tables_error is not None and time.monotonic() - self._tables_failed_at < ENSURE_RETRY_S:
+            raise self._tables_error
+        self.ensure_cloud_tables()
 
     def _drop_lost_marks(self) -> None:
         """Forget each mark whose cloud table has lost this machine's rows:
-        neither the row the mark points at nor the oldest row pushed is in
-        the cloud, while this machine still has both. Asking for two rows
-        pushed at different times keeps a cloud slow to show the newest one
-        from looking like a dropped table."""
+        none of the latest LOST_CHECK_ROWS rows pushed, nor the oldest, is in
+        the cloud, while this machine still has the row the mark points at.
+        Many rows, pushed at different times, keep a teammate's forget of a
+        few of them, or a cloud slow to show the newest, from looking like a
+        dropped table."""
         with self._lock(wait=True):
             state = self._state()
             marks = self.marks()
@@ -162,7 +198,9 @@ class Mirror:
                 if mark is None or not src.store.has_row(src.table, mark[1]):
                     continue
                 oldest = src.store.rows_after(src.table, None, mark[0], 1)
-                ids = ", ".join(tables.sql_string(i) for i in {mark[1], *(str(r[tables.ROW_ID]) for r in oldest)})
+                latest = src.store.pushed_ids(src.table, mark[0], LOST_CHECK_ROWS)
+                ids = ", ".join(tables.sql_string(i) for i in
+                                {mark[1], *latest, *(str(r[tables.ROW_ID]) for r in oldest)})
                 found = self.client.query_sql(
                     src.database, f"SELECT count(*) AS n FROM {src.table} WHERE {tables.ROW_ID} IN ({ids})")
                 if not (found and found[0].get("n")):
@@ -244,7 +282,17 @@ class Mirror:
 
         A source the cloud fails on stops at the last batch it accepted, and
         the others go on; so do the forgets. The first failure is raised
-        after them, recorded as `last_error`."""
+        after them, recorded as `last_error`. Nothing is pushed while the
+        cloud tables are not right (`_ensure_before_push`)."""
+        try:
+            self._ensure_before_push()
+        except Exception as e:
+            with self._lock(wait=False) as held:  # recorded for `hermes infino status` unless another sync runs
+                if held:
+                    state = self._state()
+                    self._save_state(self.marks(), f"{type(e).__name__}: {e}", state.get("in_flight") or [],
+                                     self._rechecks(state))
+            raise
         with self._lock(wait) as held:
             if not held:
                 return {}
@@ -381,34 +429,65 @@ class Mirror:
 
     # -- forgets -------------------------------------------------------------
 
+    def matching_ids(self, table: str, database: str, predicate: str) -> set[str]:
+        """The `row_id`s of the cloud rows matching `predicate`, whichever
+        machine pushed them. Asked while a tool call waits: a short timeout,
+        no retries."""
+        s = self.settings
+        client = InfinoClient(s.api_key, s.url, timeout=FORGET_LOOKUP_TIMEOUT_S, retries=0)
+        rows = client.query_sql(database, f"SELECT {tables.ROW_ID} FROM {table} WHERE {predicate}")
+        return {str(r.get(tables.ROW_ID)) for r in rows if r.get(tables.ROW_ID)}
+
     def forget(self, table: str, database: str, row_ids: list[str]) -> None:
-        """Queue the cloud delete of rows deleted locally."""
-        if not row_ids:
-            return
+        """Queue the cloud delete of rows by their ids."""
+        if row_ids:
+            self._queue({"table": table, "database": database, "row_ids": list(row_ids)})
+
+    def forget_matching(self, table: str, database: str, predicate: str) -> None:
+        """Queue the cloud delete of the rows matching `predicate` (which the
+        caller bounds by `stored_ms`, so rows saved later are kept)."""
+        self._queue({"table": table, "database": database, "predicate": predicate})
+
+    def _queue(self, entry: dict) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
-        line = json.dumps({"table": table, "database": database, "row_ids": row_ids}) + "\n"
+        line = json.dumps(entry) + "\n"
         with open(self.dir / FORGET_FILE, "a") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             f.write(line)
             fcntl.flock(f, fcntl.LOCK_UN)
 
     def _apply_forgets(self) -> None:
+        """Apply the queued deletes, then take the applied ones off the queue.
+        The lock is held only to read and to rewrite the file: a forget made
+        meanwhile queues without waiting on the cloud, and stays queued."""
         path = self.dir / FORGET_FILE
         if not path.exists():
             return
-        with open(path, "r+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                entries = [json.loads(line) for line in f if line.strip()]
-                remaining = list(entries)
-                for e in entries:
+        with open(path, "r") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            lines = [line for line in f if line.strip()]
+            fcntl.flock(f, fcntl.LOCK_UN)
+        applied: list[str] = []
+        try:
+            for line in lines:
+                e = json.loads(line)
+                if e.get("predicate"):
+                    self.client.delete(e["database"], e["table"], e["predicate"])
+                else:
                     ids = list(e["row_ids"])
                     for start in range(0, len(ids), FORGET_BATCH):
                         chunk = ", ".join(tables.sql_string(i) for i in ids[start:start + FORGET_BATCH])
                         self.client.delete(e["database"], e["table"], f"{tables.ROW_ID} IN ({chunk})")
-                    remaining.remove(e)
-            finally:
-                f.seek(0)
-                f.truncate()
-                f.writelines(json.dumps(e) + "\n" for e in remaining)
-                fcntl.flock(f, fcntl.LOCK_UN)
+                applied.append(line)
+        finally:
+            if applied:
+                with open(path, "r+") as f:
+                    fcntl.flock(f, fcntl.LOCK_EX)
+                    current = [line for line in f if line.strip()]
+                    for line in applied:  # one occurrence each: the same forget queued again stays
+                        if line in current:
+                            current.remove(line)
+                    f.seek(0)
+                    f.truncate()
+                    f.writelines(current)
+                    fcntl.flock(f, fcntl.LOCK_UN)
