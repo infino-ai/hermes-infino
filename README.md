@@ -8,7 +8,7 @@ You don't need an Infino account. Without one, everything is kept in a database 
 
 With an Infino account, your team shares a database in Infino Cloud, so every agent on the team can search what the others did. `hermes infino login` creates a free account on a platform that gives them out, or joins your team's with a key a teammate gives you. From then on, the plugin uploads what it has kept on your machine so far, then each new memory, conversation, trace and skill as it happens. Your machine keeps its own copy. Personal memory, and the conversations and traces of work you mark personal, never go to the team database.
 
-Infino Cloud keeps every database on object storage: Infino's, or a bucket in your own AWS, Google Cloud or Azure account, which you can encrypt with a key you own (CMEK). See [How Infino stores your data](#how-infino-stores-your-data).
+Infino Cloud is SOC 2 Type II. It keeps every database on object storage: Infino's, or a bucket in your own AWS, Google Cloud or Azure account, which you can encrypt with a key you own (CMEK). See [How Infino stores your data](#how-infino-stores-your-data).
 
 ```mermaid
 flowchart LR
@@ -53,6 +53,8 @@ flowchart LR
 | Infino Cloud, in your bucket | Your own Amazon S3, Google Cloud Storage or Azure Blob Storage bucket ([bring your own bucket](https://infino.ai/docs/cloud/bring-your-own-bucket)). Infino reaches it through an identity you grant, and you can take the grant back. | Your bucket's. With [customer-managed keys](https://infino.ai/docs/cloud/customer-managed-keys) (CMEK), that is a key you own in AWS KMS, Google Cloud KMS or Azure Key Vault. Infino never holds the key: disable or revoke it, and Infino can no longer read the data. |
 
 Infino turns on your own bucket and your own key per account. Create the team database in your bucket first (the bring-your-own-bucket guide shows how), then [sign in](#signing-in) naming it with `--team-database`. `login` uses a database that already exists as it is. A personal database can be in your bucket too.
+
+Infino Cloud is SOC 2 Type II. The report is available on request at [infino.ai/talk](https://infino.ai/talk).
 
 ## What it saves
 
