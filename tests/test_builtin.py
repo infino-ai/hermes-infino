@@ -122,8 +122,27 @@ def test_a_group_chats_review_entry_is_the_chats(env, platform, tmp_path, monkey
     assert (row["chat"], row["author"]) == ("telegram:-100", "mallory")
 
 
-def test_a_gateway_dms_user_entry_is_the_senders(env, platform, tmp_path, monkeypatch):
+def test_a_shared_profiles_user_file_is_never_taken_for_the_owners_memory(env, platform, tmp_path, monkeypatch):
+    # Hermes's USER.md of a profile a gateway answers may be about anyone who wrote in.
     env.setenv("INFINO_PERSONAL_DATABASE", PERSONAL_DB)
+    mgr, provider = make_manager(tmp_path, platform="telegram")
+    in_session(monkeypatch, DM)
+    write_file(tmp_path, "user", ["works from Lisbon"])
+    write_file(tmp_path, "memory", ["deploys are on Tuesdays"])
+    turn(provider)
+    provider.shutdown()
+    # The owner's own session on the same profile does not take it either.
+    in_session(monkeypatch, {})
+    _, at_the_terminal = make_manager(tmp_path, session_id="cli")
+    turn(at_the_terminal, 2)
+    at_the_terminal.shutdown()
+    assert platform.rows(PERSONAL_DB, tables.MEMORY) == [] and personal_rows(tmp_path) == []
+    assert contents(platform.rows(TEAM_DB, tables.MEMORY)) == ["deploys are on Tuesdays"]
+
+
+def test_a_personal_profiles_dm_user_entry_is_its_persons(env, platform, tmp_path, monkeypatch):
+    env.setenv("INFINO_PERSONAL_DATABASE", PERSONAL_DB)
+    env.setenv("INFINO_PERSONAL_PROFILE", "on")
     mgr, provider = make_manager(tmp_path, platform="telegram")
     in_session(monkeypatch, DM)
     write_file(tmp_path, "user", ["works from Lisbon"])

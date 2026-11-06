@@ -64,7 +64,7 @@ Conversations and traces belong to the team, so every agent on the team can see 
 
 The job itself can still be shared: a skill a personal job uses is the team's like any other skill. What the job reads and writes stays with you. Memory keeps its own rule (team unless it is about one person), whatever the setting.
 
-On a gateway, where one profile answers several people, each person's personal memory is saved under their name and recalled only in their own chats with the agent: not in other people's chats, and not in the profile owner's own sessions.
+Personal memory is one person's: the profile owner's, in a database of its own. Nothing separates two people's memories inside one database, so on a gateway, where a profile answers whoever writes to it, a shared profile keeps no personal memory. The agent is told it cannot save something personal there, and recall in those chats shows none. A profile that is one person's (`INFINO_PERSONAL_PROFILE=on`, such as your own bot) keeps your personal memory in its chats too.
 
 ## Group chats
 
@@ -229,7 +229,7 @@ The config block comes first because Hermes starts the Infino tools with that bl
 | `INFINO_MCP_SERVER` | The client's name under `mcp_servers` (default `infino`). Environment only, since it names the config block. |
 | `INFINO_URL` | The Infino Cloud URL (default `https://api.platform.infino.ws`) |
 | `INFINO_TEAM_SKILLS` | `off` stops this profile loading the skills teammates publish (default on) |
-| `INFINO_PERSONAL_PROFILE` | `on` keeps every conversation and trace of this profile out of the team database (default off). See [Personal conversations and traces](#personal-conversations-and-traces). |
+| `INFINO_PERSONAL_PROFILE` | `on` keeps every conversation and trace of this profile out of the team database (default off), and keeps personal memory in its gateway chats too, as one person's. See [Personal conversations and traces](#personal-conversations-and-traces). |
 | `INFINO_PERSONAL_JOBS` | Scheduled jobs (ids or names, comma-separated) whose runs, and the chats their output is delivered into, are kept out of the team database |
 
 ## Development

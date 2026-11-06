@@ -25,9 +25,14 @@ of what was said: a turn `/undo` takes back stays in it. Each session's
 In a group chat (chats.py) memory is the chat's: what its members ask the
 agent to remember is kept for that chat and the team, never in one person's
 memory, and recalled in that chat only - unless Hermes says the sender is the
-profile's owner writing their own memory. On a gateway, where one profile
-answers several people, a person's own memory is theirs: written under
-their name, recalled for them alone.
+profile's owner writing their own memory.
+
+Personal memory is one person's: the profile owner's, in a database of its
+own (nothing tells one person's rows from another's inside a database). So
+it is read and written in the owner's own sessions on this machine, and on a
+gateway only when the profile is one person's (INFINO_PERSONAL_PROFILE). A
+shared profile's gateway, which answers whoever writes in, keeps no personal
+memory: the agent is told so, and recall there shows none.
 
 The agent's own retrieval over all of it - and, signed in, the facts, cards
 and joins the platform builds from it - is the Infino client, which Hermes
@@ -78,6 +83,13 @@ PRIMARY_CONTEXT = "primary"
 # subagent or a scheduled job saving what it found writes like a session does.
 # A flush run is Hermes saving its own memory before compaction: not here.
 TOOL_WRITE_CONTEXTS = (PRIMARY_CONTEXT, "subagent", "cron")
+# Beside the plugin's databases once the profile has answered a gateway: its
+# USER.md may then hold entries about anyone who wrote in.
+GATEWAY_MARK = "served_a_gateway"
+# What a shared profile's gateway chat is told when asked to keep something personal.
+NO_PERSONAL_HERE = ("nothing was saved: this profile is shared, so it keeps no personal memory for the people "
+                    "it talks to here (only its owner's, in the owner's own sessions). Save it as team memory "
+                    "only if it is not private.")
 
 SYSTEM_PROMPT = (
     "Team memory is kept in Infino. Relevant memories are added to your context before each turn. "
@@ -97,6 +109,10 @@ SYSTEM_PROMPT_PERSON = (
 SYSTEM_PROMPT_GATEWAY = (
     "Several people may talk to you here. Write each memory so a teammate understands it on its own: "
     "name the person it is about or who said it, never \"the user\", \"I\" or \"me\"."
+)
+# A shared profile's gateway keeps no personal memory (_keeps_personal).
+SYSTEM_PROMPT_NO_PERSONAL = (
+    "This profile is shared, so no personal memory is kept here: do not save a person's private matters."
 )
 # Hermes's built-in USER.md entries are about the person a profile works with
 # ("User prefers ..."); in the team's table they are kept under that person's name.
@@ -204,6 +220,13 @@ class InfinoMemoryProvider(MemoryProvider):
         # owner, and a channel message is from whoever sent it.
         local = not self._gateway()
         assert self._settings is not None
+        if not local:
+            try:  # from now on its USER.md may be about anyone who wrote in (_shared_gateway_profile)
+                mark = config.state_dir(self._settings.home) / GATEWAY_MARK
+                config.make_private_dir(mark.parent)
+                mark.touch()
+            except OSError as e:
+                logger.info("infino: could not note that this profile answers a gateway: %s", e)
         self._author = str((self._settings.author if local else "") or kwargs.get("user_name")
                            or kwargs.get("user_id") or (self._profile if local else ""))
         # Every name this machine's person writes rows under, now or after a
@@ -279,15 +302,36 @@ class InfinoMemoryProvider(MemoryProvider):
         """Who the running turn is for: the gateway's sender, or this machine's person."""
         return self._sender() if self._gateway() else self._author
 
-    def _people(self) -> tuple[str, ...]:
-        """Whose personal memory the running turn may read or change: the
-        gateway's sender (no one's when it names nobody), or on this
-        machine's own sessions the owner's names - never a gateway sender's,
-        whose personal memory this profile keeps too."""
-        if self._gateway():
-            sender = self._sender()
-            return (sender,) if sender else ()
-        return self._owner_names
+    def _people(self) -> Optional[tuple[str, ...]]:
+        """Whose personal memory the running turn may read or change.
+
+        A personal database is one person's, this profile's owner's: nothing
+        tells one person's rows from another's inside it. So the owner's own
+        sessions on this machine read the owner's (the names the owner's rows
+        are written under, which keeps out what an earlier version saved for
+        a gateway's senders); a gateway reads all of it when the profile is
+        one person's (INFINO_PERSONAL_PROFILE), and none of it when the
+        profile is shared, where whoever writes in may be anyone."""
+        if not self._gateway():
+            return self._owner_names
+        return None if self._settings and self._settings.personal_profile else ()
+
+    def _keeps_personal(self, chat: chats.Chat) -> bool:
+        """Whether the running turn may write the owner's personal memory: in
+        this machine's own sessions; on a gateway, only when the profile is
+        one person's, or Hermes says the sender may write the owner's memory
+        (a group chat's channel-memory binding)."""
+        if not self._gateway():
+            return True
+        return bool((self._settings and self._settings.personal_profile) or (chat.group and chat.owner_writes))
+
+    def _shared_gateway_profile(self) -> bool:
+        """Whether this profile answers a gateway's people without being one
+        person's: Hermes's USER.md then holds entries about any of them."""
+        if self._settings and self._settings.personal_profile:
+            return False
+        return self._gateway() or (config.state_dir(self._settings.home if self._settings else None)
+                                   / GATEWAY_MARK).exists()
 
     def system_prompt_block(self) -> str:
         if not self._settings:
@@ -295,6 +339,8 @@ class InfinoMemoryProvider(MemoryProvider):
         tools = instructions.prompt_block(self._settings.mcp_server)
         if self._gateway():
             person = " " + SYSTEM_PROMPT_GATEWAY
+            if not self._settings.personal_profile:
+                person += " " + SYSTEM_PROMPT_NO_PERSONAL
         else:
             person = " " + SYSTEM_PROMPT_PERSON.format(author=self._author) if self._author else ""
         return SYSTEM_PROMPT + person + ("\n\n" + tools if tools else "")
@@ -367,21 +413,25 @@ class InfinoMemoryProvider(MemoryProvider):
         assert self._backend is not None
         return self._backend.forget_memory(content, scope, chat.visible, people, about_prefix, everywhere)
 
-    def _builtin_row(self, target: str, content: str, chat: chats.Chat) -> dict:
-        """The `memory` row of a built-in memory entry written in the running turn.
+    def _builtin_row(self, target: str, content: str, chat: chats.Chat) -> Optional[dict]:
+        """The `memory` row of a built-in memory entry written in the running
+        turn; None when it is not kept.
 
         A group member's note (Hermes's own memory tool, or its background
         review) is the chat's and the team's, credited to whoever said it:
         Hermes's channel memory keeps these out of the owner's files, and this
         keeps them out of the owner's personal memory too. Otherwise USER.md
         is about this person: personal (kept on this machine when there is no
-        personal database); MEMORY.md is what the agent learns about the
-        work: the team's."""
+        personal database), and not kept at all where the turn may not write
+        the owner's personal memory (`_keeps_personal`); MEMORY.md is what the
+        agent learns about the work: the team's."""
         content = content.strip()
         if chat.group and not chat.owner_writes:
             sender = self._sender()
             about = ABOUT_PERSON.format(author=sender) if target == "user" and sender else ""
             return self._memory_row(about + content, TEAM, f"builtin:{target}", chat, sender)
+        if target == "user" and not self._keeps_personal(chat):
+            return None
         person = self._person()
         scope = PERSONAL if target == "user" else self._default_scope()
         about = ABOUT_PERSON.format(author=person) if target == "user" and person else ""
@@ -403,13 +453,15 @@ class InfinoMemoryProvider(MemoryProvider):
             if chat.group and not chat.owner_writes:
                 # The entry may be about another member, who wrote it: any "About <name>: ".
                 self._run_write(self._forget, previous, TEAM, chat, None, ABOUT_ANYONE if target == "user" else "")
-            else:
+            elif target != "user" or self._keeps_personal(chat):
                 person = self._person()
                 about = ABOUT_PERSON.format(author=person) if target == "user" and person else ""
                 scope = PERSONAL if target == "user" else self._default_scope()
                 self._run_write(self._forget, about + previous, scope, chats.NO_CHAT, self._people())
         if action in ("add", "replace") and content:
-            self._run_write(self._add_builtin, self._builtin_row(target, content, chat))
+            row = self._builtin_row(target, content, chat)
+            if row is not None:
+                self._run_write(self._add_builtin, row)
 
     def _mirror_builtin(self) -> None:
         """Keep the `memory` table in step with Hermes's built-in memory
@@ -421,6 +473,10 @@ class InfinoMemoryProvider(MemoryProvider):
         chat = chats.current()
         with builtin.lock(config.state_dir(self._settings.home)):
             for target in builtin.FILES:
+                if target == "user" and self._shared_gateway_profile():
+                    # Its USER.md may be about anyone a gateway answered: no entry
+                    # of it can be taken for the owner's personal memory.
+                    continue
                 entries = builtin.read_entries(home, target)
                 if entries is None:  # missing or unreadable: says nothing
                     continue
@@ -428,7 +484,7 @@ class InfinoMemoryProvider(MemoryProvider):
                 missing, stale = builtin.compare(entries, self._backend.builtin_rows(target))
                 for entry in missing:
                     row = self._builtin_row(target, entry, chat)
-                    if not self._backend.has_memory(row):
+                    if row is not None and not self._backend.has_memory(row):
                         self._append(tables.MEMORY, [row])
                 if stale:
                     self._backend.forget_rows(stale)
@@ -594,6 +650,8 @@ class InfinoMemoryProvider(MemoryProvider):
                                                                   self._author if chat.owner_writes else sender)])
                     return json.dumps({"ok": True, "scope": "this group chat (and the team)"})
                 scope = asked or self._default_scope()
+                if scope == PERSONAL and not self._keeps_personal(chat):
+                    return json.dumps({"ok": False, "error": NO_PERSONAL_HERE})
                 self._append(tables.MEMORY, [self._memory_row(content, scope, "remember", author=self._person())])
                 return json.dumps({"ok": True, "scope": scope})
             if tool_name == "infino_forget":

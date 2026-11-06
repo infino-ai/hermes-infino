@@ -415,6 +415,7 @@ def test_a_group_chats_memory_is_never_a_persons(env, platform, tmp_path, monkey
 
 def test_a_group_chats_notes_are_recalled_there_only(env, platform, tmp_path, monkeypatch):
     env.setenv("INFINO_PERSONAL_DATABASE", PERSONAL_DB)
+    env.setenv("INFINO_PERSONAL_PROFILE", "on")  # one person's profile: its DMs keep their personal memory
     mgr, provider = make_manager(tmp_path, platform="telegram")
     in_session(monkeypatch, DM)
     mgr.handle_tool_call("infino_remember", {"content": "release freeze starts December 20", "scope": "team"})
@@ -441,16 +442,17 @@ def test_hermes_channel_memory_decides_who_writes_the_owners_memory(env, platfor
     # The owner in a group, admitted to write their own memory from it.
     in_session(monkeypatch, GROUP, binding=SimpleNamespace(owner_writes=True))
     provider.on_memory_write("add", "user", "Prefers short answers")
-    # A confirmed one-to-one chat: Hermes binds nothing.
+    # A confirmed one-to-one chat (Hermes binds nothing) on a shared profile:
+    # whoever it is with, no personal memory is kept for them.
     in_session(monkeypatch, DM, binding=None)
     provider.on_memory_write("add", "user", "Works from Lisbon")
     # A member Hermes keeps out of the owner's memory.
     in_session(monkeypatch, GROUP, binding=SimpleNamespace(owner_writes=False))
     provider.on_memory_write("add", "user", "Is the release owner")
     provider.shutdown()
-    # The owner's own entries, named after the person the gateway says sent them.
+    # The owner's own entry, named after the person the gateway says sent it.
     personal = sorted(r["content"] for r in platform.rows(PERSONAL_DB, tables.MEMORY))
-    assert personal == ["About mallory: Prefers short answers", "About owner: Works from Lisbon"]
+    assert personal == ["About mallory: Prefers short answers"]
     [team] = platform.rows(TEAM_DB, tables.MEMORY)
     assert team["content"].endswith("Is the release owner") and team["chat"] == "telegram:-100"
 
@@ -517,15 +519,16 @@ def test_a_local_table_from_an_older_version_gains_the_new_column(home, tmp_path
 # -- personal memory ----------------------------------------------------------
 
 def test_personal_memory_is_never_in_the_database_the_tools_read(home, tmp_path, monkeypatch):
-    mgr, provider = make_manager(tmp_path, platform="telegram")
-    in_session(monkeypatch, DM)
+    mgr, provider = make_manager(tmp_path)
     mgr.handle_tool_call("infino_remember", {"content": "my staging credentials expire Friday", "scope": "personal"})
     provider._drain()
     assert local_rows(tmp_path, tables.MEMORY) == []  # the tool server's database
     assert [r["content"] for r in personal_rows(tmp_path)] == ["my staging credentials expire Friday"]
     assert "credentials" in provider.prefetch("staging credentials")
+    # The same profile answering a group chat through a gateway never shows it.
+    _, on_gateway = make_manager(tmp_path, platform="telegram", session_id="g")
     in_session(monkeypatch, GROUP)
-    assert "credentials" not in provider.prefetch("staging credentials")
+    assert "credentials" not in on_gateway.prefetch("staging credentials")
 
 
 def test_without_a_personal_database_personal_memory_stays_on_this_machine(env, platform, tmp_path):
@@ -762,24 +765,26 @@ def test_a_forget_the_cloud_cannot_answer_is_queued_and_keeps_a_later_save(env, 
 
 # -- personal memory on a gateway profile ----------------------------------------
 
-def test_a_gateway_senders_personal_memory_stays_out_of_the_owners_own_sessions(home, tmp_path, monkeypatch):
+def test_a_shared_profiles_personal_database_holds_its_owners_memory_alone(home, tmp_path, monkeypatch):
     home.setenv("INFINO_AUTHOR", "owner-name")
     mgr_gw, prov_gw = make_manager(tmp_path, platform="telegram", session_id="gw-alice")
     in_session(monkeypatch, {**DM, "HERMES_SESSION_USER_NAME": "alice", "HERMES_SESSION_USER_ID": "333"})
-    mgr_gw.handle_tool_call("infino_remember", {"content": "Alice's door badge PIN is 4421", "scope": "personal"})
-    prov_gw.shutdown()
+    out = json.loads(mgr_gw.handle_tool_call("infino_remember",
+                                             {"content": "Alice's door badge PIN is 4421", "scope": "personal"}))
+    assert out["ok"] is False  # a gateway sender's: no database is hers
     in_session(monkeypatch, {})
     mgr_cli, prov_cli = make_manager(tmp_path, platform="cli", session_id="cli", user_id="uid:1000")
     mgr_cli.handle_tool_call("infino_remember", {"content": "the owner's badge PIN is 9911", "scope": "personal"})
-    # A row an earlier version wrote under the machine's user id is the owner's too.
-    prov_cli._backend.personal.append(tables.MEMORY, [{"content": "the owner's locker is 12", "scope": "personal",
-                                                       "author": "uid:1000"}])
+    # What an earlier version kept: a gateway sender's row, and the owner's under the machine's user id.
+    prov_cli._backend.personal.append(tables.MEMORY, [
+        {"content": "Bob's door badge PIN is 5512", "scope": "personal", "author": "bob"},
+        {"content": "the owner's locker is 12", "scope": "personal", "author": "uid:1000"}])
     block = prov_cli.prefetch("badge PIN locker")
-    assert "9911" in block and "locker is 12" in block and "4421" not in block
-    out = json.loads(mgr_cli.handle_tool_call("infino_forget", {"content": "Alice's door badge PIN is 4421"}))
-    assert out["matched"] == 0  # nor can the owner's sessions delete it
-    in_session(monkeypatch, {**DM, "HERMES_SESSION_USER_NAME": "alice", "HERMES_SESSION_USER_ID": "333"})
-    assert "4421" in prov_gw.prefetch("door badge PIN")  # still Alice's, in her own chat
+    assert "9911" in block and "locker is 12" in block and "5512" not in block and "4421" not in block
+    out = json.loads(mgr_cli.handle_tool_call("infino_forget", {"content": "Bob's door badge PIN is 5512"}))
+    assert out["matched"] == 0  # nor do the owner's sessions delete it
+    in_session(monkeypatch, {**DM, "HERMES_SESSION_USER_NAME": "bob", "HERMES_SESSION_USER_ID": "444"})
+    assert "PIN" not in prov_gw.prefetch("door badge PIN")  # and a gateway chat shows none of it
 
 
 # -- publishing skills ---------------------------------------------------------

@@ -18,10 +18,9 @@ else's agent wrote.
 A recall shows what the chat it runs in may see (chats.py): the team's
 memories, plus, in a group chat, that chat's own - never another chat's, and
 in a group chat never the person's own memory, which would put one member's
-notes in front of every member. Personal memory shows only to the person it
-came from: on a gateway, where one profile answers several people, the
-sender; in the profile owner's own sessions, the owner (the names the
-owner's rows are written under), never a gateway sender's.
+notes in front of every member. Personal memory is the profile owner's: it
+shows in the owner's own sessions, and on a gateway only when the profile is
+one person's (provider.py says whose a turn may read).
 
 Hermes waits 8 s for a recall. The cloud searches run side by side and get
 RECALL_BUDGET_S between them; a source whose cloud has not answered by then

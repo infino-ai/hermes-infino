@@ -373,33 +373,38 @@ def dm_from(monkeypatch, name: str) -> None:
     in_session(monkeypatch, {**DM, "HERMES_SESSION_CHAT_ID": f"dm-{name}", "HERMES_SESSION_USER_NAME": name})
 
 
-def test_each_person_recalls_only_their_own_personal_memory(home, tmp_path, monkeypatch):
+def test_a_shared_profiles_dms_keep_no_personal_memory(home, tmp_path, monkeypatch):
+    # A personal database is one person's; a shared profile's DMs are anyone's.
     m, p = make_manager(tmp_path, platform="telegram")
     dm_from(monkeypatch, "ana")
-    call(m, "infino_remember", content="ana's dentist appointment is Tuesday", scope="personal")
-    assert "dentist" in p.prefetch("dentist appointment")
-    dm_from(monkeypatch, "ben")
+    out = call(m, "infino_remember", content="ana's dentist appointment is Tuesday", scope="personal")
+    assert out["ok"] is False and "nothing was saved" in out["error"]
+    p.on_memory_write("add", "user", "Prefers short answers")  # Hermes's USER.md, written in the DM
+    p._drain()
+    assert personal_rows(tmp_path) == [] and local_rows(tmp_path, tables.MEMORY) == []
+    assert "no personal memory is kept here" in p.system_prompt_block()
+
+
+def test_a_shared_profiles_dms_read_no_personal_memory_an_earlier_version_kept(home, tmp_path, monkeypatch):
+    m, p = make_manager(tmp_path, platform="telegram")
+    p._backend.personal.append(tables.MEMORY, [{"content": "ana's dentist appointment is Tuesday",
+                                                "scope": "personal", "author": "ana"}])
+    dm_from(monkeypatch, "ana")  # a display name anyone could take
     assert "dentist" not in p.prefetch("dentist appointment")
     assert call(m, "infino_forget", content="ana's dentist appointment is Tuesday")["matched"] == 0
-    dm_from(monkeypatch, "ana")
-    assert call(m, "infino_forget", content="ana's dentist appointment is Tuesday")["matched"] == 1
 
 
-def test_a_dm_naming_nobody_reads_no_personal_memory(home, tmp_path, monkeypatch):
+def test_a_personal_profiles_dms_keep_its_persons_memory(home, tmp_path, monkeypatch):
+    home.setenv("INFINO_PERSONAL_PROFILE", "on")  # one person's profile: their own bot
     m, p = make_manager(tmp_path, platform="telegram")
     dm_from(monkeypatch, "ana")
-    call(m, "infino_remember", content="ana's dentist appointment is Tuesday", scope="personal")
-    in_session(monkeypatch, {**DM, "HERMES_SESSION_USER_NAME": "", "HERMES_SESSION_USER_ID": ""})
-    assert "dentist" not in p.prefetch("dentist appointment")
-
-
-def test_a_dm_users_entry_is_kept_under_the_senders_name(home, tmp_path, monkeypatch):
-    _, p = make_manager(tmp_path, platform="telegram")
-    dm_from(monkeypatch, "ana")
+    assert call(m, "infino_remember", content="ana's dentist appointment is Tuesday", scope="personal")["ok"]
     p.on_memory_write("add", "user", "Prefers short answers")
     p._drain()
-    [row] = personal_rows(tmp_path)
-    assert (row["content"], row["author"]) == ("About ana: Prefers short answers", "ana")
+    assert sorted((r["content"], r["author"]) for r in personal_rows(tmp_path)) == [
+        ("About ana: Prefers short answers", "ana"), ("ana's dentist appointment is Tuesday", "ana")]
+    assert "dentist" in p.prefetch("dentist appointment")
+    assert "no personal memory is kept here" not in p.system_prompt_block()
 
 
 def test_a_group_forgets_an_entry_another_member_wrote(home, tmp_path, monkeypatch):
