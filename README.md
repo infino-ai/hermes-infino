@@ -8,6 +8,8 @@ You don't need an Infino account. Without one, everything is kept in a database 
 
 With an Infino account, your team shares a database in Infino Cloud, so every agent on the team can search what the others did. `hermes infino login` creates a free account on a platform that gives them out, or joins your team's with a key a teammate gives you. From then on, the plugin uploads what it has kept on your machine so far, then each new memory, conversation, trace and skill as it happens. Your machine keeps its own copy. Personal memory, and the conversations and traces of work you mark personal, never go to the team database.
 
+Infino Cloud keeps every database on object storage: Infino's, or a bucket in your own AWS, Google Cloud or Azure account, which you can encrypt with a key you own (CMEK). See [How Infino stores your data](#how-infino-stores-your-data).
+
 ```mermaid
 flowchart LR
   H[Hermes agent] -- "memory, messages,<br/>model and tool calls" --> P[hermes-infino]
@@ -18,6 +20,39 @@ flowchart LR
   T -- "search, find, sql, ask" --> C[Infino tools]
   C --> H
 ```
+
+## How Infino stores your data
+
+An Infino database is a set of files. Each table is Parquet files with keyword and vector indexes built into them, and search and SQL read those files directly. On your machine, the Infino engine runs inside Hermes and keeps the files on your disk. In Infino Cloud, Infino's servers keep them on object storage and cache what they read.
+
+```mermaid
+flowchart LR
+  subgraph machine ["Your machine"]
+    H[Hermes agent] --> P[hermes-infino]
+    H --> T[Infino tools]
+    P --> L[("Local database<br/>in your Hermes home")]
+    T -->|"before you sign in"| L
+  end
+  subgraph cloud ["Infino Cloud"]
+    S["Infino servers<br/>search, SQL, ask"]
+  end
+  subgraph storage ["Object storage"]
+    B[("Infino's bucket, or yours:<br/>S3, GCS or Azure")]
+  end
+  K["Your key, if you want one:<br/>AWS KMS, Cloud KMS<br/>or Azure Key Vault"]
+  P -->|"sync and recall,<br/>after you sign in"| S
+  T -->|"after you sign in"| S
+  S -->|"Parquet files with<br/>keyword and vector indexes"| B
+  K -.->|"encrypts your bucket"| B
+```
+
+| Where | Where the files are | Encryption |
+| --- | --- | --- |
+| Your machine | `$HERMES_HOME/infino/`, in folders only your user can read. Every row is written here first, signed in or not. | Whatever your disk has |
+| Infino Cloud | Infino's object storage. Each database has its own prefix, and the server for a database holds a short-lived credential that reaches only that prefix. | AES-256 at rest, with keys the cloud provider manages. The servers' disk caches are encrypted too. |
+| Infino Cloud, in your bucket | Your own Amazon S3, Google Cloud Storage or Azure Blob Storage bucket ([bring your own bucket](https://infino.ai/docs/cloud/bring-your-own-bucket)). Infino reaches it through an identity you grant, and you can take the grant back. | Your bucket's. With [customer-managed keys](https://infino.ai/docs/cloud/customer-managed-keys) (CMEK), that is a key you own in AWS KMS, Google Cloud KMS or Azure Key Vault. Infino never holds the key: disable or revoke it, and Infino can no longer read the data. |
+
+Infino turns on your own bucket and your own key per account. Create the team database in your bucket first (the bring-your-own-bucket guide shows how), then [sign in](#signing-in) naming it with `--team-database`. `login` uses a database that already exists as it is. A personal database can be in your bucket too.
 
 ## What it saves
 
