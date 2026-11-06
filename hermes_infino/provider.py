@@ -616,6 +616,11 @@ class InfinoMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         scope = {"type": "string", "enum": [TEAM, PERSONAL],
                  "description": "team (the default: work knowledge) or personal (about one person)"}
+        # Hermes routes a provider's tools by the schemas it gives when the
+        # provider is added, before `initialize`, and shows the model the ones it
+        # gives after. So the personal search is always routed, and shown only
+        # where it is offered; a call from anywhere else is refused (_personal_search).
+        shown = self._settings is None or self._offers_personal_search()
         personal_search = [{
             "name": PERSONAL_SEARCH_TOOL,
             "description": "Search your own personal data, which the Infino tools do not: your personal memory, "
@@ -634,7 +639,7 @@ class InfinoMemoryProvider(MemoryProvider):
                 },
                 "required": ["query"],
             },
-        }] if self._offers_personal_search() else []
+        }] if shown else []
         return [
             {
                 "name": "infino_remember",
@@ -734,13 +739,19 @@ class InfinoMemoryProvider(MemoryProvider):
         assert self._backend is not None
         if not self._offers_personal_search() or chat.group:
             return json.dumps({"ok": False, "error": NO_PERSONAL_SEARCH_HERE})
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return json.dumps({"ok": False, "error": "query is empty: give the words to search for"})
         table = str(args.get("table") or tables.CONVERSATIONS)
         if table not in tables.PERSONAL:
             return json.dumps({"ok": False, "error": f"table must be one of {', '.join(tables.PERSONAL)}, "
                                                      f"not {table!r}"})
-        k = max(1, min(int(args.get("k") or PERSONAL_SEARCH_K), MAX_PERSONAL_SEARCH_K))
+        asked_k = args.get("k")
+        k = PERSONAL_SEARCH_K if asked_k is None or asked_k == "" else int(asked_k)
+        k = max(1, min(k, MAX_PERSONAL_SEARCH_K))
+        # Before the search, so a search that fails partway still keeps the session personal.
         privacy.note_personal(self._session_id)
-        rows = self._backend.search_personal(table, str(args["query"]), k)
+        rows = self._backend.search_personal(table, query, k)
         people = self._people()
         if table == tables.MEMORY and people is not None:
             # As recall shows it: the owner's own, not what an earlier version

@@ -14,7 +14,9 @@ from hermes_infino.provider import InfinoMemoryProvider
 
 from .helpers import DM, GROUP, SKILL_MD, fake_embed, in_session, local, local_rows, make_manager, personal_rows, wait_for
 
-TOOLS = ("infino_remember", "infino_forget", "infino_publish_skill")
+# What a provider declares before it starts, which is what Hermes routes by:
+# every tool, the personal search included (it is shown only where offered).
+TOOLS = ("infino_remember", "infino_forget", "infino_publish_skill", "infino_personal_search")
 
 
 def call(mgr, tool: str, **args) -> dict:

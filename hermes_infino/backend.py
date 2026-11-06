@@ -27,7 +27,7 @@ from typing import Any, Optional
 from . import config, embed, privacy, recall, tables
 from .client import InfinoClient
 from .local import PERSONAL_DB_DIR, LocalStore
-from .mirror import PERSONAL_MEMORY, SETTLE_MS, Mirror
+from .mirror import PERSONAL_MEMORY, PERSONAL_SOURCE_PREFIX, SETTLE_MS, Mirror
 
 logger = logging.getLogger(__name__)
 
@@ -318,20 +318,26 @@ class Backend:
     def search_personal(self, table: str, query: str, k: int) -> list[dict]:
         """The `k` best rows of one of the person's own tables for `query`, by
         keyword over each of its full-text columns, best first: from the
-        personal cloud database when there is one (every machine's rows), and
-        from this machine's copy when there is none or it does not answer."""
+        personal cloud database when there is one (every machine's rows), with
+        this machine's rows the cloud does not have yet (written since the
+        last sync), as recall reads memory; from this machine's copy alone
+        when there is no personal database or it does not answer."""
         schema, indexes = tables.PERSONAL_TABLES[table]
         columns = indexes["fts"]
         projection = [f["name"] for f in schema if f["type"] != "embedding"]
+        here = _best([self.personal.keyword_search(table, c, query, k, projection) for c in columns], k)
         s = self.settings
-        if self.mirror is not None and s.personal_database:
-            client = InfinoClient(s.api_key, s.url, timeout=PERSONAL_SEARCH_TIMEOUT_S, retries=0)
-            try:
-                return _best([client.bm25_search(s.personal_database, table, query, field=c, k=k,
-                                                 projection=projection + ["score"]) for c in columns], k)
-            except Exception as e:  # this machine's copy answers instead
-                logger.info("infino: the personal database did not answer a search: %s", e)
-        return _best([self.personal.keyword_search(table, c, query, k, projection) for c in columns], k)
+        if self.mirror is None or not s.personal_database:
+            return here
+        client = InfinoClient(s.api_key, s.url, timeout=PERSONAL_SEARCH_TIMEOUT_S, retries=0)
+        try:
+            cloud = _best([client.bm25_search(s.personal_database, table, query, field=c, k=k,
+                                              projection=projection + ["score"]) for c in columns], k)
+        except Exception as e:  # this machine's copy answers instead
+            logger.info("infino: the personal database did not answer a search: %s", e)
+            return here
+        mark = self.mirror.unsynced_after(PERSONAL_SOURCE_PREFIX + table)
+        return _best([cloud, [r for r in here if recall.past(r, mark)]], k)
 
     def query(self, sql: str, timeout_s: Optional[float] = None) -> list[dict]:
         """SQL over the team's tables: the cloud's when signed in, else local."""
