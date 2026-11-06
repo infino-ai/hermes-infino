@@ -1,6 +1,6 @@
 # Infinite recall for Hermes agents
 
-hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that gives your agents a memory that lasts. It saves four things into Infino: memory, conversations, traces, and skills, including across teams and Hermes fleets. Before each turn it gives the agent the memories that matter for that turn, and the agent can search all history with the Infino tools.
+hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that gives your agents a memory that lasts. It saves four things into Infino: memory, conversations, traces, and skills, including across teams and Hermes fleets. Before each turn it gives the agent the memories that matter for that turn, and the agent can search the team's history with the Infino tools.
 
 By default, everything is kept in a database on your machine using Infino's open source retrieval engine, and nothing leaves your device.
 
@@ -12,11 +12,11 @@ The plugin keeps four tables.
 
 **`memory`** holds everything in Hermes's `MEMORY.md` and `USER.md`, including edits you make by hand, plus whatever the agent saves with `infino_remember`. `infino_forget` deletes a memory, even one a teammate's agent saved.
 
-**`conversations`** logs every message in every session and who sent it. Tool calls and tool results have their own columns. A message stays in the log even after context compression or `/undo` removes it from the session.
+**`conversations`** logs every message of every session a person has with the agent, and who sent it. Tool calls and tool results have their own columns. A message stays in the log even after context compression or `/undo` removes it from the session. Scheduled jobs and subagents add no conversation rows; their model and tool calls are in `traces`.
 
 **`traces`** records every model call (model, provider, tokens, time) and every tool call (name, arguments, result, status, time). Secrets are masked the same way Hermes masks them for any memory plugin.
 
-**`skills`** holds the skills your agents share with `infino_publish_skill`. Once you sign in, every profile on the team can use them as read-only `infino:<name>` skills. Only a profile's owner can publish, and secrets are masked first. Set `INFINO_TEAM_SKILLS=off` to keep a profile to its own skills.
+**`skills`** holds the skills your agents share with `infino_publish_skill`. Once you sign in, every profile on the team can use them as read-only `infino:<name>` skills. Members of a group chat can't publish, and secrets are masked first. Set `INFINO_TEAM_SKILLS=off` to keep a profile to its own skills.
 
 A turn and its traces share a `session_id` and a `turn_id`, so you can join them. Every row has a `row_id`.
 
@@ -53,7 +53,7 @@ flowchart LR
 | **Infino Cloud** | Infino's object storage. Each database has its own prefix, and its server gets a short-lived credential for that prefix only. | AES-256 at rest, with keys the cloud provider manages. Server disk caches are encrypted too. |
 | **Your own bucket** | An S3, Google Cloud Storage or Azure Blob Storage bucket in your account ([bring your own bucket](https://infino.ai/docs/cloud/bring-your-own-bucket)). Infino reaches it through an identity you grant and can revoke. | However your bucket is encrypted. With [customer-managed keys](https://infino.ai/docs/cloud/customer-managed-keys) (CMEK), it's a key you own in AWS KMS, Google Cloud KMS or Azure Key Vault. Revoke the key, and Infino can no longer read the data. |
 
-Your own bucket and key are turned on per account. Create the team database in your bucket first (the bring-your-own-bucket guide shows how), then [sign in](#signing-in) and name it with `--team-database`. Your personal database can live in your bucket too.
+Your own bucket and key are turned on per account. Create the team database in your bucket first (the bring-your-own-bucket guide shows how), then [sign in](#signing-in) and name it with `--team-database`. To keep your personal database in your bucket too, create it there and sign in with `--personal-database`.
 
 Infino Cloud is SOC 2 Type II. The report is available on request at [infino.ai/talk](https://infino.ai/talk).
 
@@ -65,7 +65,7 @@ Once you sign in:
 
 - Every row is still written to your machine first. It reaches the cloud a few seconds later, and Hermes sends whatever is left before it exits.
 - If the cloud is down, nothing is lost. The sync picks up where it stopped.
-- A row the cloud refuses stays on your machine. `hermes infino status` lists it, and shows how far behind the cloud is.
+- A row the cloud refuses stays on your machine. `hermes infino status` counts them, names the file that lists them, and shows how far behind the cloud is.
 - Forgetting a memory deletes it from the cloud too.
 - The cloud embeds memories itself, so your machine stops embedding them.
 - Recall reads the cloud first and adds the rows the cloud doesn't have yet. If the cloud is slow or can't be reached, recall searches your machine by keyword.
@@ -142,7 +142,7 @@ A memory belongs to the team unless it's about one person. Nobody has to label i
 | Hermes's `MEMORY.md` | Hermes's `USER.md` |
 | `infino_remember`, by default | `infino_remember`, when the agent marks it personal |
 
-Personal memory lives in its own database. The Infino tools never open it, so no other agent and no chat can read it. On your machine it's in `$HERMES_HOME/infino/personal`, and once you sign in it's in your personal database too. It never goes to the team database. When the agent saves a personal memory, `conversations` and `traces` record the tool call without the memory's text.
+Personal memory lives in its own database. On your machine it's in `$HERMES_HOME/infino/personal`, and once you sign in it's in your personal database too. It never goes to the team database. When the agent saves a personal memory, `conversations` and `traces` record the tool call without the memory's text.
 
 `conversations` keeps every message as it was written, including anything personal said in it. To keep a whole conversation out of the team database, [mark the work personal](#keeping-work-personal).
 
