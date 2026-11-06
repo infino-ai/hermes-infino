@@ -23,7 +23,10 @@ instead of the team's, when:
   mirrors a delivered job's output into the chat's transcript, labelled with
   the job's name, and what follows in that chat is about it. The session
   stays personal from then on, even once compaction has dropped the label
-  (the backend sees that its earlier turns were kept personal).
+  (the backend sees that its earlier turns were kept personal);
+- a personal job's output was posted into a group chat (`deliver: room:<id>`):
+  Hermes shows the post in a member's turn, labelled with the job's name. The
+  member's own profile has to list the job.
 
 Everything else stays the team's, as before. Which job a run belongs to is
 Hermes's to say (`cron.execution_identity`); a job is named by its id or its
@@ -50,6 +53,14 @@ TEXT_FIELDS = ("content", "old_text", "new_text")
 # job named by its name, or its id when it has none.
 DELIVERY_PREFIX = "[Cron delivery: "
 DELIVERY_SUFFIX = "]"
+# How Hermes shows a scheduled job's output posted into a group chat
+# (`deliver: room:<id>`) in a member's turn: a line of its own,
+# `Scheduled job "<job>" (automated post, not the user): <output>`, the job
+# named by its name, or its id when it has none. A person's or a member's
+# message keeps its own newlines, so a later line of one can begin with the
+# label too; that only ever makes the session personal, never the team's.
+ROOM_DELIVERY_PREFIX = 'Scheduled job "'
+ROOM_DELIVERY_MARK = '" (automated post, not the user):'
 # A cron run's session id when Hermes's scheduler names it: cron_<job id>_<date>_<time>.
 CRON_SESSION = re.compile(r"^cron_(.+)_\d{8}_\d{6}$")
 # Hermes's record of the scheduled job the running code belongs to. Read only
@@ -141,8 +152,10 @@ def _job_ref(ref: str) -> tuple[str, str]:
 
 def delivered_jobs(messages: Iterable[dict]) -> list[str]:
     """The jobs (as their labels name them) whose output Hermes delivered into
-    these messages. A label may begin any line: Hermes merges consecutive user
-    messages, so a delivery can share one with what the person wrote next."""
+    these messages: mirrored into a chat, or posted into a group chat. A label
+    may begin any line: Hermes merges consecutive user messages, so a delivery
+    can share one with what the person wrote next, and a group chat member's
+    turn lists the room's new messages one per line."""
     found = []
     for m in messages or ():
         if not isinstance(m, dict) or m.get("role") != "user":
@@ -151,6 +164,8 @@ def delivered_jobs(messages: Iterable[dict]) -> list[str]:
             line = line.strip()
             if line.startswith(DELIVERY_PREFIX) and line.endswith(DELIVERY_SUFFIX):
                 found.append(line[len(DELIVERY_PREFIX):-len(DELIVERY_SUFFIX)].strip())
+            elif line.startswith(ROOM_DELIVERY_PREFIX) and ROOM_DELIVERY_MARK in line:
+                found.append(line[len(ROOM_DELIVERY_PREFIX):line.index(ROOM_DELIVERY_MARK)].strip())
     return found
 
 

@@ -59,8 +59,10 @@ Conversations and traces belong to the team, so every agent on the team can see 
 
 | Setting | What becomes personal |
 | --- | --- |
-| `INFINO_PERSONAL_JOBS=email-digest,weekly-finances` | Each run of those scheduled jobs (named by name or id, as `hermes cron list` shows them): every model call and tool call on the way to the output, and the subagents it starts. And the chat its output is delivered into: when Hermes puts the output in the chat's history (`attach_to_session`, `cron.mirror_delivery`, or a continuable thread), that chat's conversation and traces are personal from then on. |
+| `INFINO_PERSONAL_JOBS=email-digest,weekly-finances` | Each run of those scheduled jobs (named by name or id, as `hermes cron list` shows them): every model call and tool call on the way to the output, and the subagents it starts. And the chat its output is delivered into: when Hermes puts the output in the chat's history (`attach_to_session`, `cron.mirror_delivery`, or a continuable thread), or posts it into a group chat (`deliver: room:<id>`), that chat's conversation and traces are personal from then on. |
 | `INFINO_PERSONAL_PROFILE=on` | Every conversation and trace of the profile. |
+
+In a group chat, each member's turn runs as that member's own profile, maybe on another installation, and reads the setting from there. List the job on every member's profile, or once for the team through Remote Config (see [Fleets](#fleets-settings-from-config-or-remote-config)). A member whose profile does not list the job writes the post, and its answer, to the team. Hermes also trims a member's turn to its newest messages: after several long replies, a member can see a reply that quotes the job's output without the job's own post, and that turn goes to the team.
 
 The job itself can still be shared: a skill a personal job uses is the team's like any other skill. What the job reads and writes stays with you. Memory keeps its own rule (team unless it is about one person), whatever the setting.
 
@@ -128,7 +130,7 @@ hermes config set tools.tool_search.enabled off
 These steps were run as written on a fresh machine with Hermes's own installer.
 
 **Before you start:**
-- Hermes, installed with its installer: `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`.
+- Hermes, installed with its installer: `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`. The plugin is tested on Hermes 0.22.6, 0.22.7 and 0.23.0.
 - Access to the two private repositories, `infino-ai/hermes-infino` and `infino-ai/ask-bench`. Hermes clones the plugin with your GitHub sign-in: run `gh auth login` first, or put `GITHUB_TOKEN=<a token that can read the repos>` in `~/.hermes/.env`.
 
 **1. Build the Infino client.** It needs Node.js 22.19 or newer; Hermes's installer already put one in `~/.hermes/tools/`.
@@ -199,7 +201,7 @@ mcp_servers:
     connect_timeout: 120
 ```
 
-With Hermes's [Remote Config](https://github.com/NousResearch/hermes-agent/pull/122509) (on Hermes's main branch, not yet in a release), the same keys come from the config service instead of a file, so an administrator sets the team database once, at the team (group) level, and every agent on the team starts with it. Remote Config refuses a key written out in full, so `INFINO_API_KEY` stays a `${INFINO_API_KEY}` reference, and the key goes in each profile's `.env`. `hermes infino status` says where the settings came from ("from the config").
+With Hermes's [Remote Config](https://github.com/NousResearch/hermes-agent/pull/122509) (in Hermes 0.22.6 and later, turned on with `HERMES_CONFIG_BACKEND=remote`), the same keys come from the config service instead of a file, so an administrator sets the team database once, at the team (group) level, and every agent on the team starts with it. Remote Config refuses a key written out in full, so `INFINO_API_KEY` stays a `${INFINO_API_KEY}` reference, and the key goes in each profile's `.env`. `hermes infino status` says where the settings came from ("from the config").
 
 ```mermaid
 flowchart LR

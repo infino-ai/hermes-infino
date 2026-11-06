@@ -192,6 +192,88 @@ def test_a_delivered_chats_traces_are_personal(chat, tmp_path):
     assert texts(local(tmp_path), tables.TRACES) == []
 
 
+def room_turn(job_name: str, output: str) -> str:
+    """A group chat member's turn prompt, as Hermes builds one when a scheduled
+    job posts its output into the room (`deliver: room:<id>`)."""
+    return "\n".join([
+        '[Discussion: "Family"] You are @helper, one participant with @planner and the user.', "",
+        "New messages in this thread since your last turn (oldest first):",
+        f'  Scheduled job "{job_name}" (automated post, not the user): {output}',
+        "  User (user): Can you draft the reply?", "",
+        "Rules for this Discussion:",
+        "- Reply with one conversational message only when you have something new worth adding."])
+
+
+def test_a_group_chat_a_personal_jobs_output_was_posted_into_is_personal(chat, tmp_path):
+    _, p = chat
+    prompt = room_turn(DIGEST["name"], TRIAGE)
+    p.sync_turn(prompt, "Drafted a reply to Dr. Lee.", session_id="room-1",
+                messages=turn(prompt, "Drafted a reply to Dr. Lee."))
+    p._drain()
+    assert texts(local(tmp_path), tables.CONVERSATIONS) == []
+    assert len(texts(personal(tmp_path), tables.CONVERSATIONS)) == 2
+
+
+def test_a_group_chat_a_team_jobs_output_was_posted_into_stays_the_teams(chat, tmp_path):
+    _, p = chat
+    prompt = room_turn(REPORT["name"], "12 deploys this week.")
+    p.sync_turn(prompt, "The Tuesday deploy failed.", session_id="room-1",
+                messages=turn(prompt, "The Tuesday deploy failed."))
+    p._drain()
+    assert len(texts(local(tmp_path), tables.CONVERSATIONS)) == 2
+    assert texts(personal(tmp_path), tables.CONVERSATIONS) == []
+
+
+def hermes_room_turn(tmp_path, job: dict, output: str) -> str:
+    """The turn prompt Hermes itself builds for a group chat member that a
+    scheduled job's post @mentions: the room store, the job's post and the
+    Discussion planner are Hermes's own (in Hermes 0.23 and later)."""
+    hosted_rooms = pytest.importorskip("gateway.hosted_rooms")
+    room_context = pytest.importorskip("gateway.hosted_room_context")
+    discussion = pytest.importorskip("gateway.hosted_room_discussion")
+    members = [{"member_id": "member-helper", "profile": "helper", "handle": "helper"},
+               {"member_id": "member-planner", "profile": "planner", "handle": "planner"}]
+    db = tmp_path / "rooms.db"
+    hosted_rooms.create_room(db, room_id="room-family", name="Family", members=members,
+                             authority_gateway_id=hosted_rooms.local_authority_gateway_id(), now=1)
+    room_context.post_scheduled_message(db, room_id="room-family", job_id=job["id"], job_name=job["name"],
+                                        run_key="run-1", text=f"@helper {output}")
+    room = hosted_rooms.room_state(db, room_id="room-family")
+    room["members"] = members
+    events = hosted_rooms.read_events(db, room_id="room-family", limit=hosted_rooms.MAX_LOG_LIMIT)["events"]
+    task = discussion.plan_next_task(room, events, local_profiles=("helper", "planner")).task
+    return task.payload["prompt"]
+
+
+@pytest.mark.parametrize("job, personal_rows, team_rows", [(DIGEST, 2, 0), (REPORT, 0, 2)])
+def test_a_group_chat_post_as_hermes_builds_it_follows_the_job(chat, tmp_path, job, personal_rows, team_rows):
+    _, p = chat
+    prompt = hermes_room_turn(tmp_path, job, TRIAGE)
+    p.sync_turn(prompt, "Drafted a reply to Dr. Lee.", session_id="room-1",
+                messages=turn(prompt, "Drafted a reply to Dr. Lee."))
+    p._drain()
+    assert len(texts(personal(tmp_path), tables.CONVERSATIONS)) == personal_rows
+    assert len(texts(local(tmp_path), tables.CONVERSATIONS)) == team_rows
+
+
+def test_a_group_chat_member_whose_profile_does_not_list_the_job_writes_to_the_team(home, tmp_path, monkeypatch):
+    """The setting is read per profile: a member's turn runs as its own profile,
+    and this one does not list the job."""
+    in_session(monkeypatch, DM)
+    _, p = make_manager(tmp_path, platform="telegram", session_id="room-1")
+    prompt = hermes_room_turn(tmp_path, DIGEST, TRIAGE)
+    p.sync_turn(prompt, "Drafted a reply to Dr. Lee.", session_id="room-1",
+                messages=turn(prompt, "Drafted a reply to Dr. Lee."))
+    p._drain()
+    assert texts(personal(tmp_path), tables.CONVERSATIONS) == []
+    assert len(texts(local(tmp_path), tables.CONVERSATIONS)) == 2
+
+
+def test_a_person_quoting_a_room_label_mid_line_names_no_job():
+    said = 'User (user): it printed Scheduled job "email-digest" (automated post, not the user): hi'
+    assert privacy.delivered_jobs([{"role": "user", "content": said}]) == []
+
+
 def test_a_chat_a_team_jobs_output_was_delivered_into_stays_the_teams(chat, tmp_path):
     _, p = chat
     messages = [{"role": "user", "content": "[Cron delivery: weekly-report]\n12 deploys this week."}] + turn(
