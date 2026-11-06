@@ -61,15 +61,9 @@ Infino Cloud is SOC 2 Type II, and the report is available on request at [infino
 
 ### How your machine and the cloud stay in sync
 
-```mermaid
-flowchart LR
-  H[Hermes] -- every write --> L[(Local database<br/>on your machine)]
-  L -- "sync: a few seconds after each write,<br/>and before Hermes exits<br/>(only after you sign in)" --> C[(Team database<br/>in Infino Cloud)]
-```
-
 Without an account, everything is stored under `$HERMES_HOME/infino/` and nothing leaves your machine. Each memory is embedded locally with all-MiniLM-L6-v2 (384 dimensions), and recall uses keyword and vector search together. If the model is still loading, or couldn't be downloaded, recall uses keyword search alone.
 
-Once you sign in, every row is still written to your machine first, and a sync sends it on to the cloud:
+Once you sign in, every row is still written to your machine first, and a sync sends it on to the cloud a few seconds after each write, and once more before Hermes exits:
 
 - Rows go up in the order they were saved, and the sync picks up where it left off. If the cloud is down, nothing is lost. If an upload is cut off partway, the batch is checked against the cloud before it's sent again.
 - If the cloud refuses a row outright, the row stays on your machine and `hermes infino status` lists it. `status` also shows how far behind the cloud is and, if the sync stopped, why.
@@ -148,13 +142,6 @@ A memory belongs to the team unless it's about one person. Nobody has to label i
 | Decisions, conventions, fixes, who owns what, how things are set up | A person's preferences, credentials, schedule and private matters |
 | Hermes's `MEMORY.md` | Hermes's `USER.md` |
 | `infino_remember`, by default | `infino_remember`, when the agent marks it personal |
-
-```mermaid
-flowchart TD
-  W[New memory] --> Q{Is it about<br/>one person?}
-  Q -- no --> T[(Team database<br/>every agent on the team can read it)]
-  Q -- yes --> P[(Personal database<br/>only your own recall reads it)]
-```
 
 Personal memory lives in a database of its own, and the Infino tools never open it, so no other agent and no chat can read it. On your machine it's in `$HERMES_HOME/infino/personal`. When you sign in, it goes to your personal database (`--personal-database`), or stays on your machine if you don't have one. Either way, it never reaches the team database. When the agent saves a personal memory, the tool call still shows up in `conversations` and `traces`, but without the memory's text.
 
@@ -237,16 +224,6 @@ mcp_servers:
 ```
 
 With Hermes's [Remote Config](https://github.com/NousResearch/hermes-agent/pull/122509) (Hermes 0.22.6 and later, turned on with `HERMES_CONFIG_BACKEND=remote`), the same keys come from the config service instead of a file. An administrator sets the team database once, at the team (group) level, and every agent on the team starts with it. Remote Config refuses a key written out in full, so leave `INFINO_API_KEY` as a `${INFINO_API_KEY}` reference and put the key itself in each profile's `.env`. `hermes infino status` tells you where the settings came from ("from the config").
-
-```mermaid
-flowchart LR
-  RC[Remote Config<br/>team level] -- "memory.provider: infino<br/>mcp_servers.infino.env" --> A[Each agent's Hermes]
-  ENV[".env: INFINO_API_KEY"] -- "resolves ${INFINO_API_KEY}" --> A
-  A --> P[hermes-infino]
-  A --> C[Infino tools]
-  P --> T[(Team database)]
-  C --> T
-```
 
 ## Settings
 
