@@ -8,7 +8,7 @@ However, with an Infino account, your team shares a database in Infino Cloud, so
 
 In Infino Cloud, your data lives on object storage, either Infino's or a bucket in your own AWS, Google Cloud or Azure account, and you can encrypt your bucket with a key you own (CMEK). See [Where your data lives](#where-your-data-lives).
 
-## What it saves
+## What it stores
 
 The plugin keeps four tables.
 
