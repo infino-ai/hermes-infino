@@ -4,9 +4,9 @@ A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that store
 
 It saves four things: memory, conversations, traces, and skills, including across teams and Hermes fleets. Before each turn it gives the agent the memories that matter for that turn. The agent can also search all history with the Infino tools.
 
-You don't need an Infino account. Without one, everything is kept in a database on your machine, and nothing leaves it.
+By default, everything is kept in a database on your machine using Infino's open source retrieval engine, and nothing leaves your device. 
 
-With an Infino account, your team shares a database in Infino Cloud, so every agent on the team can search what the others did. `hermes infino login` creates a free account on a platform that gives them out, or joins your team's with a key a teammate gives you. From then on, the plugin uploads what it has kept on your machine so far, then each new memory, conversation, trace and skill as it happens. Your machine keeps its own copy. Personal memory, and the conversations and traces of work you mark personal, never go to the team database.
+However, with an Infino account, your team shares a database in Infino Cloud, so every agent on the team can search what the others did. `hermes infino login` creates a free account on a platform that gives them out, or joins your team's with a key a teammate gives you. From then on, the plugin uploads what it has kept on your machine so far, then each new memory, conversation, trace and skill as it happens. Your machine keeps its own copy. Personal memory, and the conversations and traces of work you mark personal, never go to the team database.
 
 Infino Cloud is SOC 2 Type II. It keeps every database on object storage: Infino's, or a bucket in your own AWS, Google Cloud or Azure account, which you can encrypt with a key you own (CMEK). See [How Infino stores your data](#how-infino-stores-your-data).
 
