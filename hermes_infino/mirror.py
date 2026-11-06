@@ -25,9 +25,13 @@ table gets this machine's rows. A teammate's `infino_forget` deletes rows of
 this machine from the cloud too, so a table counts as lost only when none of
 the last LOST_CHECK_ROWS rows pushed, nor the first, is in the cloud.
 
-Nothing is pushed until the cloud tables are right (`tables.ensure_all`): a
-database whose tables lack a column this version writes, and cannot be given
-it, gets no rows, and the sync says why.
+Nothing is pushed to a cloud database until its tables are right
+(`tables.ensure_all`): a database whose tables lack a column this version
+writes, and cannot be given it, or that cannot be made or reached at all (a
+key limited to other databases, a personal database out of reach, a plan's
+cap on databases), gets no rows, and the sync says why. Each database is
+apart: one that is not right holds up only its own sources, never the other
+database's, nor the forgets to it.
 
 A batch whose append was never answered may still have reached the cloud (a
 timeout after the platform committed it, or a process killed mid-append). A
@@ -50,8 +54,11 @@ after each sync's pushes: by id, so a memory saved again later is never
 deleted with it, and after the pushes, so a row pushed while it was being
 deleted is deleted too. A forget the cloud could not be asked about at the
 time (no answer) is queued as its match instead, bounded by `stored_ms` so a
-memory saved again later is still kept. The queue's lock is held only to
-read and rewrite the file, never across a request to the cloud.
+memory saved again later is still kept. Each queued forget is applied on its
+own: one the cloud fails stays queued for the next sync without holding up
+the ones after it, and one whose database or table no longer exists is
+dropped, there being nothing left there to delete. The queue's lock is held
+only to read and rewrite the file, never across a request to the cloud.
 
 One sync runs at a time per profile (a file lock); the others skip.
 """
@@ -82,6 +89,9 @@ REFUSED_FILE = "refused.jsonl"
 # large, unprocessable. Anything else (auth, busy, down) is the sync's failure.
 BAD_REQUEST = 400
 REFUSED_STATUSES = (BAD_REQUEST, 413, 422)
+# A delete's answer when its database or table no longer exists (never made,
+# dropped, or being purged): nothing is left there to delete.
+GONE_STATUSES = (404, 410)
 # Rows stored this recently are left for the next sync (another process may
 # still be committing a row stamped just before them).
 SETTLE_MS = 2_000
@@ -141,11 +151,12 @@ class Mirror:
         self.personal = personal
         self.client = client or InfinoClient(settings.api_key, settings.url)
         self.dir = config.state_dir(settings.home)
-        # Whether the cloud tables are right (ensure_cloud_tables), and when
-        # and why the last attempt failed.
-        self._tables_ready = False
+        # The cloud databases whose tables are right (ensure_cloud_tables);
+        # why each of the others failed its last attempt, and when the last
+        # failed attempt was.
+        self._tables_ready: set[str] = set()
+        self._tables_errors: dict[str, Exception] = {}
         self._tables_failed_at = 0.0
-        self._tables_error: Optional[Exception] = None
 
     # -- where rows go -------------------------------------------------------
 
@@ -162,38 +173,71 @@ class Mirror:
                     for name, table in PERSONAL_SOURCES.items()]
         return out
 
+    def databases(self) -> list[tuple[str, bool]]:
+        """Each cloud database rows go to, with whether it is the person's own."""
+        out = [(self.settings.team_database, False)]
+        if self.settings.personal_database:
+            out.append((self.settings.personal_database, True))
+        return out
+
     def ensure_cloud_tables(self) -> None:
-        try:
-            tables.ensure_all(self.client, self.settings.team_database)
-            if self.settings.personal_database:
-                tables.ensure_all(self.client, self.settings.personal_database, personal=True)
-            self._drop_lost_marks()
-        except Exception as e:
-            self._tables_failed_at, self._tables_error = time.monotonic(), e
-            raise
-        self._tables_ready, self._tables_error = True, None
+        """Make each cloud database's tables right, each on its own (see
+        `_ensure`); the first failure is raised once every one was tried."""
+        failures = self._ensure(self.databases())
+        if failures:
+            raise next(iter(failures.values()))
 
-    def _ensure_before_push(self) -> None:
-        """Make the cloud tables right before a sync pushes anything; while
-        they cannot be, the sync stops with why (retried every ENSURE_RETRY_S)."""
-        if self._tables_ready:
-            return
-        if self._tables_error is not None and time.monotonic() - self._tables_failed_at < ENSURE_RETRY_S:
-            raise self._tables_error
-        self.ensure_cloud_tables()
+    def _ensure(self, databases: list[tuple[str, bool]]) -> dict[str, Exception]:
+        """Make the tables of each of `databases` right (`tables.ensure_all`),
+        and drop the marks of its tables that lost this machine's rows; the
+        databases that could not be made right, with why. Each is apart: one
+        that cannot be (a key limited to other databases, a personal
+        database out of reach, a plan's cap) holds up only its own sources."""
+        failures: dict[str, Exception] = {}
+        for database, personal in databases:
+            try:
+                tables.ensure_all(self.client, database, personal=personal)
+                self._drop_lost_marks(database)
+            except Exception as e:
+                logger.warning("infino: nothing goes to %s until its tables are right (tried again in %d s): %s",
+                               database, ENSURE_RETRY_S, e)
+                failures[database] = e
+                continue
+            self._tables_ready.add(database)
+            self._tables_errors.pop(database, None)
+        if failures:
+            self._tables_ready -= set(failures)
+            self._tables_errors.update(failures)
+            self._tables_failed_at = time.monotonic()
+        return failures
 
-    def _drop_lost_marks(self) -> None:
-        """Forget each mark whose cloud table has lost this machine's rows:
-        none of the latest LOST_CHECK_ROWS rows pushed, nor the oldest, is in
-        the cloud, while this machine still has the row the mark points at.
-        Many rows, pushed at different times, keep a teammate's forget of a
-        few of them, or a cloud slow to show the newest, from looking like a
-        dropped table."""
+    def _ensure_before_push(self) -> dict[str, Exception]:
+        """Make the cloud tables right before a sync pushes anything; the
+        databases whose tables are not, each with why. Their sources wait,
+        and the other database's go on; one that failed is tried again once
+        ENSURE_RETRY_S has passed."""
+        retry = time.monotonic() - self._tables_failed_at >= ENSURE_RETRY_S
+        due = [(database, personal) for database, personal in self.databases()
+               if database not in self._tables_ready and (retry or database not in self._tables_errors)]
+        if due:
+            self._ensure(due)
+        return {database: self._tables_errors[database] for database, _ in self.databases()
+                if database not in self._tables_ready}
+
+    def _drop_lost_marks(self, database: str) -> None:
+        """Forget each mark of `database` whose cloud table has lost this
+        machine's rows: none of the latest LOST_CHECK_ROWS rows pushed, nor
+        the oldest, is in the cloud, while this machine still has the row the
+        mark points at. Many rows, pushed at different times, keep a
+        teammate's forget of a few of them, or a cloud slow to show the
+        newest, from looking like a dropped table."""
         with self._lock(wait=True):
             state = self._state()
             marks = self.marks()
             lost = []
             for src in self.sources():
+                if src.database != database:
+                    continue
                 mark = marks.get(src.mark)
                 if mark is None or not src.store.has_row(src.table, mark[1]):
                     continue
@@ -208,7 +252,7 @@ class Mirror:
             if lost:
                 logger.info("infino: the cloud lost %s; pushing this machine's rows again", ", ".join(lost))
                 self._save_state({k: v for k, v in marks.items() if k not in lost},
-                                 str(state.get("last_error") or ""), state.get("in_flight") or [],
+                                 str(state.get("last_error") or ""), self._in_flight(state),
                                  {k: v for k, v in self._rechecks(state).items() if k not in lost})
 
     # -- state ---------------------------------------------------------------
@@ -256,6 +300,15 @@ class Mirror:
                                    "recheck": {t: list(m) for t, m in (recheck or {}).items()}, "at_ms": _now_ms()}))
         os.replace(tmp, path)
 
+    def _in_flight(self, state: dict) -> list[str]:
+        """The sources whose last append was never answered: that batch may
+        have reached the cloud. A state from before `in_flight` was kept only
+        says whether the last sync stopped, and then every source is."""
+        in_flight = state.get("in_flight")
+        if in_flight is None:
+            return [s.mark for s in self.sources()] if state.get("last_error") else []
+        return list(in_flight)
+
     def _rechecks(self, state: dict) -> dict[str, tuple[int, str]]:
         raw = state.get("recheck")
         return {k: (int(v[0]), str(v[1])) for k, v in raw.items() if v} if isinstance(raw, dict) else {}
@@ -282,34 +335,26 @@ class Mirror:
 
         A source the cloud fails on stops at the last batch it accepted, and
         the others go on; so do the forgets. The first failure is raised
-        after them, recorded as `last_error`. Nothing is pushed while the
-        cloud tables are not right (`_ensure_before_push`)."""
-        try:
-            self._ensure_before_push()
-        except Exception as e:
-            with self._lock(wait=False) as held:  # recorded for `hermes infino status` unless another sync runs
-                if held:
-                    state = self._state()
-                    self._save_state(self.marks(), f"{type(e).__name__}: {e}", state.get("in_flight") or [],
-                                     self._rechecks(state))
-            raise
+        after them, recorded as `last_error`. Nothing is pushed to a database
+        whose tables are not right (`_ensure_before_push`): its sources, and
+        the forgets queued for it, wait, and that is the first failure."""
+        waiting = self._ensure_before_push()
         with self._lock(wait) as held:
             if not held:
                 return {}
             state = self._state()
             marks = self.marks()
-            # Sources whose last append was never answered: that batch may have
-            # reached the cloud. A state from before `in_flight` was kept only
-            # says the last sync stopped, so every source is checked.
-            unsure = set(state.get("in_flight") or ([s.mark for s in self.sources()] if state.get("last_error") else []))
+            unsure = set(self._in_flight(state))
             recheck = self._rechecks(state)
             for mark, upto in self._take_late_commits(marks).items():
                 recheck[mark] = max(recheck.get(mark, upto), upto)
             until = _now_ms() - SETTLE_MS
             pushed: dict[str, int] = {}
-            failure: Optional[Exception] = None
+            failure: Optional[Exception] = next(iter(waiting.values()), None)
             for src in self.sources():
                 pushed[src.mark] = 0
+                if src.database in waiting:
+                    continue  # its rows stay here, and its mark where it is, until its tables are right
                 check = src.mark in unsure
                 try:
                     while True:
@@ -340,7 +385,7 @@ class Mirror:
                     continue
                 unsure.discard(src.mark)
             try:
-                self._apply_forgets()
+                self._apply_forgets(frozenset(waiting))
             except Exception as e:
                 failure = failure or e
             if failure is not None:
@@ -456,8 +501,14 @@ class Mirror:
             f.write(line)
             fcntl.flock(f, fcntl.LOCK_UN)
 
-    def _apply_forgets(self) -> None:
-        """Apply the queued deletes, then take the applied ones off the queue.
+    def _apply_forgets(self, waiting: frozenset[str] = frozenset()) -> None:
+        """Apply the queued deletes, each on its own, then take the applied
+        ones off the queue. One the cloud fails stays queued for the next
+        sync, and holds up none after it (the first failure is raised after
+        them all); one whose database or table no longer exists is taken off
+        too, there being nothing left there to delete. One for a database in
+        `waiting` (its tables are not right) stays queued, unasked.
+
         The lock is held only to read and to rewrite the file: a forget made
         meanwhile queues without waiting on the cloud, and stays queued."""
         path = self.dir / FORGET_FILE
@@ -468,16 +519,23 @@ class Mirror:
             lines = [line for line in f if line.strip()]
             fcntl.flock(f, fcntl.LOCK_UN)
         applied: list[str] = []
+        failure: Optional[Exception] = None
         try:
             for line in lines:
-                e = json.loads(line)
-                if e.get("predicate"):
-                    self.client.delete(e["database"], e["table"], e["predicate"])
-                else:
-                    ids = list(e["row_ids"])
-                    for start in range(0, len(ids), FORGET_BATCH):
-                        chunk = ", ".join(tables.sql_string(i) for i in ids[start:start + FORGET_BATCH])
-                        self.client.delete(e["database"], e["table"], f"{tables.ROW_ID} IN ({chunk})")
+                try:
+                    entry = json.loads(line)
+                    if entry["database"] in waiting:
+                        continue
+                    self._delete(entry)
+                except InfinoError as e:
+                    if e.status not in GONE_STATUSES:
+                        failure = failure or e
+                        continue
+                    logger.info("infino: a queued forget's %s.%s no longer exists; nothing is left there to "
+                                "delete: %s", entry["database"], entry["table"], e)
+                except Exception as e:  # stays queued for the next sync
+                    failure = failure or e
+                    continue
                 applied.append(line)
         finally:
             if applied:
@@ -491,3 +549,16 @@ class Mirror:
                     f.truncate()
                     f.writelines(current)
                     fcntl.flock(f, fcntl.LOCK_UN)
+        if failure is not None:
+            raise failure
+
+    def _delete(self, entry: dict) -> None:
+        """Delete in the cloud what one queued forget names: the rows matching
+        its predicate, or its rows by id, FORGET_BATCH ids per request."""
+        if entry.get("predicate"):
+            self.client.delete(entry["database"], entry["table"], entry["predicate"])
+            return
+        ids = list(entry["row_ids"])
+        for start in range(0, len(ids), FORGET_BATCH):
+            chunk = ", ".join(tables.sql_string(i) for i in ids[start:start + FORGET_BATCH])
+            self.client.delete(entry["database"], entry["table"], f"{tables.ROW_ID} IN ({chunk})")

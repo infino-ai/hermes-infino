@@ -3,7 +3,9 @@
 It keeps rows in memory and answers the routes the plugin calls, with the
 same status codes the platform documents (409 with Retry-After on a busy
 table, 400 for a hybrid search the deployment cannot embed, 403 for an
-embedding column an account cannot have). Search is a naive keyword match:
+embedding column an account cannot have, 400 for one a deployment with no
+embedding server cannot, 404 for a delete in a database or table that does
+not exist). Search is a naive keyword match:
 these tests check the plugin's logic, not ranking. The real platform is
 exercised by the end-to-end test on a Hermes install.
 """
@@ -16,6 +18,12 @@ import sqlite3
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# What the platform answers (400) for a create_table declaring an embedding
+# column on a deployment with no embedding server: the embedding library's
+# words for a JSON schema field, which the worker passes through.
+NO_EMBEDDING_SERVER = ('schema field "embedding" of type "embedding" needs an embedding server, and this '
+                       'deployment has none configured')
 
 
 class FakePlatform:
@@ -32,8 +40,10 @@ class FakePlatform:
         self.refused_marker = None     # an append carrying a row with this text answers refused_status
         self.refused_status = 400
         self.no_embedder = False       # create_table refuses embedding columns with 403
+        self.no_embedding_server = False  # create_table refuses embedding columns with 400 (none deployed)
         self.schema_patch_refused = False  # a schema patch (adding a column) answers 403
         self.database_limit = None     # like a free plan: creates past this count answer 403
+        self.refused_databases: set[str] = set()  # creating one of these answers 403 (a key for other databases)
         self.trial_status = None       # /v1/trial answers this status (501: no free accounts; 409: one per network)
         self.trial_without_key = False  # /v1/trial answers 200 with no api_key
         self.valid_keys = None         # a set: any other bearer key answers 401
@@ -115,11 +125,15 @@ class FakePlatform:
             # The platform checks the plan's limit before the name.
             if self.database_limit is not None and len(self.databases) >= self.database_limit:
                 return 403, {"error": "free plan database limit reached"}, None
+            if body["name"] in self.refused_databases:
+                return 403, {"error": f"this key may not create database {body['name']}"}, None
             if body["name"] in self.databases:
                 return 409, {"error": "exists"}, None
             self.databases[body["name"]] = {}
             return 200, {}, None
         op, db = parts[1], urllib.parse.unquote(parts[2])
+        if op == "delete" and params["table"] not in self.databases.get(db, {}):
+            return 404, {"error": f"no table {params['table']} in database {db}"}, None
         tables = self.databases.setdefault(db, {})
         if op == "list_tables":
             return 200, list(tables), None
@@ -136,6 +150,8 @@ class FakePlatform:
                 return 409, {"error": "exists"}, None
             if self.no_embedder and any(f["type"] == "embedding" for f in body["schema"]):
                 return 403, {"error": "embedding columns are not enabled for this account"}, None
+            if self.no_embedding_server and any(f["type"] == "embedding" for f in body["schema"]):
+                return 400, {"error": NO_EMBEDDING_SERVER}, None
             types = {f["name"]: f["type"] for f in body["schema"]}
             for column in (body.get("indexes") or {}).get("fts", []):
                 if types.get(column) != "large_utf8":  # the platform's rule for FTS columns

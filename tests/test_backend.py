@@ -9,11 +9,20 @@ import pytest
 
 from hermes_infino import backend, config, embed, mirror, recall, tables
 from hermes_infino.backend import Backend
+from hermes_infino.client import InfinoError
 
 from .helpers import TEAM_DB, fake_embed, personal_rows, sign_in, wait_for
 
 # How long the stand-in sync below takes after it has read its rows.
 SLOW_SYNC_S = 0.5
+# The first wait before a failed sync is tried again, short enough for a test.
+QUICK_RETRY_S = 0.1
+# Appends the platform fails in a row before it accepts one.
+FAILURES_IN_A_ROW = 2
+# How long after a write its sync waits, in the test of a replaced backend:
+# long enough that the settings change while the old one's sync is pending.
+PENDING_SYNC_S = 0.3
+OTHER_TEAM_DB = "team-other"
 
 
 @pytest.fixture
@@ -84,6 +93,57 @@ def test_a_failed_background_sync_leaves_the_rows_for_the_next(cloud_backend, pl
     assert platform.rows(TEAM_DB, tables.MEMORY) == []
     cloud_backend.flush()
     assert len(platform.rows(TEAM_DB, tables.MEMORY)) == 1
+
+
+def test_a_failed_background_sync_is_tried_again_without_a_write(cloud_backend, platform, monkeypatch):
+    monkeypatch.setattr(backend, "SYNC_RETRY_FIRST_S", QUICK_RETRY_S, raising=False)
+    platform.failed_appends = FAILURES_IN_A_ROW
+    cloud_backend.append(tables.MEMORY, [{"content": "goes once the cloud takes it"}])
+    assert wait_for(lambda: len(platform.rows(TEAM_DB, tables.MEMORY)) == 1)
+    assert wait_for(lambda: cloud_backend._retry_s == 0)  # the success starts the wait over
+
+
+def test_a_start_that_could_not_make_the_cloud_tables_is_tried_again(home, platform, tmp_path, monkeypatch):
+    monkeypatch.setattr(backend, "SYNC_RETRY_FIRST_S", QUICK_RETRY_S, raising=False)
+    monkeypatch.setattr(mirror, "ENSURE_RETRY_S", 0)
+    b = backend.for_settings(sign_in(tmp_path, platform))
+    b.ensure_local()
+    b.local.append(tables.MEMORY, [{"content": "kept before the cloud was reached"}])  # no write to come
+    platform.database_limit = 0  # the team database cannot be made yet
+    with pytest.raises(InfinoError):
+        b.catch_up()
+    platform.database_limit = None
+    assert wait_for(lambda: len(platform.rows(TEAM_DB, tables.MEMORY)) == 1)
+
+
+def test_a_backend_replaced_by_new_settings_never_syncs_again(home, platform, tmp_path, monkeypatch):
+    monkeypatch.setattr(backend, "SYNC_DELAY_S", PENDING_SYNC_S)
+    old = backend.for_settings(sign_in(tmp_path, platform))
+    old.ensure_local()
+    old.append(tables.MEMORY, [{"content": "written before the change"}])
+    new = backend.for_settings(sign_in(tmp_path, platform, team=OTHER_TEAM_DB))
+    new.append(tables.MEMORY, [{"content": "written after it"}])
+    old.append(tables.MEMORY, [{"content": "written through the old one"}])  # a caller not moved yet
+    assert wait_for(lambda: len(platform.rows(OTHER_TEAM_DB, tables.MEMORY)) == 3)
+    time.sleep(PENDING_SYNC_S * 2)  # past when the old one's syncs were due
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+
+
+def test_a_look_at_the_personal_tables_that_failed_is_tried_again(local_backend, monkeypatch):
+    local_backend.append(tables.CONVERSATIONS, [{"session_id": "kept", "seq": 0, "role": "user", "content": "mine"}],
+                         personal=True)
+    real = local_backend.personal.query_sql
+    failed = []
+
+    def fails_once(sql):
+        if not failed:
+            failed.append(sql)
+            raise OSError("the local database could not be read")
+        return real(sql)
+
+    monkeypatch.setattr(local_backend.personal, "query_sql", fails_once)
+    assert local_backend.transcript_personal("kept") is False  # could not tell this time
+    assert local_backend.transcript_personal("kept") is True
 
 
 def test_a_forget_is_queued_for_the_cloud(cloud_backend, platform):

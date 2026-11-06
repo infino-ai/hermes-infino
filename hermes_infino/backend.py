@@ -10,10 +10,15 @@ database is read by recall and by `infino_personal_search`, both only where
 the turn is the owner's (provider.py).
 
 One backend per profile home, shared by the memory provider, the trace hooks
-and the skills loader. Writes land locally and return; when signed in they
-also schedule a sync, which runs on a background thread once the rows have
-settled (`mirror.SETTLE_MS`), at most one at a time. A write made while a
-sync runs, or a sync that found another process syncing, schedules one more.
+and the skills loader; when the home's settings change (another team, a
+sign-in), the backend made for the new ones takes over and the old one is
+retired: its syncs stop, so no row goes where the settings no longer say.
+Writes land locally and return; when signed in they also schedule a sync,
+which runs on a background thread once the rows have settled
+(`mirror.SETTLE_MS`), at most one at a time. A write made while a sync runs,
+or a sync that found another process syncing, schedules one more; a sync
+that failed is tried again by itself (SYNC_RETRY_FIRST_S, doubling up to
+SYNC_RETRY_MAX_S), so an idle gateway's rows do not wait for its next write.
 """
 
 from __future__ import annotations
@@ -36,6 +41,11 @@ logger = logging.getLogger(__name__)
 SYNC_DELAY_S = SETTLE_MS / 1000 + 0.5
 # The most a session's end waits for its rows to reach the cloud.
 FLUSH_TIMEOUT_S = 30.0
+# Seconds after a failed background sync that the next one runs, with no
+# write needed to start it; each failure in a row doubles the wait, up to
+# SYNC_RETRY_MAX_S, and a sync that succeeds starts it over.
+SYNC_RETRY_FIRST_S = 30.0
+SYNC_RETRY_MAX_S = 15 * 60.0
 # The tables whose rows follow their session: personal sessions' go to the
 # person's own database.
 TRANSCRIPT_TABLES = (tables.CONVERSATIONS, tables.TRACES)
@@ -72,6 +82,17 @@ class Backend:
         self._last_write = 0.0
         # A sync was asked for while one was pending or running.
         self._again = False
+        # The sync that tries again after a failed one, and how long it waited
+        # (0 after a sync that succeeded).
+        self._retry_timer: Optional[threading.Timer] = None
+        self._retry_s = 0.0
+        # The backend made for this home's new settings, once this one is
+        # retired (`for_settings`): the syncs asked of this one are its.
+        self._successor: Optional[Backend] = None
+        # Sessions whose look at the personal tables could not read them:
+        # looked at again, since privacy.first_look counts a look only once.
+        # Few: a session leaves once a read succeeds.
+        self._look_again: set[str] = set()
 
     @property
     def signed_in(self) -> bool:
@@ -91,12 +112,16 @@ class Backend:
     def catch_up(self) -> None:
         """What may take a while, after the local tables exist: signed in, the
         cloud tables and a sync; in local mode, the model's load (in the
-        background) and then the memories saved without a vector."""
+        background) and then the memories saved without a vector. The sync
+        starts even when a cloud database could not be made right: the other
+        database's rows go, and a failed sync is tried again by itself."""
         if self.mirror is not None:
             self.local.drop_vectors()
             self.personal.drop_vectors()
-            self.mirror.ensure_cloud_tables()
-            self.schedule_sync(delay_s=0)
+            try:
+                self.mirror.ensure_cloud_tables()
+            finally:
+                self.schedule_sync(delay_s=0)
             return
         embed.load_in_background(self._backfill_vectors)
 
@@ -137,24 +162,38 @@ class Backend:
         """Whether a session's conversation and traces are personal
         (privacy.transcript_personal), or this machine kept its earlier turns
         personal: a chat stays personal after compaction drops the delivery
-        that made it so, and after a restart."""
+        that made it so, and after a restart. This machine's tables are asked
+        once per session, counted only when they could be read: after a read
+        that failed, the session's next call asks again."""
         if privacy.transcript_personal(self.settings, session_id, messages):
             return True
-        if privacy.first_look(session_id) and self._kept_personal(session_id):
+        if not (privacy.first_look(session_id) or session_id in self._look_again):
+            return False
+        kept = self._kept_personal(session_id)
+        if kept is None:
+            self._look_again.add(session_id)
+            return False
+        self._look_again.discard(session_id)
+        if kept:
             privacy.note_personal(session_id)
-            return True
-        return False
+        return kept
 
-    def _kept_personal(self, session_id: str) -> bool:
-        """Whether the person's own tables hold any of a session's turns."""
+    def _kept_personal(self, session_id: str) -> Optional[bool]:
+        """Whether the person's own tables hold any of a session's turns;
+        None when they could not be read."""
         session = tables.sql_string(session_id)
-        for table in TRANSCRIPT_TABLES:
-            try:
+        try:
+            made = set(self.personal.list_tables())
+            for table in TRANSCRIPT_TABLES:
+                if table not in made:  # a table not made yet holds nothing
+                    continue
                 found = self.personal.query_sql(f"SELECT count(*) AS n FROM {table} WHERE session_id = {session}")
-            except Exception:  # a table not made yet holds nothing
-                continue
-            if found and found[0]["n"]:
-                return True
+                if found and found[0]["n"]:
+                    return True
+        except Exception as e:
+            logger.info("infino: could not read whether session %s was kept personal (asked again on its next "
+                        "turn): %s", session_id, e)
+            return None
         return False
 
     def forget_memory(self, content: str, scope: Optional[str] = None, visible: tuple[str, ...] = ("",),
@@ -250,36 +289,89 @@ class Backend:
     # -- sync ----------------------------------------------------------------
 
     def schedule_sync(self, delay_s: float = SYNC_DELAY_S) -> None:
-        if self.mirror is None:
-            return
         with self._timer_lock:
-            if self._timer is not None and self._timer.is_alive():
-                # The pending or running sync may have read its rows already: one more after it.
-                self._again = True
+            successor = self._successor
+            if successor is None:
+                if self.mirror is None:
+                    return
+                if self._timer is not None and self._timer.is_alive():
+                    # The pending or running sync may have read its rows already: one more after it.
+                    self._again = True
+                    return
+                self._timer = threading.Timer(delay_s, self._sync_quietly)
+                self._timer.daemon = True
+                self._timer.start()
                 return
-            self._timer = threading.Timer(delay_s, self._sync_quietly)
-            self._timer.daemon = True
-            self._timer.start()
+        successor.schedule_sync(delay_s)
 
     def _sync_quietly(self) -> None:
-        skipped = False
+        with self._timer_lock:
+            if self._successor is not None:  # retired while this waited to run
+                return
+        skipped = failed = False
         try:
             pushed = self.mirror.sync()
             skipped = pushed == {}  # another process holds the sync: it may not see these rows
             if any(pushed.values()):
                 logger.info("infino: pushed %s", {t: n for t, n in pushed.items() if n})
         except Exception as e:
+            failed = True
             logger.warning("infino: sync to the cloud stopped (the rows stay local and go next time): %s", e)
         with self._timer_lock:
             again, self._again = self._again or skipped, False
             self._timer = None
+            if failed:
+                self._retry_later()
+            elif not skipped:
+                self._retry_s = 0.0
+                if self._retry_timer is not None:
+                    self._retry_timer.cancel()
+                    self._retry_timer = None
         if again:
             self.schedule_sync()
+
+    def _retry_later(self) -> None:
+        """After a failed sync (the timer lock held): one more by itself, so
+        the rows go without waiting for a write, after a wait that doubles
+        with each failure in a row. One retry pending at a time."""
+        if self._successor is not None or (self._retry_timer is not None and self._retry_timer.is_alive()):
+            return
+        self._retry_s = min(self._retry_s * 2, SYNC_RETRY_MAX_S) if self._retry_s else SYNC_RETRY_FIRST_S
+        self._retry_timer = threading.Timer(self._retry_s, self._retry_now)
+        self._retry_timer.daemon = True
+        self._retry_timer.start()
+
+    def _retry_now(self) -> None:
+        with self._timer_lock:
+            self._retry_timer = None
+        self.schedule_sync(delay_s=0)
+
+    def retire(self, successor: Backend) -> None:
+        """Hand this home's syncs to the backend made for its new settings:
+        this one's timers stop and it never syncs again (one already running
+        finishes), and every sync asked of it from now on - a write made
+        through it, a session's end - is the successor's, which pushes each
+        row to where the settings now say."""
+        with self._timer_lock:
+            self._successor = successor
+            pending = [t for t in (self._timer, self._retry_timer) if t is not None]
+            for timer in pending:
+                timer.cancel()
+            self._timer = self._retry_timer = None
+            waiting = bool(pending) or self._again
+            self._again = False
+        if waiting:  # rows written through this one are waiting for a sync
+            successor.schedule_sync()
 
     def flush(self) -> None:
         """At a session's end: wait for this process's rows to settle, then
         push them, so a one-shot session's work reaches the cloud before it
         exits. Bounded; whatever is left goes with the next sync."""
+        with self._timer_lock:
+            successor = self._successor
+        if successor is not None:
+            successor.flush()
+            return
         if self.mirror is None:
             return
         settle = SETTLE_MS / 1000 - (time.monotonic() - self._last_write)
@@ -359,11 +451,18 @@ _backends_lock = threading.Lock()
 
 
 def for_settings(settings: config.Settings) -> Backend:
-    """The shared backend of a profile, rebuilt when its sign-in changes."""
-    key = (str(Path(settings.home).resolve()), settings.api_key, settings.team_database,
-           settings.personal_database, settings.url, settings.personal_profile, settings.personal_jobs)
+    """The shared backend of a profile, rebuilt when its sign-in changes; the
+    one it replaces for the same home is retired (`Backend.retire`), so it
+    never pushes the home's rows to where the old settings said."""
+    home = str(Path(settings.home).resolve())
+    key = (home, settings.api_key, settings.team_database, settings.personal_database, settings.url,
+           settings.personal_profile, settings.personal_jobs)
     with _backends_lock:
         backend = _backends.get(key)
-        if backend is None:
-            backend = _backends[key] = Backend(settings)
-        return backend
+        if backend is not None:
+            return backend
+        backend = _backends[key] = Backend(settings)
+        replaced = [_backends.pop(k) for k in list(_backends) if k[0] == home and k != key]
+    for old in replaced:
+        old.retire(backend)
+    return backend
