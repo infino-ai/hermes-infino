@@ -4,7 +4,7 @@ hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) 
 
 By default, everything is kept in a database on your machine using Infino's open source retrieval engine, and nothing leaves your device.
 
-With an Infino account, your team shares a database in Infino Cloud, so every agent on the team can search what the others did. Personal memory, and any work you mark as personal, stays out of it. [Signing in](#signing-in) says what gets uploaded and when.
+With an [Infino account](#signing-in), your team shares a database in Infino Cloud, so every agent on the team can search what the others did. Personal memory, and any work you mark as personal, stays out of it. 
 
 ## What it stores
 
