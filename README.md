@@ -2,7 +2,7 @@
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that stores the agent's memory and history in Infino.
 
-It saves four things: memory, conversations, traces and skills. Before each turn it gives the agent the memories that matter for that turn. The agent can also search everything with the Infino tools.
+It saves four things: memory, conversations, traces and skills, including across teams and Hermes fleets. Before each turn it gives the agent the memories that matter for that turn. The agent can also search all history with the Infino tools.
 
 You don't need an Infino account. Without one, everything is kept in a database on your machine, and nothing leaves it.
 
