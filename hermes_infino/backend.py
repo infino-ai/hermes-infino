@@ -163,8 +163,10 @@ class Backend:
         (privacy.transcript_personal), or this machine kept its earlier turns
         personal: a chat stays personal after compaction drops the delivery
         that made it so, and after a restart. This machine's tables are asked
-        once per session, counted only when they could be read: after a read
-        that failed, the session's next call asks again."""
+        once per session, counted only when they could be read. A read that
+        failed answers personal for that call, since a turn written to the
+        team's tables cannot be taken back, and the session's next call asks
+        again (finding that turn, it stays personal: the safe side)."""
         if privacy.transcript_personal(self.settings, session_id, messages):
             return True
         if not (privacy.first_look(session_id) or session_id in self._look_again):
@@ -172,7 +174,7 @@ class Backend:
         kept = self._kept_personal(session_id)
         if kept is None:
             self._look_again.add(session_id)
-            return False
+            return True
         self._look_again.discard(session_id)
         if kept:
             privacy.note_personal(session_id)
@@ -191,8 +193,8 @@ class Backend:
                 if found and found[0]["n"]:
                     return True
         except Exception as e:
-            logger.info("infino: could not read whether session %s was kept personal (asked again on its next "
-                        "turn): %s", session_id, e)
+            logger.info("infino: could not read whether session %s was kept personal (kept personal this time, "
+                        "asked again on its next turn): %s", session_id, e)
             return None
         return False
 

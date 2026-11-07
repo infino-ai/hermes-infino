@@ -42,7 +42,7 @@ class FakePlatform:
         self.no_embedder = False       # create_table refuses embedding columns with 403
         self.no_embedding_server = False  # create_table refuses embedding columns with 400 (none deployed)
         self.schema_patch_refused = False  # a schema patch (adding a column) answers 403
-        self.database_limit = None     # like a free plan: creates past this count answer 403
+        self.database_limit = None     # a key that may make no more: creates past this count answer 403
         self.refused_databases: set[str] = set()  # creating one of these answers 403 (a key for other databases)
         self.trial_status = None       # /v1/trial answers this status (501: no free accounts; 409: one per network)
         self.trial_without_key = False  # /v1/trial answers 200 with no api_key
@@ -122,9 +122,9 @@ class FakePlatform:
             return 200, {"api_key": f"trial-key-{self.trials}", "database": body["database"],
                          "credit_cents": 500}, None
         if parts == ["v1", "databases"]:
-            # The platform checks the plan's limit before the name.
+            # A key that may make no more databases is refused before the name is looked at.
             if self.database_limit is not None and len(self.databases) >= self.database_limit:
-                return 403, {"error": "free plan database limit reached"}, None
+                return 403, {"error": "this key may not create another database"}, None
             if body["name"] in self.refused_databases:
                 return 403, {"error": f"this key may not create database {body['name']}"}, None
             if body["name"] in self.databases:

@@ -202,8 +202,8 @@ def _personal_database(client: InfinoClient, args, team: str) -> Optional[str]:
     named (made if missing), else a new one, never one that exists already (it
     could be anyone's). None with --no-personal-database, or when it cannot be
     made, for any reason (refused, unreachable, timed out): what is personal
-    then stays on this machine, and the sign-in, saved already, goes on, since
-    a personal database the cloud refuses would stop every sync."""
+    then stays on this machine, and the sign-in, saved already, goes on, rather
+    than naming a personal database whose rows would never go."""
     if args.no_personal_database:
         return None
     name = args.personal_database or _new_personal_name(team)
@@ -333,7 +333,10 @@ def _sync(args) -> int:
 
 
 def _catch_up(settings: config.Settings) -> int:
-    """Create the cloud tables, then push until nothing is left to push."""
+    """Create the cloud tables, then push until nothing is left to push. A
+    database whose tables cannot be made right (a personal database the key
+    may not reach, say) holds up only its own rows: the other's are pushed,
+    and the end says what was not, and why."""
     from . import tables
     from .backend import Backend
     from .mirror import SETTLE_MS
@@ -343,21 +346,34 @@ def _catch_up(settings: config.Settings) -> int:
     b.personal.ensure_tables(with_vectors=False, only=tables.PERSONAL)
     b.local.drop_vectors()
     b.personal.drop_vectors()
-    b.mirror.ensure_cloud_tables()
+    try:
+        b.mirror.ensure_cloud_tables()
+    except Exception:
+        if len(b.mirror.waiting()) == len(b.mirror.databases()):
+            raise  # nothing can go anywhere: the platform's answer says why
+        # The others go on; each database that failed is reported at the end.
 
-    def show(table, n):
-        print(f"\r   {table:<14} {n} rows pushed", end="", flush=True)
+    pushed_now: dict[str, int] = {}
+
+    def show(mark, n):
+        pushed_now[mark] = n
+        print(f"\r   {mark:<14} {n} rows pushed", end="", flush=True)
 
     deadline = time.monotonic() + CATCH_UP_S
     total = 0
     last_pass = False
     while True:
+        pushed_now.clear()
         try:
-            pushed = sum(b.mirror.sync(wait=True, progress=show).values())
+            b.mirror.sync(wait=True, progress=show)
         except Exception as e:
-            print(f"\nThe cloud stopped accepting rows: {e}\nThey are kept here; `hermes infino sync` resumes.",
-                  file=sys.stderr)
-            return 1
+            # A database out of reach was skipped, and the others' rows went
+            # (sync raises a failed push before it); anything else stops here.
+            if not any(e is why for why in b.mirror.waiting().values()):
+                print(f"\nThe cloud stopped accepting rows: {e}\nThey are kept here; `hermes infino sync` resumes.",
+                      file=sys.stderr)
+                return 1
+        pushed = sum(pushed_now.values())
         total += pushed
         if last_pass:
             break
@@ -365,9 +381,16 @@ def _catch_up(settings: config.Settings) -> int:
         # once they have settled, takes them.
         last_pass = not pushed or time.monotonic() > deadline
         time.sleep(SETTLE_MS / 1000)
-    # What a sync never sends: what is personal, without a personal database,
-    # and the rows the cloud refused outright.
+    # What this sync did not send: the rows of a database out of reach; what
+    # is personal, without a personal database; and the rows the cloud
+    # refused outright.
     kept_here = []
+    out_of_reach = b.mirror.waiting()
+    for database, personal in b.mirror.databases():
+        if database in out_of_reach:
+            whose = "what is personal" if personal else "the team's rows"
+            kept_here.append(f"{whose}: '{database}' could not be made ready ({out_of_reach[database]}); "
+                             "`hermes infino sync` tries again")
     if not settings.personal_database:
         kept_here.append("what is personal: there is no personal database")
     refused = _refused(b)
@@ -379,4 +402,4 @@ def _catch_up(settings: config.Settings) -> int:
     print(f"\nThe cloud has everything kept here except what stays on this machine ({total} rows pushed):")
     for what in kept_here:
         print(f"   {what}")
-    return 0
+    return 1 if out_of_reach else 0

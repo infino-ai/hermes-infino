@@ -317,3 +317,46 @@ def test_sync_counts_the_rows_the_cloud_refused(home, platform, tmp_path, capsys
     out = capsys.readouterr().out
     assert "The cloud has everything kept here (" not in out
     assert "1 rows the cloud would not take" in out
+
+
+def remember_team_and_personal(tmp_path) -> None:
+    m, _ = make_manager(tmp_path)
+    m.handle_tool_call("infino_remember", {"content": "the deploy freeze starts December 20"})
+    m.handle_tool_call("infino_remember", {"content": "my dentist is Tuesday", "scope": "personal"})
+
+
+def test_sync_pushes_the_teams_rows_past_a_personal_database_out_of_reach(home, platform, tmp_path, capsys):
+    remember_team_and_personal(tmp_path)
+    sign_in(tmp_path, platform, personal_database=PERSONAL_DB)
+    platform.refused_databases = {PERSONAL_DB}  # a key limited to other databases
+    assert run("sync") == 1
+    out = capsys.readouterr().out
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["the deploy freeze starts December 20"]
+    assert PERSONAL_DB not in platform.databases
+    assert f"what is personal: '{PERSONAL_DB}' could not be made ready" in out and "403" in out
+    assert "The cloud has everything kept here (" not in out
+    # Once it can be made, the next sync sends what is personal.
+    platform.refused_databases = set()
+    assert run("sync") == 0
+    assert [r["content"] for r in platform.rows(PERSONAL_DB, tables.MEMORY)] == ["my dentist is Tuesday"]
+    assert len(platform.rows(TEAM_DB, tables.MEMORY)) == 1
+
+
+def test_sync_says_the_team_push_failed_while_the_personal_database_is_out_of_reach(home, platform, tmp_path,
+                                                                                    capsys):
+    remember_team_and_personal(tmp_path)
+    sign_in(tmp_path, platform, personal_database=PERSONAL_DB)
+    platform.refused_databases = {PERSONAL_DB}
+    platform.failed_appends = 1
+    assert run("sync") == 1
+    err = capsys.readouterr().err
+    assert "The cloud stopped accepting rows: " in err and "HTTP 500" in err
+
+
+def test_sync_where_no_database_can_be_made_ready_says_why(home, platform, tmp_path, capsys):
+    remember_team_and_personal(tmp_path)
+    sign_in(tmp_path, platform, personal_database=PERSONAL_DB)
+    platform.refused_databases = {TEAM_DB, PERSONAL_DB}
+    assert run("sync") == 1
+    assert "the platform refused" in capsys.readouterr().err
+    assert platform.databases == {}

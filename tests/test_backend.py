@@ -129,21 +129,33 @@ def test_a_backend_replaced_by_new_settings_never_syncs_again(home, platform, tm
     assert platform.rows(TEAM_DB, tables.MEMORY) == []
 
 
-def test_a_look_at_the_personal_tables_that_failed_is_tried_again(local_backend, monkeypatch):
-    local_backend.append(tables.CONVERSATIONS, [{"session_id": "kept", "seq": 0, "role": "user", "content": "mine"}],
-                         personal=True)
-    real = local_backend.personal.query_sql
+def fail_the_first_look(store, monkeypatch):
+    """The store's next read of its tables fails; the ones after it do not."""
+    real = store.list_tables
     failed = []
 
-    def fails_once(sql):
+    def fails_once():
         if not failed:
-            failed.append(sql)
+            failed.append(True)
             raise OSError("the local database could not be read")
-        return real(sql)
+        return real()
 
-    monkeypatch.setattr(local_backend.personal, "query_sql", fails_once)
-    assert local_backend.transcript_personal("kept") is False  # could not tell this time
-    assert local_backend.transcript_personal("kept") is True
+    monkeypatch.setattr(store, "list_tables", fails_once)
+
+
+def test_a_look_at_the_personal_tables_that_failed_keeps_the_turn_personal(local_backend, monkeypatch):
+    local_backend.append(tables.CONVERSATIONS, [{"session_id": "kept", "seq": 0, "role": "user", "content": "mine"}],
+                         personal=True)
+    fail_the_first_look(local_backend.personal, monkeypatch)
+    assert local_backend.transcript_personal("kept") is True  # could not tell: the safe side
+    assert local_backend.transcript_personal("kept") is True  # read this time
+
+
+def test_a_session_whose_look_failed_is_asked_again_and_is_the_teams(local_backend, monkeypatch):
+    fail_the_first_look(local_backend.personal, monkeypatch)
+    assert local_backend.transcript_personal("team-chat") is True  # could not tell this time
+    assert local_backend.transcript_personal("team-chat") is False  # nothing of it was kept personal
+    assert local_backend.transcript_personal("team-chat") is False  # and it is not asked again
 
 
 def test_a_forget_is_queued_for_the_cloud(cloud_backend, platform):

@@ -80,7 +80,7 @@ def test_personal_transcripts_go_to_the_personal_database_only(home, platform, t
 
 
 def test_a_personal_database_that_cannot_be_made_holds_up_only_its_own_rows(home, platform, tmp_path):
-    platform.refused_databases = {PERSONAL_DB}  # a key limited to other databases, or a plan's cap
+    platform.refused_databases = {PERSONAL_DB}  # a key limited to other databases
     m = local_mirror(tmp_path, sign_in(tmp_path, platform, personal_database=PERSONAL_DB))
     tables.ensure_all(m.client, TEAM_DB)
     m.client.append(TEAM_DB, tables.MEMORY, [{tables.ROW_ID: "old", "content": "forgotten"}])
@@ -101,6 +101,19 @@ def test_a_personal_database_that_cannot_be_made_holds_up_only_its_own_rows(home
     m.sync(wait=True)
     assert [r["content"] for r in platform.rows(PERSONAL_DB, tables.MEMORY)] == ["mine"]
     assert m.last_error() == "" and (m.dir / mirror.FORGET_FILE).read_text() == ""
+
+
+def test_a_failed_push_is_raised_before_a_database_out_of_reach(home, platform, tmp_path):
+    # Raising the database out of reach would hide that the team's rows did not go either.
+    platform.refused_databases = {PERSONAL_DB}
+    m = local_mirror(tmp_path, sign_in(tmp_path, platform, personal_database=PERSONAL_DB))
+    m.local.append(tables.MEMORY, [{"content": "for the team"}])
+    platform.failed_appends = 1
+    with pytest.raises(InfinoError) as raised:
+        m.sync(wait=True)
+    assert raised.value.status == 500 and "HTTP 500" in m.last_error()
+    assert m.waiting()[PERSONAL_DB].status == 403
+    assert list(m.waiting()) == [PERSONAL_DB]
 
 
 def test_a_platform_with_no_embedding_server_gets_a_keyword_only_memory(home, platform, tmp_path):

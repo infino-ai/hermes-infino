@@ -28,8 +28,8 @@ the last LOST_CHECK_ROWS rows pushed, nor the first, is in the cloud.
 Nothing is pushed to a cloud database until its tables are right
 (`tables.ensure_all`): a database whose tables lack a column this version
 writes, and cannot be given it, or that cannot be made or reached at all (a
-key limited to other databases, a personal database out of reach, a plan's
-cap on databases), gets no rows, and the sync says why. Each database is
+key limited to other databases, a personal database out of reach), gets no
+rows, and the sync says why. Each database is
 apart: one that is not right holds up only its own sources, never the other
 database's, nor the forgets to it.
 
@@ -192,7 +192,7 @@ class Mirror:
         and drop the marks of its tables that lost this machine's rows; the
         databases that could not be made right, with why. Each is apart: one
         that cannot be (a key limited to other databases, a personal
-        database out of reach, a plan's cap) holds up only its own sources."""
+        database out of reach) holds up only its own sources."""
         failures: dict[str, Exception] = {}
         for database, personal in databases:
             try:
@@ -221,8 +221,13 @@ class Mirror:
                if database not in self._tables_ready and (retry or database not in self._tables_errors)]
         if due:
             self._ensure(due)
+        return self.waiting()
+
+    def waiting(self) -> dict[str, Exception]:
+        """The cloud databases whose tables are not right, each with why its
+        last attempt failed: nothing goes to them until an attempt succeeds."""
         return {database: self._tables_errors[database] for database, _ in self.databases()
-                if database not in self._tables_ready}
+                if database not in self._tables_ready and database in self._tables_errors}
 
     def _drop_lost_marks(self, database: str) -> None:
         """Forget each mark of `database` whose cloud table has lost this
@@ -337,7 +342,9 @@ class Mirror:
         the others go on; so do the forgets. The first failure is raised
         after them, recorded as `last_error`. Nothing is pushed to a database
         whose tables are not right (`_ensure_before_push`): its sources, and
-        the forgets queued for it, wait, and that is the first failure."""
+        the forgets queued for it, wait, and why is raised when nothing else
+        failed. A failed push or forget comes first, so a database out of
+        reach never hides that the other's rows did not go either."""
         waiting = self._ensure_before_push()
         with self._lock(wait) as held:
             if not held:
@@ -350,7 +357,7 @@ class Mirror:
                 recheck[mark] = max(recheck.get(mark, upto), upto)
             until = _now_ms() - SETTLE_MS
             pushed: dict[str, int] = {}
-            failure: Optional[Exception] = next(iter(waiting.values()), None)
+            failure: Optional[Exception] = None
             for src in self.sources():
                 pushed[src.mark] = 0
                 if src.database in waiting:
@@ -388,6 +395,7 @@ class Mirror:
                 self._apply_forgets(frozenset(waiting))
             except Exception as e:
                 failure = failure or e
+            failure = failure or next(iter(waiting.values()), None)
             if failure is not None:
                 self._save_state(marks, f"{type(failure).__name__}: {failure}", sorted(unsure), recheck)
                 raise failure
