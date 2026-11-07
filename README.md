@@ -63,7 +63,7 @@ Without an account, nothing leaves your machine. Each memory is embedded locally
 
 Once you sign in:
 
-- Every row is still written to your machine first. It reaches the cloud a few seconds later, and Hermes sends whatever is left before it exits.
+- Every row is still written to your machine first. It reaches the cloud a few seconds later, and Hermes sends whatever is left before it exits, waiting up to about ten seconds for the cloud. Anything still left goes with the next sync.
 - If the cloud is down, nothing is lost. The sync picks up where it stopped.
 - A row the cloud refuses stays on your machine. `hermes infino status` counts them, names the file that lists them, and shows how far behind the cloud is.
 - Forgetting a memory deletes it from the cloud too.

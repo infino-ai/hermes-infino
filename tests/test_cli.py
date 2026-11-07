@@ -574,3 +574,12 @@ def test_sync_where_no_database_can_be_made_ready_says_why(home, platform, tmp_p
     assert run("sync") == 1
     assert "the platform refused" in capsys.readouterr().err
     assert platform.databases == {}
+
+
+def test_the_upload_notice_never_counts_an_older_versions_personal_memory_as_the_teams(home, tmp_path):
+    # An older version kept personal memory in the team's table: it moves to the personal one, never to the team.
+    store = local(tmp_path)
+    store.ensure_tables(with_vectors=False)
+    store.append(tables.MEMORY, [{"content": "the deploy freeze starts December 20", "scope": "team"},
+                                 {"content": "my salary", "scope": "personal"}])
+    assert cli._local_counts()[tables.MEMORY] == 1

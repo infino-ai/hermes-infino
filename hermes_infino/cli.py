@@ -49,8 +49,12 @@ from typing import Optional
 
 from . import config
 from .client import DEFAULT_URL, InfinoClient, InfinoError, request_trial
-from .tables import OutdatedTable
+from .tables import MEMORY, OutdatedTable
 
+# Which rows of a team table a sign-in uploads to the team, as a WHERE clause:
+# an older version kept personal memory in the team's `memory`, which moves to
+# the personal tables before anything is pushed (Backend._move_personal_memory).
+TEAM_ROWS = {MEMORY: "WHERE scope IS NULL OR scope <> 'personal'"}
 # The team database a new account registers when none is named.
 DEFAULT_DATABASE = "hermes-team"
 # The platform's answers to a free-account request that refuse it: it gives
@@ -282,7 +286,8 @@ def _local_counts() -> dict:
     store = LocalStore.under(config.state_dir())
     try:
         names = set(store.list_tables())
-        return {t: store.query_sql(f"SELECT count(*) AS n FROM {t}")[0]["n"] for t in tables.ALL if t in names}
+        return {t: store.query_sql(f"SELECT count(*) AS n FROM {t} {TEAM_ROWS.get(t, '')}")[0]["n"]
+                for t in tables.ALL if t in names}
     except Exception:
         return {}
 
