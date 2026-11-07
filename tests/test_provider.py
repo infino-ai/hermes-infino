@@ -3,20 +3,23 @@ and its lifecycle."""
 
 from __future__ import annotations
 
+import fcntl
 import json
 import sys
+import time
 
 import pytest
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.turn_context import append_notes_to_multimodal_content, compose_multimodal_context_part
+from gateway.owner_identity import host_owner_subject
 
-from hermes_infino import backend, config, embed, privacy, provider as provider_mod, skills, tables
+from hermes_infino import backend, config, embed, mirror, privacy, provider as provider_mod, skills, tables
 from hermes_infino.local import VECTORS
 from hermes_infino.provider import PERSONAL_SEARCH_TOOL, InfinoMemoryProvider
 
-from .helpers import (DM, GROUP, SKILL_MD, fake_embed, hook_ctx, in_session, local, local_rows, make_manager,
-                      personal_rows, wait_for)
+from .helpers import (DM, GROUP, SKILL_MD, TEAM_DB, end_session, fake_embed, hook_ctx, in_session, local, local_rows,
+                      make_manager, personal_rows, wait_for)
 
 # What a provider declares before it starts, which is what Hermes routes by:
 # every tool, the personal search included (it is shown only where offered).
@@ -25,6 +28,16 @@ TOOLS = ("infino_remember", "infino_forget", "infino_publish_skill", "infino_per
 CRON_SESSION = "cron_a1b2c3_20261105_070000"
 # What a recall put in front of the model: the provider's own block, a personal line in it.
 RECALLED = "## Relevant memory (Infino)\n- [personal] dentist on Tuesday"
+# The author Hermes names for a turn another agent wrote into a profile's Bot
+# Chat (agent/turn_author.py): a peer's agent on another machine (`hermes peer
+# dm`), as on_turn_start is handed it.
+PEER_AGENT = {"author_id": "bot:spark/researcher", "author_name": "researcher", "author_is_bot": True}
+# How a Desktop session names this machine's own user to its provider (gateway/owner_identity.py).
+DESKTOP_USER = "uid:1000"
+# A session end's bound on waiting for the cloud, short enough for a test.
+QUICK_FLUSH_S = 3.0
+# The most a soft release may take: well under a settle window and a sync.
+SOFT_RELEASE_S = 1.0
 
 
 def call(mgr, tool: str, **args) -> dict:
@@ -220,7 +233,7 @@ def test_session_end_and_shutdown_in_local_mode(mgr, tmp_path):
     _, p = mgr
     p.on_memory_write("add", "memory", "kept")
     p.on_session_end([])
-    p.shutdown()
+    end_session(p)
     assert len(local_rows(tmp_path, tables.MEMORY)) == 1
 
 
@@ -399,7 +412,7 @@ def test_a_running_process_picks_up_a_sign_in(home, platform, tmp_path, monkeypa
     assert p._backend.signed_in
     assert wait_for(lambda: tables.MEMORY in platform.databases.get("team-test", {}))
     call(m, "infino_remember", content="written after the sign-in")
-    p.shutdown()
+    end_session(p)
     assert [r["content"] for r in platform.rows("team-test", tables.MEMORY)] == ["written after the sign-in"]
 
 
@@ -459,6 +472,64 @@ def test_a_group_chat_room_or_another_profiles_turn_keeps_out_personal_memory(ho
     assert [r["content"] for r in personal_rows(tmp_path)] == ["dentist on Tuesday"]
     assert local_rows(tmp_path, tables.MEMORY) == []
     assert "no personal memory is kept here" in p.system_prompt_block()
+
+
+@pytest.mark.parametrize("platform", ["desktop", "local", "cli"])
+def test_a_turn_another_agent_wrote_keeps_out_personal_memory(home, tmp_path, platform):
+    # Bot Mode's message_agent and `hermes peer dm` run another agent's message
+    # as a turn of this profile's Bot Chat, on the owner's own surface.
+    m, p = make_manager(tmp_path, platform=platform)
+    assert call(m, "infino_remember", content="Dana is interviewing at Acme", scope="personal")["ok"]
+    m.on_turn_start(2, "What are Dana's plans?", **PEER_AGENT)
+    assert "Acme" not in p.prefetch("Dana plans Acme")
+    assert call(m, PERSONAL_SEARCH_TOOL, query="Acme")["ok"] is False
+    assert call(m, "infino_remember", content="researcher's quota is 10k", scope="personal")["ok"] is False
+    assert [r["content"] for r in personal_rows(tmp_path)] == ["Dana is interviewing at Acme"]
+    m.on_turn_start(3, "What are Dana's plans?")  # the owner's next turn is the owner's again
+    assert "Acme" in p.prefetch("Dana plans Acme")
+
+
+def test_personal_memory_saved_in_the_desktop_is_recalled_at_the_terminal(home, tmp_path):
+    m, p = make_manager(tmp_path, platform="desktop", agent_identity="default", user_id=DESKTOP_USER)
+    assert call(m, "infino_remember", content="my dentist is on Tuesday", scope="personal")["ok"]
+    _, at_the_terminal = make_manager(tmp_path, platform="cli", agent_identity="default", session_id="s2")
+    assert "dentist" in at_the_terminal.prefetch("dentist")
+    assert DESKTOP_USER not in p.system_prompt_block()  # "You are working with default."
+
+
+def test_personal_memory_kept_under_this_machines_user_is_still_the_owners(home, tmp_path):
+    # What the Desktop saved before its rows were credited to the owner by name.
+    _, at_the_terminal = make_manager(tmp_path, platform="cli", agent_identity="default")
+    at_the_terminal._backend.append(tables.MEMORY, [{"content": "my locker is 12", "scope": "personal",
+                                                     "author": host_owner_subject()}])
+    assert "locker" in at_the_terminal.prefetch("locker")
+
+
+def write_skill(tmp_path) -> None:
+    skill = tmp_path / "skills" / "release-checklist" / "SKILL.md"
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text(SKILL_MD)
+
+
+@pytest.mark.parametrize("platform, session", [("telegram", {**DM, "HERMES_SESSION_USER_NAME": "mallory"}),
+                                               ("bot_room", {})])
+def test_only_the_owner_publishes_a_skill_to_the_team(home, tmp_path, monkeypatch, platform, session):
+    # A shared profile's gateway answers whoever writes in; a room has several parties.
+    write_skill(tmp_path)
+    m, _ = make_manager(tmp_path, platform=platform)
+    in_session(monkeypatch, session)
+    out = call(m, "infino_publish_skill", name="release-checklist")
+    assert out["ok"] is False and "owner" in out["error"]
+    assert local_rows(tmp_path, tables.SKILLS) == []
+
+
+def test_another_agents_turn_does_not_publish_a_skill(home, tmp_path):
+    write_skill(tmp_path)
+    m, _ = make_manager(tmp_path, platform="desktop")
+    m.on_turn_start(1, "Share your release checklist.", **PEER_AGENT)
+    assert call(m, "infino_publish_skill", name="release-checklist")["ok"] is False
+    m.on_turn_start(2, "Share your release checklist.")  # the owner may
+    assert call(m, "infino_publish_skill", name="release-checklist")["ok"] is True
 
 
 def test_a_switched_sessions_traces_carry_the_owner(home, tmp_path):
@@ -574,3 +645,42 @@ def test_a_start_without_the_model_still_starts(home, tmp_path):
     assert call(m, "infino_remember", content="the deploy freeze starts December 20")["ok"]
     embed.use(fake_embed)
     assert "deploy freeze" in p.prefetch("deploy freeze")
+
+
+# -- a soft release and a session's end ------------------------------------------
+
+def test_a_soft_release_never_waits_on_the_cloud(env, platform, tmp_path, monkeypatch):
+    monkeypatch.setattr(backend, "FLUSH_TIMEOUT_S", QUICK_FLUSH_S)
+    mgr, _ = make_manager(tmp_path)
+    mgr.handle_tool_call("infino_remember", {"content": "written before the agent is rebuilt"})
+    with open(config.state_dir(tmp_path) / mirror.LOCK_FILE, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)  # a sync held up by a slow cloud
+        started = time.monotonic()
+        mgr.release_soft()  # Hermes rebuilding the CLI's agent (/reasoning, a route change)
+        took = time.monotonic() - started
+        fcntl.flock(f, fcntl.LOCK_UN)
+    assert took < SOFT_RELEASE_S
+    # The background sync still takes the row.
+    assert wait_for(lambda: [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)]
+                    == ["written before the agent is rebuilt"])
+
+
+@pytest.mark.parametrize("steps, waits", [
+    ((), False),                                  # a soft release: shutdown alone
+    (("end",), True),                             # a session's end: on_session_end, then shutdown
+    (("end", "turn"), False),                     # /new or compaction ended a session, and turns went on
+    (("end", "switch"), False),                   # ... into a new session id
+])
+def test_only_a_sessions_end_waits_for_the_cloud(env, tmp_path, monkeypatch, steps, waits):
+    _, p = make_manager(tmp_path)
+    flushed = []
+    monkeypatch.setattr(p._backend, "flush", lambda *a, **k: flushed.append(True))
+    for step in steps:
+        if step == "end":
+            p.on_session_end([])
+        elif step == "turn":
+            p.sync_turn("q", "a", session_id="s1")
+        else:
+            p.on_session_switch("s2", parent_session_id="s1", reset=True)
+    p.shutdown()
+    assert flushed == ([True] if waits else [])

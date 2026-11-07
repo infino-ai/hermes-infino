@@ -22,7 +22,7 @@ from hermes_infino import backend, chats, cli, config, instructions, mirror, rec
 from hermes_infino.client import InfinoClient
 from hermes_infino.local import arrow_schema, index_spec
 
-from .helpers import (DM, GROUP, OTHER_GROUP, PERSONAL_DB, SKILL_MD, TEAM_DB, hook_ctx, in_session, local,
+from .helpers import (DM, GROUP, OTHER_GROUP, PERSONAL_DB, SKILL_MD, TEAM_DB, end_session, hook_ctx, in_session, local,
                       local_rows, make_manager, personal_rows, wait_for)
 
 # Seconds that put a save after a forget's `stored_ms` bound.
@@ -63,11 +63,11 @@ def test_remember_recall_forget(env, platform, tmp_path):
     assert context.startswith(recall.HEADING)
     assert "deploy freeze starts December 20" in context
     assert provider.recall_status().count == 1
-    provider.shutdown()
+    end_session(provider)
     assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["The deploy freeze starts December 20"]
     out = json.loads(mgr.handle_tool_call("infino_forget", {"content": "The deploy freeze starts December 20"}))
     assert out["ok"] and out["matched"] == 1
-    provider.shutdown()
+    end_session(provider)
     assert platform.rows(TEAM_DB, tables.MEMORY) == []
     assert local_rows(tmp_path, tables.MEMORY) == []
     assert provider.prefetch("deploy freeze") == ""
@@ -76,17 +76,17 @@ def test_remember_recall_forget(env, platform, tmp_path):
 def test_a_forget_never_deletes_the_same_text_saved_again_later(env, platform, tmp_path):
     mgr, provider = make_manager(tmp_path)
     mgr.handle_tool_call("infino_remember", {"content": "use pnpm"})
-    provider.shutdown()
+    end_session(provider)
     mgr.handle_tool_call("infino_forget", {"content": "use pnpm"})
     mgr.handle_tool_call("infino_remember", {"content": "use pnpm"})  # before the forget reaches the cloud
-    provider.shutdown()
+    end_session(provider)
     assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["use pnpm"]
 
 
 def test_recall_falls_back_to_keyword_search(env, platform, tmp_path):
     mgr, provider = make_manager(tmp_path)
     mgr.handle_tool_call("infino_remember", {"content": "Acme renewal is owned by support"})
-    provider.shutdown()
+    end_session(provider)
     platform.hybrid_refused = True
     assert "Acme renewal" in provider.prefetch("who owns the Acme renewal")
 
@@ -96,7 +96,7 @@ def test_account_without_embedder_gets_keyword_only_memory(env, platform, tmp_pa
     mgr, provider = make_manager(tmp_path)
     assert all(f["type"] != "embedding" for f in platform.schemas[(TEAM_DB, tables.MEMORY)])
     mgr.handle_tool_call("infino_remember", {"content": "Acme renewal is owned by support"})
-    provider.shutdown()
+    end_session(provider)
     assert "Acme renewal" in provider.prefetch("who owns the Acme renewal")
     hybrid_calls = sum(1 for p, _ in platform.requests if "/hybrid_search/" in p)
     provider.prefetch("Acme renewal again")
@@ -107,13 +107,13 @@ def test_personal_scope_goes_to_the_personal_database(env, platform, tmp_path):
     env.setenv("INFINO_PERSONAL_DATABASE", PERSONAL_DB)
     mgr, provider = make_manager(tmp_path)
     mgr.handle_tool_call("infino_remember", {"content": "my staging credentials expire Friday", "scope": "personal"})
-    provider.shutdown()
+    end_session(provider)
     assert [r["content"] for r in platform.rows(PERSONAL_DB, tables.MEMORY)] == ["my staging credentials expire Friday"]
     assert platform.rows(TEAM_DB, tables.MEMORY) == []
     assert "[personal]" in provider.prefetch("staging credentials")
     # A forget that names no scope deletes the row from the database it went to.
     mgr.handle_tool_call("infino_forget", {"content": "my staging credentials expire Friday"})
-    provider.shutdown()
+    end_session(provider)
     assert platform.rows(PERSONAL_DB, tables.MEMORY) == []
 
 
@@ -134,7 +134,7 @@ def test_turns_are_appended_once_each_with_tool_calls_and_results(env, platform,
     hooks["post_api_request"](session_id="s1", turn_id="t2", api_request_id="r2", model="m", usage={})
     messages += [{"role": "user", "content": "thanks"}, {"role": "assistant", "content": "anytime"}]
     provider.sync_turn("thanks", "anytime", session_id="s1", messages=messages)
-    provider.shutdown()
+    end_session(provider)
 
     rows = sorted(platform.rows(TEAM_DB, tables.CONVERSATIONS), key=lambda r: r["seq"])
     assert [r["seq"] for r in rows] == [0, 1, 2, 3, 4, 5]
@@ -153,7 +153,7 @@ def test_builtin_memory_writes_are_mirrored(env, platform, tmp_path):
     mgr, provider = make_manager(tmp_path)
     provider.on_memory_write("add", "memory", "use pnpm, not npm")
     provider.on_memory_write("replace", "memory", "use pnpm 9, not npm", {"previous_content": "use pnpm, not npm"})
-    provider.shutdown()
+    end_session(provider)
     assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["use pnpm 9, not npm"]
     assert platform.rows(TEAM_DB, tables.MEMORY)[0]["origin"] == "builtin:memory"
 
@@ -163,7 +163,7 @@ def test_only_a_persons_session_captures_turns_and_builtin_memory(env, platform,
     mgr, provider = make_manager(tmp_path, agent_context=context)
     provider.sync_turn("a", "b", session_id="s1")
     provider.on_memory_write("add", "memory", "y")
-    provider.shutdown()
+    end_session(provider)
     assert platform.rows(TEAM_DB, tables.MEMORY) == []
     assert platform.rows(TEAM_DB, tables.CONVERSATIONS) == []
     assert local_rows(tmp_path, tables.MEMORY) == []
@@ -174,11 +174,11 @@ def test_the_memory_tools_write_from_subagents_and_cron_jobs(env, platform, tmp_
     mgr, provider = make_manager(tmp_path, agent_context=context)
     out = json.loads(mgr.handle_tool_call("infino_remember", {"content": "weekly report: 5 sessions"}))
     assert out == {"ok": True, "scope": "team"}
-    provider.shutdown()
+    end_session(provider)
     assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["weekly report: 5 sessions"]
     out = json.loads(mgr.handle_tool_call("infino_forget", {"content": "weekly report: 5 sessions"}))
     assert out["ok"] and out["matched"] == 1
-    provider.shutdown()
+    end_session(provider)
     assert platform.rows(TEAM_DB, tables.MEMORY) == []
 
 
@@ -187,7 +187,7 @@ def test_a_flush_run_refuses_the_memory_tools_and_says_why(env, platform, tmp_pa
     out = json.loads(mgr.handle_tool_call("infino_remember", {"content": "x"}))
     assert out["ok"] is False
     assert "'flush' run" in out["error"] and "cron job" in out["error"]
-    provider.shutdown()
+    end_session(provider)
     assert platform.rows(TEAM_DB, tables.MEMORY) == []
 
 
@@ -210,7 +210,7 @@ def test_traces_land_locally_then_in_the_cloud(env, platform, tmp_path):
                             args={"cmd": "ls"}, result="a b", duration_ms=12, status="ok")
     hooks["on_session_end"](session_id="s1")
     assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 2)
-    provider.shutdown()
+    end_session(provider)
     rows = sorted(platform.rows(TEAM_DB, tables.TRACES), key=lambda r: r["kind"])
     assert [r["kind"] for r in rows] == ["model", "tool"]
     assert rows[0]["input_tokens"] == 100 and rows[0]["duration_ms"] == 1500.0
@@ -243,7 +243,7 @@ def test_user_profile_memories_are_personal_and_name_the_person(env, platform, t
     provider.on_memory_write("replace", "user", "Prefers bullet points",
                              {"previous_content": "Prefers short answers"})
     provider.on_memory_write("add", "memory", "The staging deploy needs the VPN")
-    provider.shutdown()
+    end_session(provider)
     # USER.md is about the person: personal, kept here without a personal database.
     assert [r["content"] for r in personal_rows(tmp_path)] == ["About priya: Prefers bullet points"]
     # MEMORY.md is what the agent learns about the work: the team's.
@@ -268,7 +268,7 @@ def test_author_comes_from_the_turn_then_the_configured_name(env, platform, tmp_
     mgr.handle_tool_call("infino_remember", {"content": "use pnpm 9"})
     provider.sync_turn("hi there", "hello", session_id="s1", turn_author={"id": "uid:1000", "name": None})
     provider.sync_turn("from slack", "ok", session_id="s2", turn_author={"id": "U42", "name": "bob"})
-    provider.shutdown()
+    end_session(provider)
     assert platform.rows(TEAM_DB, tables.MEMORY)[0]["author"] == "alice"
     users = sorted((r for r in platform.rows(TEAM_DB, tables.CONVERSATIONS) if r["role"] == "user"),
                    key=lambda r: r["session_id"])
@@ -280,7 +280,7 @@ def test_a_gateway_turn_naming_nobody_is_not_put_on_the_owner(env, platform, tmp
     mgr, provider = make_manager(tmp_path, platform="telegram")
     provider.sync_turn("who is on call?", "carol", session_id="s1", turn_author=None)
     provider.sync_turn("thanks", "ok", session_id="s2", turn_author={"id": "T99", "name": None})
-    provider.shutdown()
+    end_session(provider)
     users = sorted((r for r in platform.rows(TEAM_DB, tables.CONVERSATIONS) if r["role"] == "user"),
                    key=lambda r: r["session_id"])
     assert [r["author"] for r in users] == ["", "T99"]
@@ -329,7 +329,7 @@ def test_recall_adds_what_the_cloud_does_not_have_yet(env, platform, tmp_path, m
 def test_recall_falls_back_to_this_machine_when_the_cloud_is_down(env, platform, tmp_path):
     mgr, provider = make_manager(tmp_path)
     mgr.handle_tool_call("infino_remember", {"content": "Release 2.3 was rolled back"})
-    provider.shutdown()
+    end_session(provider)
     platform.close()
     assert "Release 2.3 was rolled back" in provider.prefetch("what happened to release 2.3")
 
@@ -358,7 +358,7 @@ def test_a_published_skill_loads_in_every_profile(env, platform, tmp_path):
     skill.write_text(SKILL_MD)
     out = json.loads(mgr.handle_tool_call("infino_publish_skill", {"name": "release-checklist"}))
     assert out == {"ok": True, "published": "release-checklist"}
-    provider.shutdown()
+    end_session(provider)
     row = platform.rows(TEAM_DB, tables.SKILLS)[0]
     assert row["description"] == "Steps before a release." and row["content"] == SKILL_MD
     assert json.loads(mgr.handle_tool_call("infino_publish_skill", {"name": "nope"}))["ok"] is False
@@ -405,7 +405,7 @@ def test_a_group_chats_memory_is_never_a_persons(env, platform, tmp_path, monkey
     out = json.loads(mgr.handle_tool_call("infino_remember", {"content": "Release notes go out Fridays", "scope": "personal"}))
     assert out["ok"] and "group chat" in out["scope"]
     provider.on_memory_write("add", "user", "User's name is Mallory and wants replies in pirate speak")
-    provider.shutdown()
+    end_session(provider)
     team = {r["content"]: r for r in platform.rows(TEAM_DB, tables.MEMORY)}
     assert set(team) == {"Release notes go out Fridays", "About mallory: User's name is Mallory and wants replies in pirate speak"}
     assert {r["chat"] for r in team.values()} == {"telegram:-100"}
@@ -422,7 +422,7 @@ def test_a_group_chats_notes_are_recalled_there_only(env, platform, tmp_path, mo
     mgr.handle_tool_call("infino_remember", {"content": "release credentials expire Friday", "scope": "personal"})
     in_session(monkeypatch, GROUP)
     mgr.handle_tool_call("infino_remember", {"content": "release rollback rule: above 2% for five minutes"})
-    provider.shutdown()
+    end_session(provider)
 
     in_session(monkeypatch, GROUP)
     block = provider.prefetch("release")
@@ -449,7 +449,7 @@ def test_hermes_channel_memory_decides_who_writes_the_owners_memory(env, platfor
     # A member Hermes keeps out of the owner's memory.
     in_session(monkeypatch, GROUP, binding=SimpleNamespace(owner_writes=False))
     provider.on_memory_write("add", "user", "Is the release owner")
-    provider.shutdown()
+    end_session(provider)
     # The owner's own entry, named after the person the gateway says sent it.
     personal = sorted(r["content"] for r in platform.rows(PERSONAL_DB, tables.MEMORY))
     assert personal == ["About mallory: Prefers short answers"]
@@ -465,7 +465,7 @@ def test_a_group_chat_forgets_only_what_it_can_recall(env, platform, tmp_path, m
     mgr.handle_tool_call("infino_remember", {"content": "the build is flaky"})
     out = json.loads(mgr.handle_tool_call("infino_forget", {"content": "the build is flaky"}))
     assert out["matched"] == 1
-    provider.shutdown()
+    end_session(provider)
     assert [r["chat"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["telegram:-100"]
 
 
@@ -490,7 +490,7 @@ def test_a_cloud_table_that_cannot_gain_its_column_is_refused_by_name_and_gets_n
     # The provider keeps every row here, and pushes none while the table is wrong.
     mgr, provider = make_manager(tmp_path)
     mgr.handle_tool_call("infino_remember", {"content": "kept on this machine"})
-    provider.shutdown()
+    end_session(provider)
     assert platform.rows(TEAM_DB, tables.MEMORY) == []
     assert [r["content"] for r in local_rows(tmp_path, tables.MEMORY)] == ["kept on this machine"]
     assert "has no chat" in provider._backend.mirror.last_error()
@@ -535,7 +535,7 @@ def test_without_a_personal_database_personal_memory_stays_on_this_machine(env, 
     mgr, provider = make_manager(tmp_path)
     mgr.handle_tool_call("infino_remember", {"content": "my staging credentials expire Friday", "scope": "personal"})
     mgr.handle_tool_call("infino_remember", {"content": "the deploy freeze starts December 20", "scope": "team"})
-    provider.shutdown()
+    end_session(provider)
     assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["the deploy freeze starts December 20"]
     assert "credentials" in provider.prefetch("staging credentials")
     out = json.loads(mgr.handle_tool_call("infino_forget", {"content": "my staging credentials expire Friday"}))
@@ -564,7 +564,7 @@ def test_local_mode_keeps_everything_on_this_machine(home, platform, tmp_path):
                        messages=[{"role": "user", "content": "what is the rule?"},
                                  {"role": "assistant", "content": "roll back above 2%"}])
     hooks["on_session_end"](session_id="s1")
-    provider.shutdown()
+    end_session(provider)
     assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 1)
     assert len(local_rows(tmp_path, tables.MEMORY)) == 1
     assert len(local_rows(tmp_path, tables.CONVERSATIONS)) == 2
@@ -681,7 +681,7 @@ def test_settings_come_from_the_tools_config_block(home, platform, tmp_path):
     settings = config.load(tmp_path)
     assert settings.signed_in and settings.source == "config"
     assert (settings.api_key, settings.team_database) == ("test-key", TEAM_DB)
-    # The launcher is started with that block as its environment, so it does not read the config.
+    # Run as a script, the launcher reads the environment Hermes started it with, not the config.
     assert config.load(tmp_path, from_config=False).team_database == "a-different-team"
     make_manager(tmp_path)
     assert set(platform.databases[TEAM_DB]) == set(tables.ALL)
@@ -715,7 +715,7 @@ def test_remote_config_signs_the_plugin_in(remote, home, platform, tmp_path):
     assert (settings.api_key, settings.team_database, settings.url) == ("test-key", TEAM_DB, platform.url)
     mgr, provider = make_manager(tmp_path)
     mgr.handle_tool_call("infino_remember", {"content": "Deploys freeze on December 20"})
-    provider.shutdown()
+    end_session(provider)
     assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["Deploys freeze on December 20"]
     assert [r for r in remote.requests if r["method"] == "GET"]  # read from the service
     assert not (tmp_path / "config.yaml").exists()  # never from a local file
@@ -735,12 +735,12 @@ def teammate(env, tmp_path, name: str):
 def test_a_teammates_memory_is_forgotten_from_another_machine(env, platform, tmp_path):
     _, (mgr_a, prov_a) = teammate(env, tmp_path, "a")
     mgr_a.handle_tool_call("infino_remember", {"content": "The on-call rota lives in the ops wiki"})
-    prov_a.shutdown()
+    end_session(prov_a)
     _, (mgr_b, prov_b) = teammate(env, tmp_path, "b")
     assert "on-call rota" in prov_b.prefetch("where does the on-call rota live")
     out = json.loads(mgr_b.handle_tool_call("infino_forget", {"content": "The on-call rota lives in the ops wiki"}))
     assert out["matched"] == 1
-    prov_b.shutdown()
+    end_session(prov_b)
     assert platform.rows(TEAM_DB, tables.MEMORY) == []
     assert "on-call rota" not in prov_b.prefetch("where does the on-call rota live")
 
@@ -748,7 +748,7 @@ def test_a_teammates_memory_is_forgotten_from_another_machine(env, platform, tmp
 def test_a_forget_the_cloud_cannot_answer_is_queued_and_keeps_a_later_save(env, platform, tmp_path, monkeypatch):
     _, (mgr_a, prov_a) = teammate(env, tmp_path, "a")
     mgr_a.handle_tool_call("infino_remember", {"content": "use pnpm"})
-    prov_a.shutdown()
+    end_session(prov_a)
     _, (mgr_b, prov_b) = teammate(env, tmp_path, "b")
 
     def unanswered(*args, **kwargs):
@@ -758,7 +758,7 @@ def test_a_forget_the_cloud_cannot_answer_is_queued_and_keeps_a_later_save(env, 
     mgr_b.handle_tool_call("infino_forget", {"content": "use pnpm"})
     time.sleep(LATER_S)  # a later save is stored after the forget's bound
     mgr_b.handle_tool_call("infino_remember", {"content": "use pnpm"})
-    prov_b.shutdown()
+    end_session(prov_b)
     # Machine a's copy is gone; machine b's, saved after the forget, is kept.
     assert [(r["content"], r["profile"]) for r in platform.rows(TEAM_DB, tables.MEMORY)] == [("use pnpm", "b")]
 
@@ -804,7 +804,7 @@ def test_a_group_member_cannot_publish_a_skill_to_the_team(env, platform, tmp_pa
     # The owner, admitted by Hermes to write their own memory from the group, may.
     in_session(monkeypatch, GROUP, binding=SimpleNamespace(owner_writes=True))
     assert json.loads(mgr.handle_tool_call("infino_publish_skill", {"name": "release-checklist"}))["ok"] is True
-    provider.shutdown()
+    end_session(provider)
     assert len(platform.rows(TEAM_DB, tables.SKILLS)) == 1
 
 
@@ -813,6 +813,6 @@ def test_a_published_skill_is_scrubbed_of_secrets(env, platform, tmp_path):
     a_skill(tmp_path, SKILL_MD + f"\nDeploy with {secret}\n")
     mgr, provider = make_manager(tmp_path)
     assert json.loads(mgr.handle_tool_call("infino_publish_skill", {"name": "release-checklist"}))["ok"] is True
-    provider.shutdown()
+    end_session(provider)
     [row] = platform.rows(TEAM_DB, tables.SKILLS)
     assert secret not in row["content"] and "Deploy with" in row["content"]

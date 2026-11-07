@@ -23,7 +23,7 @@ config to edit. The key reaches the client in its environment
 Hermes hands an MCP server only an allowlist of its environment plus the
 entry's `env`, so a deployment that signs in through config names
 INFINO_TEAM_DATABASE and `INFINO_API_KEY: ${INFINO_API_KEY}` in that block,
-which the plugin reads too (config.py).
+which the plugin and this launcher both read from the config (config.py).
 
 Before the client starts, the local tables are created: the client opens the
 local database's tables once, at its start, and a first session's plugin may
@@ -88,11 +88,17 @@ def node_command() -> str:
     return shutil.which("node", path=with_hermes_node_path({"PATH": ""})["PATH"]) or "node"
 
 
-def launch(config, local) -> None:
-    """Create the local tables, then become the client (never returns)."""
-    # Hermes started this process with the config's `env` block as its
-    # environment, so the block is read from there, not from the config again.
-    settings = config.load(from_config=False)
+def launch(config, local, *, from_config: bool = True) -> None:
+    """Create the local tables, then become the client (never returns).
+
+    Hermes starts this process with the config's `env` block as its
+    environment. As `hermes infino mcp`, it is Hermes's own command line, which
+    loads the profile's `.env` over that environment as it starts (and boots
+    the config backend): so the block is read from the config, as the plugin
+    reads it, or a `.env` left by an earlier setup would pick another team.
+    Run as a script (`from_config=False`), nothing loads `.env`, and the block
+    is read from the environment Hermes gave it."""
+    settings = config.load(from_config=from_config)
     store = local.LocalStore.under(config.state_dir(settings.home))
     store.ensure_tables(with_vectors=not settings.signed_in)
     client_js = os.environ.get("INFINO_CLIENT") or ""
@@ -112,7 +118,7 @@ def main() -> None:
     # same name; the plugin's are reached through PACKAGE instead.
     here = str(Path(__file__).resolve().parent)
     sys.path[:] = [p for p in sys.path if Path(p or ".").resolve() != Path(here)]
-    launch(*_load_plugin())
+    launch(*_load_plugin(), from_config=False)
 
 
 if __name__ == "__main__":

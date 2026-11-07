@@ -4,8 +4,11 @@ the conversation they belong to. A personal session's traces (privacy.py) go
 to the person's own database instead, as its conversation does: which
 scheduled job a run belongs to is noted from each of its calls, a chat a job's
 output was delivered into from the turn's history before its first model call
-(`pre_llm_call`), and a subagent follows the session that started it
-(`subagent_start`).
+(`pre_llm_call`), a session that read the person's own database from that
+call (under the session Hermes names for it, which may be one Hermes moved the
+agent to without telling the provider), and a subagent follows the session
+that started it (`subagent_start`), whose standing is read there, in its own
+context and profile: Hermes may run the subagent as another profile.
 
 Rows are buffered per session and written once per turn (Hermes's plugin
 `on_session_end` hook fires at each turn's end), so a turn with ten tool
@@ -23,8 +26,9 @@ scope they were made in, whichever turn's call sets them going.
 Hermes scrubs secrets from everything it hands a memory provider, but these
 hooks get tool arguments and results as the tool saw them. So every text
 cell is put through the same scrub (`redact_for_egress`) before it is kept:
-a key a tool printed never reaches the team's database. The text of a
-personal memory written by a tool call is withheld (privacy.py). A model
+a key a tool printed never reaches the team's database. The text of a call
+that may write personal memory, or that read the person's own database, is
+withheld (privacy.py): from its arguments, its result and its error. A model
 call's row keeps the text the model wrote; its tool calls are rows of their
 own.
 
@@ -229,6 +233,17 @@ def _write(session_id: str, rows: list[dict], author: Optional[str] = None) -> N
         logger.warning("infino-traces: %d trace rows not written: %s", len(rows), e)
 
 
+def _personal(session_id: str) -> bool:
+    """Whether a session is personal (privacy.py), read in the profile scope
+    and context this runs in; personal when that cannot be read."""
+    try:
+        return backend.for_settings(config.load()).transcript_personal(session_id)
+    except Exception as e:
+        logger.warning("infino-traces: could not read whether session %s is personal (kept personal): %s",
+                       session_id, e)
+        return True
+
+
 @dataclass
 class _Waiting:
     """A session's rows not written yet."""
@@ -298,12 +313,25 @@ class TraceRecorder:
     def on_subagent(self, **kw: Any) -> None:
         """A subagent's session is as personal as the session that started it,
         and its rows are that session's person's and profile's: Hermes starts
-        no provider for a subagent, which would note them."""
+        no provider for a subagent, which would note them.
+
+        Hermes fires this as the parent, before the subagent runs, and may run
+        the subagent as another profile (a delegation route): there the
+        parent's profile settings are not read, and that profile may load its
+        own copy of this plugin, which knows nothing noted here. So the
+        parent's standing is read now, in its own context and profile, and a
+        personal parent's subagent is noted personal."""
         child, parent = str(kw.get("child_session_id") or ""), str(kw.get("parent_session_id") or "")
         privacy.note_parent(child, parent)
+        if not child or child == parent:
+            return
         identity = _identity_of(parent)
-        if child and child != parent and any(identity) and not any(_identity_of(child)):
+        if any(identity) and not any(_identity_of(child)):
             note_identity(child, *identity)
+        if parent:
+            privacy.note_cron_job(parent)  # the job a run belongs to is said in the run's own context
+            if _personal(parent):
+                privacy.note_personal(child)
 
     def on_api(self, **kw: Any) -> None:
         inp, out, cached = _tokens(kw.get("usage"))
@@ -331,7 +359,14 @@ class TraceRecorder:
 
     def on_tool(self, **kw: Any) -> None:
         tool = str(kw.get("tool_name") or "")
+        session = str(kw.get("session_id") or "")
+        if session and privacy.read_personal(tool, kw.get("result")):
+            # The session the agent runs, as Hermes names it for the call: Hermes may have moved
+            # the agent to another session without telling the provider, which notes the one it knows.
+            privacy.note_personal(session)
         personal = privacy.is_personal_call(tool, kw.get("args"))
+        # A failed call's error can quote its arguments ("No entry matched '<text>'").
+        error = kw.get("error_message") or ""
         self._add(kw.get("session_id", ""), {
             "session_id": str(kw.get("session_id") or ""),
             "turn_id": str(kw.get("turn_id") or ""),
@@ -342,7 +377,7 @@ class TraceRecorder:
             "tool": tool,
             "provider": "",
             "status": str(kw.get("status") or ""),
-            "error": _clip(kw.get("error_message") or ""),
+            "error": privacy.WITHHELD if personal and error else _clip(error),
             "duration_ms": float(kw.get("duration_ms") or 0),
             "input_tokens": 0,
             "output_tokens": 0,

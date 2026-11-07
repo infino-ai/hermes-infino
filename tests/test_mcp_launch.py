@@ -5,10 +5,11 @@ from __future__ import annotations
 import sys
 
 import pytest
+from hermes_cli.env_loader import load_hermes_dotenv
 
 from hermes_infino import config, local, mcp_launch, tables
 
-from .helpers import TEAM_DB, sign_in
+from .helpers import TEAM_DB, sign_in, write_tools_setting
 
 CLIENT_JS = "/opt/infino/client/dist/cli.js"
 NODE = "/opt/node/bin/node"
@@ -50,6 +51,21 @@ def test_signed_in_through_the_environment_starts_it_on_the_cloud(started, home,
     assert {k: started["env"][k] for k in mcp_launch.CLOUD_ENV} == mcp_launch.CLOUD_ENV
     assert started["env"]["INFINO_API_KEY"] == "the-key" and "CX_LOCAL_DB" not in started["env"]
     assert not local.LocalStore.under(config.state_dir(tmp_path)).has_vectors()
+
+
+def test_the_config_block_wins_over_the_profiles_env_file_for_the_tools_too(started, home, tmp_path):
+    """`hermes infino mcp` is Hermes's own command line: as it starts, it loads
+    the profile's .env over the environment Hermes started it with (the config
+    block). The tools still read the team the block names, as the plugin does."""
+    write_tools_setting(tmp_path, f"INFINO_TEAM_DATABASE: {TEAM_DB}")
+    home.setenv("INFINO_TEAM_DATABASE", TEAM_DB)  # the block, as Hermes passes it to the tools
+    home.setenv("INFINO_API_KEY", "k")
+    (tmp_path / ".env").write_text("INFINO_TEAM_DATABASE=hermes-team\n")  # left by an earlier setup
+    load_hermes_dotenv(hermes_home=tmp_path)  # what `hermes` does as it starts
+    mcp_launch.launch(config, local)
+    argv = started["argv"]
+    assert argv[argv.index("--db") + 1].endswith(f"/{TEAM_DB}")
+    assert config.load(tmp_path).team_database == TEAM_DB
 
 
 def test_signed_in_through_the_sign_in_file(started, platform, tmp_path):

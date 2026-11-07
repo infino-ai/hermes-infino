@@ -24,6 +24,8 @@ MANY_ROWS = 5
 QUOTED = "it's Bob's"
 # The mirror's settle window as shipped (the tests' fixture turns it off).
 SETTLE_MS = mirror.SETTLE_MS
+# How far a clock is put back: well past how far ahead of it a row is stamped.
+CLOCK_PUT_BACK_MS = 60_000
 
 
 @pytest.fixture
@@ -264,13 +266,26 @@ def test_an_unrelated_question_recalls_nothing(store):
     assert store.search_memory("lunch menu tomorrow", 5, PROJECTION) == []
 
 
-def test_a_clock_stepped_back_never_stamps_behind_a_committed_row(store, monkeypatch):
+def test_a_clock_stepped_back_a_little_never_stamps_behind_a_committed_row(store, monkeypatch):
     store.append(tables.CONVERSATIONS, [{"content": "first"}])
     [first] = store.query_sql("SELECT stored_ms FROM conversations")
-    monkeypatch.setattr(local_mod, "_now_ms", lambda: first[tables.STORED] - 60_000)
+    monkeypatch.setattr(local_mod, "_now_ms", lambda: first[tables.STORED] - local_mod.MAX_STAMP_AHEAD_MS // 2)
     store.append(tables.CONVERSATIONS, [{"content": "after the clock moved back"}])
     later = store.query_sql("SELECT stored_ms FROM conversations WHERE content = 'after the clock moved back'")
     assert later[0][tables.STORED] > first[tables.STORED]
+
+
+def test_a_clock_put_back_further_stamps_by_the_clock_and_leaves_a_note_for_the_next_sync(store, monkeypatch):
+    # Stamped past the latest row, it would wait unpushed until the clock caught up.
+    store.append(tables.CONVERSATIONS, [{"content": "first"}])
+    [first] = store.query_sql("SELECT stored_ms FROM conversations")
+    back = first[tables.STORED] - CLOCK_PUT_BACK_MS
+    monkeypatch.setattr(local_mod, "_now_ms", lambda: back)
+    store.append(tables.CONVERSATIONS, [{"content": "after the clock was put back"}])
+    later = store.query_sql("SELECT stored_ms FROM conversations WHERE content = 'after the clock was put back'")
+    assert later[0][tables.STORED] == back
+    [note] = [json.loads(line) for line in (store.path.parent / local_mod.LATE_COMMITS_FILE).read_text().splitlines()]
+    assert note == {"store": "db", "table": tables.CONVERSATIONS, "stored_ms": back}
 
 
 def test_a_delete_takes_only_the_rows_it_found(store, monkeypatch):

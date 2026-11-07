@@ -5,7 +5,8 @@ same status codes the platform documents (409 with Retry-After on a busy
 table, 400 for a hybrid search the deployment cannot embed, 403 for an
 embedding column an account cannot have, 400 for one a deployment with no
 embedding server cannot, 404 for a delete in a database or table that does
-not exist). Search is a naive keyword match:
+not exist, 413 for an append a busy worker's memory budget cannot take).
+Search is a naive keyword match:
 these tests check the plugin's logic, not ranking. The real platform is
 exercised by the end-to-end test on a Hermes install.
 """
@@ -24,6 +25,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # words for a JSON schema field, which the worker passes through.
 NO_EMBEDDING_SERVER = ('schema field "embedding" of type "embedding" needs an embedding server, and this '
                        'deployment has none configured')
+# What a worker answers (413, plain text) for an append its connection's memory
+# budget cannot take while other queries fill it: the engine's OverBudget error
+# ("over budget: ...") under the worker's "<operation> error: " (the platform's
+# worker/src/error.rs, classify_infino and ConnectionError::Engine).
+OVER_BUDGET = "append error: over budget: the connection's memory budget is spent"
 
 
 class FakePlatform:
@@ -39,6 +45,7 @@ class FakePlatform:
         self.failed_deletes = 0        # next N deletes answer 500
         self.refused_marker = None     # an append carrying a row with this text answers refused_status
         self.refused_status = 400
+        self.over_budget = False       # every append answers 413 OVER_BUDGET (a busy worker)
         self.no_embedder = False       # create_table refuses embedding columns with 403
         self.no_embedding_server = False  # create_table refuses embedding columns with 400 (none deployed)
         self.schema_patch_refused = False  # a schema patch (adding a column) answers 403
@@ -67,9 +74,11 @@ class FakePlatform:
                 pass
 
             def _send(self, status: int, body=None, headers=None):
-                raw = json.dumps(body if body is not None else {}).encode()
+                # A worker's error is plain text; everything else here is JSON.
+                text = isinstance(body, str)
+                raw = body.encode() if text else json.dumps(body if body is not None else {}).encode()
                 self.send_response(status)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", "text/plain" if text else "application/json")
                 for k, v in (headers or {}).items():
                     self.send_header(k, v)
                 self.send_header("Content-Length", str(len(raw)))
@@ -169,6 +178,8 @@ class FakePlatform:
             if self.failed_appends > 0:
                 self.failed_appends -= 1
                 return 500, {"error": "append error"}, None
+            if self.over_budget:
+                return 413, OVER_BUDGET, None
             if self.refused_marker and any(self.refused_marker in json.dumps(r) for r in body["data"]):
                 return self.refused_status, {"error": "row refused"}, None
             if params["table"] not in tables:

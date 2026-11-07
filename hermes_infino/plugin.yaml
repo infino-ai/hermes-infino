@@ -1,5 +1,5 @@
 name: infino
-version: 0.5.7
+version: 0.5.8
 description: "Infino as the backend for Hermes: memory, conversations, traces and skills in an Infino database on this machine, and in the team's Infino Cloud database once signed in (`hermes infino login`), read by the Infino client's MCP tools."
 author: "Infino"
 homepage: "https://github.com/infino-ai/hermes-infino"
@@ -39,7 +39,7 @@ optional_env:
     description: "on: this profile's conversations and traces are personal, never the team's (default off)"
     password: false
   - name: INFINO_PERSONAL_JOBS
-    description: "Scheduled jobs (ids or names, comma-separated) whose runs and delivered output are personal"
+    description: "Scheduled jobs (names, or this profile's job ids, comma-separated) whose runs and delivered output are personal"
     password: false
 # The plugin hooks registered (traces.py); the memory provider's own methods are not hooks.
 hooks:

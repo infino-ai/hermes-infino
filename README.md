@@ -16,7 +16,7 @@ The plugin keeps four tables.
 
 **`traces`** records every model call (model, provider, tokens, time) and every tool call (name, arguments, result, status, time). Secrets are masked the same way Hermes masks them for any memory plugin.
 
-**`skills`** holds the skills your agents share with `infino_publish_skill`. Once you sign in, every profile on the team can use them as read-only `infino:<name>` skills, from its next session. Members of a group chat can't publish, and secrets are masked first. Set `INFINO_TEAM_SKILLS=off` to keep a profile to its own skills.
+**`skills`** holds the skills your agents share with `infino_publish_skill`. Once you sign in, every profile on the team can use them as read-only `infino:<name>` skills, from its next session. Only the profile's owner publishes, from their own sessions or a chat on a profile marked personal. Group chat members, a shared profile's gateway users, hosted rooms, messages from other agents and jobs made in a gateway chat can't. Secrets are masked first. A shared skill's name can have only letters, digits, `-` and `_`, the only names Hermes loads a plugin's skills under. Set `INFINO_TEAM_SKILLS=off` to keep a profile to its own skills.
 
 A turn and its traces share a `session_id` and a `turn_id`, so you can join them. Every row has a `row_id`.
 
@@ -75,7 +75,7 @@ Once you sign in:
 You need:
 
 - Hermes, installed with its installer: `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`. The plugin is tested on Hermes 0.22.6, 0.22.7 and 0.23.0.
-- Read access to the private repositories `infino-ai/hermes-infino` and `infino-ai/ask-bench`. Run `gh auth login` first, or put `GITHUB_TOKEN=<a token that can read them>` in `~/.hermes/.env`.
+- Read access to the private repositories `infino-ai/hermes-infino` and `infino-ai/ask-bench`. Run `gh auth login`, then `gh auth setup-git`, so `git clone` in step 1 can use your GitHub sign-in. Hermes's installer in step 2 uses it too. It also reads a `GITHUB_TOKEN=<a token that can read them>` line in `~/.hermes/.env`, but `git clone` doesn't.
 
 **1. Build the Infino client.** It needs Node.js 22.19 or newer. Hermes's installer puts one in `~/.hermes/tools/`.
 
@@ -124,11 +124,13 @@ To use another Infino platform, such as staging, add `--url`:
 hermes infino login --url https://api.platform.staging.infino.ai --api-key-file KEY --team-database TEAM --yes
 ```
 
-`login` shows what it will upload and asks before it creates or sends anything. Only a person at a terminal can agree to create an account. With a key someone gave you, `--yes` agrees to the upload. The key is saved in `$HERMES_HOME/infino/credentials.json`, readable only by you. To sign in again, remove that file first.
+`login` shows what it will upload and asks before it creates or sends anything. Only a person at a terminal can agree to create an account. With a key someone gave you, `--yes` agrees to the upload. The key is saved in `$HERMES_HOME/infino/credentials.json`, readable only by you. A free account's key is given only once, so keep that file. To sign in again, save its `api_key` to a file first. Then remove `credentials.json` and run `hermes infino login` with `--api-key-file` and the saved key, and `--team-database` and your team's database.
+
+A URL, team database, personal database or key set in the config block or `.env` takes precedence over a sign-in (see [Settings](#settings)). `login` uses the team and personal database set there. If one of those settings differs from what `login` would use, `login` stops before it creates or sends anything and says where the setting is.
 
 Once you're signed in, the plugin uploads what your machine has kept so far, then each new memory, conversation, trace and skill as it happens. Your machine keeps its own copy.
 
-`login` also creates your personal database and prints its name. The name is the team's plus a random suffix, such as `hermes-team-personal-3f9a1c2e`, so it's never shared with anyone. To use it from another machine, sign in there with `--personal-database` and that name. To keep personal data on this machine only, add `--no-personal-database`. Your personal database can't be the team database. If it can't be created, for example because your key may not create that database, you're still signed in, and personal data stays on your machine.
+`login` also creates your personal database and prints its name, unless `INFINO_PERSONAL_DATABASE` already names one. The name is the team's plus a random suffix, such as `hermes-team-personal-3f9a1c2e`, so it's never shared with anyone. To use it from another machine, sign in there with `--personal-database` and that name. To keep personal data on this machine only, add `--no-personal-database`. Your personal database can't be the team database. If it can't be created, for example because your key may not create that database, you're still signed in, and personal data stays on your machine. To add one later without signing in again, run `hermes config set INFINO_PERSONAL_DATABASE <a name of your own>`. The next sync creates it.
 
 A running Hermes picks up the sign-in within half a minute. The Infino tools switch to the cloud when Hermes restarts. Until then they search your machine's copy, which has everything too.
 
@@ -148,6 +150,8 @@ Personal memory lives in its own database. On your machine it's in `$HERMES_HOME
 
 Personal memory belongs to the profile's owner. A shared profile on a gateway answers whoever writes to it, so it keeps no personal memory. On a profile that serves only you, such as your own bot, set `INFINO_PERSONAL_PROFILE=on`. Its chats can then keep your personal memory, and its conversations and traces stay personal too.
 
+A scheduled job made in a gateway chat runs as that chat. It keeps no personal memory on a shared profile, and none on any profile if it was made in a group chat. Neither does a message another agent sends into your Bot Chat.
+
 ## Keeping work personal
 
 Conversations and traces go to the team database, so every agent can see what the others did. Some work is yours alone, such as a scheduled job that summarizes your email, or a profile for private errands. Mark it personal, and its conversations and traces go to your personal database instead, or stay on your machine if you don't have one.
@@ -157,9 +161,11 @@ Conversations and traces go to the team database, so every agent can see what th
 | `INFINO_PERSONAL_JOBS=email-digest,weekly-finances` | Every run of those scheduled jobs, named as `hermes cron list` shows them: every model call, tool call and subagent along the way, and the chat the output is delivered to |
 | `INFINO_PERSONAL_PROFILE=on` | Every conversation and trace of the profile |
 
+A subagent that Hermes runs as another profile keeps its traces personal on that profile, even for team work, since that profile can't tell whose work it is.
+
 A chat becomes personal once a personal job's output is in its history, and stays personal from then on. The output gets there when the job uses `attach_to_session`, `cron.mirror_delivery` or a continuable thread, or posts to a group chat with `deliver: room:<id>`.
 
-In a group chat, each member's turn runs on that member's own profile. List the job on every member's profile, or once for the whole team through [Remote Config](#running-a-fleet). A member's turn is personal only when their profile lists the job and the turn still includes the job's post.
+In a group chat, each member's turn runs on that member's own profile. List the job by its name on every member's profile, or once for the whole team through [Remote Config](#running-a-fleet): another profile sees only the job's name, never its id. If two of a profile's jobs share a name and either is listed, the output of both is personal. A member's turn is personal only when their profile lists the job and the turn still includes the job's post.
 
 These settings don't change memory. A memory is still the team's unless it's about one person.
 
@@ -170,6 +176,7 @@ When Hermes is in a group chat through the gateway, memory belongs to that chat:
 - What members ask the agent to remember is saved for that chat and credited to whoever said it. It never goes into anyone's personal memory.
 - Recall in the group shows that chat's notes and the team's memory, never anyone's personal memory or other chats' notes.
 - Recall anywhere else doesn't show that group's notes.
+- Notes Hermes's background review saves after a group's turn stay with that chat, and never go into anyone's personal memory. If several groups talked in the same half hour, those notes show in no chat's recall.
 
 ```mermaid
 flowchart LR
@@ -185,7 +192,7 @@ flowchart LR
   R2 --> PM
 ```
 
-Hermes tells the plugin which chat a message came from. Any chat that isn't a direct message counts as a group, and nobody writes to the owner's personal memory from a group. With Hermes's proposed channel memory ([#144822](https://github.com/NousResearch/hermes-agent/pull/144822)), its setting for each chat decides instead.
+Hermes tells the plugin which chat a message came from. Any chat that isn't a direct message counts as a group, including one whose type Hermes can't tell, and nobody writes to the owner's personal memory from a group. With Hermes's proposed channel memory ([#144822](https://github.com/NousResearch/hermes-agent/pull/144822)), its setting for each chat decides instead.
 
 **The Infino tools search the whole team database.** Recall keeps each chat's notes to that chat, but an agent can use the tools to read another chat's notes and conversations.
 
@@ -226,7 +233,9 @@ mcp_servers:
 
 With Hermes's [Remote Config](https://github.com/NousResearch/hermes-agent/pull/122509) (Hermes 0.22.6 and later, turned on with `HERMES_CONFIG_BACKEND=remote`), these settings come from the config service instead of a file. An administrator sets the team database once, and every agent on the team starts with it. Remote Config won't store a key written out in full, so keep `INFINO_API_KEY` as a `${INFINO_API_KEY}` reference and put the key in each profile's `.env`. `hermes infino status` shows where the settings came from.
 
-A profile set up this way has no personal database unless you name one with `INFINO_PERSONAL_DATABASE`, even if it once ran `login`. Without one, its personal memory and personal work stay on that machine.
+Write every value in the `env` block as text. YAML reads a bare `on`, `off`, `yes`, `no`, `true` or `false` as a boolean, and reads numbers and lists as numbers and lists. Hermes passes them to the Infino tools as they are, and the tools won't start. So quote them, as in `INFINO_PERSONAL_PROFILE: "on"`, and write jobs as one string, as in `INFINO_PERSONAL_JOBS: "email-digest,weekly-finances"`. The plugin's log names any value that isn't text. `hermes config set` stores these values as booleans, numbers and lists too, so edit `config.yaml` instead, or put the setting in `.env`, for example with `hermes config set INFINO_PERSONAL_PROFILE on`.
+
+A profile set up this way uses the personal database from its `login` only while its key is the one it signed in with. With another key, it has no personal database unless you name one with `INFINO_PERSONAL_DATABASE`. Without one, its personal memory and personal work stay on that machine.
 
 ## Settings
 
@@ -236,7 +245,7 @@ Each setting comes from the first of these that has it:
 2. the profile's environment (`.env`)
 3. the sign-in saved by `hermes infino login`
 
-The config block comes first because Hermes starts the Infino tools with it as their environment, so the plugin and its tools always use the same team. A `${VAR}` reference to a variable that isn't set counts as not set.
+The config block comes first for the plugin and for the Infino tools alike, so both always use the same team, whatever `.env` says. A `${VAR}` reference to a variable that isn't set counts as not set.
 
 The sign-in's URL and personal database go with its key. They apply only when the key in use is the sign-in's, so another key, from the config block or `.env`, never goes to the sign-in's platform or writes to its personal database.
 
@@ -245,12 +254,12 @@ The sign-in's URL and personal database go with its key. They apply only when th
 | `INFINO_API_KEY` | The Infino API key for this person or bot |
 | `INFINO_TEAM_DATABASE` | The team's database |
 | `INFINO_PERSONAL_DATABASE` | Your own database. `login` creates one. Leave it unset for bots and shared profiles. If it names the team database, the plugin uses none. |
-| `INFINO_AUTHOR` | Who this profile's messages and memories are from, when Hermes doesn't say. In a chat, the sender is the author. |
+| `INFINO_AUTHOR` | Who this profile's messages and memories are from, when Hermes doesn't say (default: the profile's name, on every surface, never the machine's user id). In a chat, the sender is the author. |
 | `INFINO_MCP_SERVER` | The client's name under `mcp_servers` (default `infino`). Environment only, since it names the config block. |
 | `INFINO_URL` | The Infino Cloud URL (default `https://api.platform.infino.ws`) |
 | `INFINO_TEAM_SKILLS` | `off` stops this profile loading the skills teammates publish (default on) |
-| `INFINO_PERSONAL_PROFILE` | `on` keeps this profile's conversations and traces out of the team database, and lets its gateway chats keep personal memory (default off) |
-| `INFINO_PERSONAL_JOBS` | Scheduled jobs (names or ids, comma-separated) whose runs, and the chats their output is delivered to, stay out of the team database |
+| `INFINO_PERSONAL_PROFILE` | `on` keeps this profile's conversations and traces out of the team database, and lets its gateway chats keep personal memory (default off). Any value other than `off`, `false`, `no` or `0` counts as `on`. |
+| `INFINO_PERSONAL_JOBS` | Scheduled jobs (names or ids, comma-separated) whose runs, and the chats their output is delivered to, stay out of the team database. On a profile other than the job's own, name the job, not its id. |
 
 ## Development
 

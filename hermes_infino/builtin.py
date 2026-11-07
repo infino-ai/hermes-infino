@@ -8,10 +8,11 @@ to save what a conversation taught it - writes the same files with every
 memory provider switched off, and a person may edit them by hand. So the
 provider compares the files with the rows it keeps from them (`memory` rows
 of origin `builtin:memory` / `builtin:user`, on this machine) at its start
-and after each turn: an entry no row holds is added as the profile owner's -
-nothing says which conversation or chat it came from, so never as the
-running turn's - and a row whose entry has left the file is deleted, here
-and in the cloud.
+and after each turn: an entry no row holds is added, credited to the profile's
+owner - nothing says who wrote it, nor after which conversation, so the
+provider keeps it where it can do no harm (a group chat's note for that chat
+alone; USER.md as the owner's only where no one else's turn has run) - and a
+row whose entry has left the file is deleted, here and in the cloud.
 
 A file that is missing or cannot be read says nothing: no row is deleted for
 it. Entries are compared scrubbed of secrets, as Hermes scrubs what it hands
@@ -86,10 +87,11 @@ def compare(entries: list[str], rows: list) -> tuple[list[str], list]:
 
 
 @contextmanager
-def lock(state_dir: Path) -> Iterator[None]:
-    """The profile's lock for built-in memory rows (LOCK_FILE)."""
+def lock(state_dir: Path, name: str = LOCK_FILE) -> Iterator[None]:
+    """One of the profile's locks beside its databases, across processes: by
+    default the one for built-in memory rows (LOCK_FILE)."""
     Path(state_dir).mkdir(parents=True, exist_ok=True)
-    with open(Path(state_dir) / LOCK_FILE, "a") as f:
+    with open(Path(state_dir) / name, "a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
             yield

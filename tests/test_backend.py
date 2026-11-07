@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import threading
 import time
 
 import pytest
@@ -11,7 +12,7 @@ from hermes_infino import backend, config, embed, mirror, recall, tables
 from hermes_infino.backend import Backend
 from hermes_infino.client import InfinoError
 
-from .helpers import TEAM_DB, fake_embed, personal_rows, sign_in, wait_for
+from .helpers import PERSONAL_DB, TEAM_DB, fake_embed, personal_rows, sign_in, wait_for
 
 # How long the stand-in sync below takes after it has read its rows.
 SLOW_SYNC_S = 0.5
@@ -23,6 +24,16 @@ FAILURES_IN_A_ROW = 2
 # long enough that the settings change while the old one's sync is pending.
 PENDING_SYNC_S = 0.3
 OTHER_TEAM_DB = "team-other"
+# A settle window a write is still inside when its session ends at once.
+SHORT_SETTLE_MS = 1_000
+# How long one start's move of personal memory waits for another start begun during it.
+OTHER_START_WAIT_S = 1.0
+# A session end's bound on waiting for the cloud, short enough for a test.
+QUICK_FLUSH_S = 0.2
+# Session ends in a row while another process's sync holds the profile's sync.
+SESSION_ENDS = 3
+# A personal memory as an older version kept it: in the team's local table.
+OLD_PERSONAL_MEMORY = {tables.ROW_ID: "p1", "content": "my salary", "scope": recall.PERSONAL}
 
 
 @pytest.fixture
@@ -71,6 +82,53 @@ def test_in_local_mode_nothing_is_scheduled(local_backend):
 def test_signing_in_drops_the_local_vectors_and_makes_the_cloud_tables(cloud_backend, platform):
     assert not cloud_backend.local.has_vectors() and not cloud_backend.personal.has_vectors()
     assert set(platform.databases[TEAM_DB]) == set(tables.ALL)
+
+
+def an_older_versions_personal_memory(b: Backend, database: str, personal: bool = False) -> None:
+    """A personal memory an older version kept in the team's local table and
+    pushed to `database` (the team's, when there was no personal database)."""
+    b.local.ensure_tables(with_vectors=False)
+    b.local.append(tables.MEMORY, [dict(OLD_PERSONAL_MEMORY)])
+    tables.ensure_all(b.mirror.client, database, personal=personal)
+    b.mirror.client.append(database, tables.MEMORY, [dict(OLD_PERSONAL_MEMORY)])
+
+
+def test_personal_memory_an_older_version_pushed_to_the_team_leaves_the_teams_cloud(home, platform, tmp_path):
+    b = backend.for_settings(sign_in(tmp_path, platform))
+    an_older_versions_personal_memory(b, TEAM_DB)
+    b.ensure()
+    b.flush()
+    assert [r for r in platform.rows(TEAM_DB, tables.MEMORY) if r[tables.ROW_ID] == "p1"] == []
+    assert [r["content"] for r in personal_rows(tmp_path)] == ["my salary"]
+
+
+def test_personal_memory_an_older_version_pushed_is_not_pushed_again(home, platform, tmp_path):
+    b = backend.for_settings(sign_in(tmp_path, platform, personal_database=PERSONAL_DB))
+    an_older_versions_personal_memory(b, PERSONAL_DB, personal=True)
+    b.ensure()
+    b.flush()
+    assert [r["content"] for r in platform.rows(PERSONAL_DB, tables.MEMORY)] == ["my salary"]
+
+
+def test_two_starts_move_an_older_versions_personal_memory_once(home, tmp_path, monkeypatch):
+    settings = config.load(tmp_path)
+    first, second = Backend(settings), Backend(settings)
+    first.local.ensure_tables(with_vectors=False)
+    first.local.append(tables.MEMORY, [dict(OLD_PERSONAL_MEMORY)])
+    real = first.personal.append
+    others = []
+
+    def another_start_meanwhile(table, rows):
+        other = threading.Thread(target=second.ensure_local)  # another process of the profile starting
+        other.start()
+        others.append(other)
+        other.join(OTHER_START_WAIT_S)
+        real(table, rows)
+
+    monkeypatch.setattr(first.personal, "append", another_start_meanwhile)
+    first.ensure_local()
+    others[0].join()
+    assert [r["content"] for r in personal_rows(tmp_path)] == ["my salary"]
 
 
 def test_a_write_reaches_the_cloud_by_itself(cloud_backend, platform):
@@ -127,6 +185,33 @@ def test_a_backend_replaced_by_new_settings_never_syncs_again(home, platform, tm
     assert wait_for(lambda: len(platform.rows(OTHER_TEAM_DB, tables.MEMORY)) == 3)
     time.sleep(PENDING_SYNC_S * 2)  # past when the old one's syncs were due
     assert platform.rows(TEAM_DB, tables.MEMORY) == []
+
+
+def test_a_session_end_through_a_replaced_backend_waits_for_its_rows_to_settle(home, platform, tmp_path, monkeypatch):
+    monkeypatch.setattr(backend, "SETTLE_MS", SHORT_SETTLE_MS)
+    monkeypatch.setattr(mirror, "SETTLE_MS", SHORT_SETTLE_MS)
+    old = backend.for_settings(sign_in(tmp_path, platform))
+    new = backend.for_settings(sign_in(tmp_path, platform, personal_database=PERSONAL_DB))
+    new.ensure()
+    assert wait_for(lambda: not (new._timer and new._timer.is_alive()))
+    old.append(tables.MEMORY, [{"content": "written through the old one"}])  # a caller not moved yet
+    old.flush()
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["written through the old one"]
+
+
+def test_session_ends_while_another_process_syncs_leave_one_sync_waiting(cloud_backend, platform, tmp_path,
+                                                                         monkeypatch):
+    monkeypatch.setattr(backend, "FLUSH_TIMEOUT_S", QUICK_FLUSH_S)
+    cloud_backend.append(tables.MEMORY, [{"content": "written before the sessions end"}])
+    before = set(threading.enumerate())
+    with open(config.state_dir(tmp_path) / mirror.LOCK_FILE, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)  # another process's sync, held up by a slow cloud
+        for _ in range(SESSION_ENDS):
+            cloud_backend.flush()
+        waiting = [t for t in threading.enumerate() if t not in before and t.name == "infino-flush" and t.is_alive()]
+        fcntl.flock(f, fcntl.LOCK_UN)
+    assert len(waiting) == 1
+    assert wait_for(lambda: len(platform.rows(TEAM_DB, tables.MEMORY)) == 1)
 
 
 def fail_the_first_look(store, monkeypatch):

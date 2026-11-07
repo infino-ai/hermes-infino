@@ -4,18 +4,23 @@ traces out of the team's database; everything else still goes there."""
 
 from __future__ import annotations
 
+import json
 import time
 from contextlib import contextmanager
 
 import pytest
 
+from agent.delegation_context import delegated_child_context
 from cron.execution_identity import enter_cron_execution, exit_cron_execution
+from cron.jobs import create_job, use_cron_store
 from cron.scheduler_delivery import bot_chat_message
+from tools.delegate_tool_routes import delegated_profile_scope
 
 from hermes_infino import backend, config, privacy, tables
 from hermes_infino.local import PERSONAL_DB_DIR, LocalStore
 
-from .helpers import DM, PERSONAL_DB, TEAM_DB, hook_ctx, in_session, local, make_manager, wait_for
+from .helpers import (DM, PERSONAL_DB, SKILL_MD, TEAM_DB, end_session, hook_ctx, in_session, local, make_manager,
+                      personal_rows, wait_for, write_tools_setting)
 
 # A person's email digest (personal) and the team's weekly report (not).
 DIGEST = {"id": "a1b2c3", "name": "email-digest"}
@@ -33,6 +38,15 @@ LATER_MS = 60_000
 # A registry of sessions this small, and more sessions noted than it holds.
 SMALL_REGISTRY = 3
 MANY_SESSIONS = 10
+# How often the jobs in these tests run, as Hermes's scheduler reads a schedule.
+HOURLY = "every 1h"
+# Where a job was made, as Hermes keeps it with the job (`origin`,
+# tools/cronjob_job_args.py): a team's Slack channel, and a Slack one-to-one
+# chat (a chat id that starts with "D", as cron/scheduler_delivery.py reads it).
+CHANNEL = {"platform": "slack", "chat_id": "C1", "user_id": "U7"}
+SLACK_DM = {"platform": "slack", "chat_id": "D1", "user_id": "U7"}
+# The owner's personal memory, saved at the terminal.
+PRIVATE_PLAN = "Dana is interviewing at Acme"
 
 
 def personal(tmp_path) -> LocalStore:
@@ -44,7 +58,7 @@ def texts(store: LocalStore, table: str) -> list[str]:
     the store has no such table)."""
     if table not in store.list_tables():
         return []
-    cells = ("content", "tool_args", "tool_result") if table == tables.CONVERSATIONS else ("args", "result")
+    cells = ("content", "tool_args", "tool_result") if table == tables.CONVERSATIONS else ("args", "result", "error")
     return [" ".join(str(r.get(c) or "") for c in cells) for r in store.query_sql(f"SELECT * FROM {table}")]
 
 
@@ -135,6 +149,18 @@ def test_a_cron_session_names_its_job_when_hermes_has_no_record_of_the_run(home,
     assert texts(local(tmp_path), tables.TRACES) == []
 
 
+def test_personal_jobs_listed_in_the_tools_block_as_a_yaml_list_are_personal(home, tmp_path):
+    # What `hermes config set mcp_servers.infino.env.INFINO_PERSONAL_JOBS '[...]'`
+    # stores, and what Remote Config can hold: a list, not a comma-separated text.
+    write_tools_setting(tmp_path, f"INFINO_PERSONAL_JOBS: [{DIGEST['name']}, weekly-finances]")
+    make_manager(tmp_path, platform="cron", agent_context="cron", session_id=DIGEST_SESSION)
+    hooks = hook_ctx()
+    with running(DIGEST):
+        a_run(hooks, DIGEST_SESSION)
+    assert wait_for(lambda: len(texts(local(tmp_path), tables.TRACES) + texts(personal(tmp_path), tables.TRACES)) == 2)
+    assert texts(local(tmp_path), tables.TRACES) == []
+
+
 def test_a_team_jobs_run_is_traced_to_the_team_as_before(digest_is_personal, tmp_path):
     make_manager(tmp_path, platform="cron", agent_context="cron", session_id=REPORT_SESSION)
     hooks = hook_ctx()
@@ -173,7 +199,7 @@ def test_the_chat_stays_personal_after_compaction_and_a_restart(chat, tmp_path):
     first = [{"role": "user", "content": DELIVERED}] + turn("Draft a reply to Dr. Lee.", "Drafted.")
     p.sync_turn("Draft a reply to Dr. Lee.", "Drafted.", session_id="dm-1", messages=first)
     p._drain()
-    p.shutdown()
+    end_session(p)
     # A new process; Hermes compacted the chat in place: the delivery is gone from its messages.
     restart()
     _, again = make_manager(tmp_path, platform="telegram", session_id="dm-1")
@@ -307,6 +333,27 @@ def test_a_team_jobs_output_noted_into_a_local_or_bot_chat_stays_the_teams(diges
     assert not privacy.transcript_personal(settings, "bot-chat-2", turn(bot_chat_message(REPORT, "12 deploys."), "ok"))
 
 
+def jobs_named(tmp_path, name: str, prompts: tuple[str, ...]) -> list[dict]:
+    """Jobs of the profile at `tmp_path` that share one name, made by Hermes's own job store."""
+    with use_cron_store(tmp_path):
+        return [create_job(prompt=prompt, schedule=HOURLY, name=name) for prompt in prompts]
+
+
+@pytest.mark.parametrize("delivered", [
+    lambda job: f"[Cron delivery: {job['name']}]\n{TRIAGE}",
+    lambda job: bot_chat_message(job, TRIAGE),
+    lambda job: room_turn(job["name"], TRIAGE),
+])
+def test_a_job_listed_by_its_id_is_recognized_when_another_job_shares_its_name(home, tmp_path, delivered):
+    """Hermes labels a job's output by its name. When two of the profile's jobs
+    share it, either may be the one listed: the output counts as personal (so
+    the other job's does too)."""
+    digest, _ = jobs_named(tmp_path, DIGEST["name"], ("Triage my inbox.", "Triage the team's inbox."))
+    home.setenv("INFINO_PERSONAL_JOBS", digest["id"])
+    messages = turn(delivered(digest), "Drafted a reply to Dr. Lee.")
+    assert privacy.transcript_personal(config.load(tmp_path), "chat-1", messages)
+
+
 def test_a_session_still_making_calls_stays_remembered(home, tmp_path, monkeypatch):
     monkeypatch.setattr(privacy, "MAX_SESSIONS", SMALL_REGISTRY)
     settings = config.load(tmp_path)
@@ -338,6 +385,84 @@ def test_a_chat_a_team_jobs_output_was_delivered_into_stays_the_teams(chat, tmp_
     assert texts(personal(tmp_path), tables.CONVERSATIONS) == []
 
 
+# -- the run of a job made in a chat --------------------------------------------------
+
+def job_made_in(origin) -> dict:
+    """A job as Hermes stores one: made in a chat (`origin`), or at the terminal (None)."""
+    return create_job("Summarize the Acme deal.", "every 1d", name="acme-summary", deliver="origin", origin=origin)
+
+
+def a_run_of(tmp_path, job: dict):
+    """The provider of one of the job's runs, as Hermes's scheduler starts one."""
+    return make_manager(tmp_path, platform="cron", agent_context="cron", agent_identity="bot",
+                        session_id=f"cron_{job['id']}_20261107_090000")
+
+
+def remembered_at_the_terminal(tmp_path) -> None:
+    m, _ = make_manager(tmp_path, agent_identity="bot", session_id="cli")
+    assert json.loads(m.handle_tool_call("infino_remember", {"content": PRIVATE_PLAN, "scope": "personal"}))["ok"]
+
+
+def call(m, tool: str, **args) -> dict:
+    return json.loads(m.handle_tool_call(tool, args))
+
+
+@pytest.mark.parametrize("personal_profile", ["off", "on"])
+def test_a_run_of_a_job_made_in_a_channel_keeps_out_the_owners_personal_memory(home, tmp_path, personal_profile):
+    # A team bot's member asked for it in a channel: the run answers the channel.
+    home.setenv("INFINO_PERSONAL_PROFILE", personal_profile)
+    remembered_at_the_terminal(tmp_path)
+    job = job_made_in(CHANNEL)
+    m, p = a_run_of(tmp_path, job)
+    with running(job):
+        assert "Acme" not in p.prefetch("Acme deal")
+        assert call(m, "infino_remember", content="Bob is job hunting", scope="personal")["ok"] is False
+    assert [r["content"] for r in personal_rows(tmp_path)] == [PRIVATE_PLAN]
+
+
+def test_a_run_of_a_job_made_in_a_shared_profiles_dm_keeps_out_the_owners_personal_memory(home, tmp_path):
+    remembered_at_the_terminal(tmp_path)
+    job = job_made_in(SLACK_DM)
+    _, p = a_run_of(tmp_path, job)
+    with running(job):
+        assert "Acme" not in p.prefetch("Acme deal")
+
+
+def test_a_run_of_a_job_made_in_a_personal_profiles_dm_is_its_owners(home, tmp_path):
+    home.setenv("INFINO_PERSONAL_PROFILE", "on")
+    remembered_at_the_terminal(tmp_path)
+    job = job_made_in(SLACK_DM)
+    _, p = a_run_of(tmp_path, job)
+    with running(job):
+        assert "Acme" in p.prefetch("Acme deal")
+
+
+def test_a_run_of_a_job_made_at_the_terminal_is_its_owners(home, tmp_path):
+    remembered_at_the_terminal(tmp_path)
+    job = job_made_in(None)
+    m, p = a_run_of(tmp_path, job)
+    with running(job):
+        assert "Acme" in p.prefetch("Acme deal")
+        assert call(m, "infino_remember", content="the summary went out", scope="personal")["ok"] is True
+
+
+def test_a_run_whose_job_cannot_be_read_keeps_out_the_owners_personal_memory(home, tmp_path):
+    remembered_at_the_terminal(tmp_path)
+    _, p = make_manager(tmp_path, platform="cron", agent_context="cron", agent_identity="bot", session_id=DIGEST_SESSION)
+    with running(DIGEST):  # a job no store holds
+        assert "Acme" not in p.prefetch("Acme deal")
+
+
+def test_a_run_of_a_job_made_in_a_channel_does_not_publish_a_skill(home, tmp_path):
+    skill = tmp_path / "skills" / "release-checklist" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(SKILL_MD)
+    job = job_made_in(CHANNEL)
+    m, _ = a_run_of(tmp_path, job)
+    with running(job):
+        assert call(m, "infino_publish_skill", name="release-checklist")["ok"] is False
+
+
 # -- a personal profile --------------------------------------------------------------
 
 def test_a_personal_profile_keeps_its_conversations_and_traces_personal(home, tmp_path):
@@ -359,6 +484,90 @@ def test_a_profile_that_is_not_personal_shares_as_before(home, tmp_path):
     p.sync_turn("What time is standup?", "Ten.", session_id="work")
     p._drain()
     assert len(texts(local(tmp_path), tables.CONVERSATIONS)) == 2
+
+
+@pytest.mark.parametrize("value, is_personal", [("on", True), ("Yes", True), ("y", True), ("enabled", True),
+                                                ("off", False), ("No", False), ("false", False), ("0", False),
+                                                ("", False)])
+def test_only_an_off_value_keeps_a_profile_from_being_personal(home, tmp_path, value, is_personal):
+    # A spelling the plugin does not know fails closed: the profile is personal.
+    home.setenv("INFINO_PERSONAL_PROFILE", value)
+    assert config.load(tmp_path).personal_profile is is_personal
+
+
+def test_a_personal_profile_setting_in_an_unknown_spelling_is_named_once(home, tmp_path, monkeypatch):
+    warned = []
+    monkeypatch.setattr(config.logger, "warning", lambda msg, *args: warned.append(msg % args))
+    home.setenv("INFINO_PERSONAL_PROFILE", "enabled")
+    config.load(tmp_path)
+    config.load(tmp_path)  # settings load on every turn: one warning says it
+    assert len(warned) == 1 and "'enabled'" in warned[0] and "INFINO_PERSONAL_PROFILE" in warned[0]
+
+
+def tools_settings(home_dir, env: dict) -> None:
+    """One profile's own settings, in the env block of its Infino tools' entry."""
+    (home_dir / "config.yaml").write_text(json.dumps({"mcp_servers": {"infino": {"command": "hermes", "env": env}}}))
+
+
+def a_subagent_turn(hooks, child: str) -> None:
+    """A subagent's tool call and turn end, as Hermes runs its conversation:
+    marked as a delegated child's (and, routed, inside the other profile)."""
+    with delegated_child_context(child):
+        hooks["post_tool_call"](session_id=child, turn_id="c1", tool_name="terminal", args={}, result=MAIL)
+        hooks["on_session_end"](session_id=child)
+
+
+@pytest.mark.parametrize("own_copy", [False, True])
+def test_a_subagent_routed_to_another_profile_keeps_a_personal_sessions_work_personal(home, tmp_path, own_copy):
+    tools_settings(tmp_path, {"INFINO_PERSONAL_PROFILE": "on"})
+    make_manager(tmp_path, session_id="errands")
+    coder = tmp_path / "profiles" / "coder"  # a team profile on the same machine
+    coder.mkdir(parents=True)
+    backend.for_settings(config.load(coder)).ensure_local()
+    hooks = hook_ctx()
+    # Hermes fires subagent_start as the parent, then runs the child as the profile its route names.
+    hooks["subagent_start"](parent_session_id="errands", child_session_id="child-1")
+    if own_copy:  # that profile loads its own copy of the plugin, which knows nothing this one noted
+        privacy._sessions.clear()
+    with delegated_profile_scope(coder):
+        a_subagent_turn(hooks, "child-1")
+    assert wait_for(lambda: len(texts(local(coder), tables.TRACES) + texts(personal(coder), tables.TRACES)) == 1)
+    assert texts(local(coder), tables.TRACES) == []
+
+
+def test_a_subagent_of_a_team_session_stays_the_teams_as_hermes_runs_it(home, tmp_path):
+    make_manager(tmp_path, session_id="work")
+    hooks = hook_ctx()
+    hooks["subagent_start"](parent_session_id="work", child_session_id="child-1")
+    a_subagent_turn(hooks, "child-1")
+    assert wait_for(lambda: len(texts(local(tmp_path), tables.TRACES)) == 1)
+    assert texts(personal(tmp_path), tables.TRACES) == []
+
+
+# -- memory calls that may reach personal memory ------------------------------------------
+
+@pytest.mark.parametrize("tool, args", [
+    ("infino_forget", {"content": "About Ann: her therapist is Dr. Lee"}),  # no scope: personal memory too
+    ("infino_remember", {"content": "Ann's therapist is Dr. Lee", "scope": "private"}),  # refused, still said
+])
+def test_a_memory_call_that_may_reach_personal_memory_keeps_its_text_out_of_the_teams_rows(home, tmp_path, tool,
+                                                                                            args):
+    mgr, p = make_manager(tmp_path, session_id="s1")
+    hooks = hook_ctx()
+    result = mgr.handle_tool_call(tool, args)
+    hooks["post_tool_call"](session_id="s1", turn_id="t1", tool_name=tool, tool_call_id="c1", args=args,
+                            result=result, status="ok")
+    hooks["on_session_end"](session_id="s1")
+    messages = [{"role": "user", "content": "Forget that."},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c1", "function": {"name": tool, "arguments": json.dumps(args)}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": result},
+                {"role": "assistant", "content": "Done."}]
+    p.sync_turn("Forget that.", "Done.", session_id="s1", messages=messages)
+    p._drain()
+    assert wait_for(lambda: len(texts(local(tmp_path), tables.TRACES)) == 1)
+    team = texts(local(tmp_path), tables.CONVERSATIONS) + texts(local(tmp_path), tables.TRACES)
+    assert len(team) == 5 and not [t for t in team if PRIVATE in t]
 
 
 # -- what reaches the cloud ----------------------------------------------------------
@@ -400,7 +609,7 @@ def test_personal_rows_never_reach_the_team_databases_sources_and_team_rows_stil
     p.sync_turn("Draft a reply to Dr. Lee.", "Drafted for Dr. Lee.", session_id="dm-1", messages=messages)
     p._drain()
     assert wait_for(lambda: len(texts(local(tmp_path), tables.TRACES) + texts(personal(tmp_path), tables.TRACES)) == 3)
-    p.shutdown()  # pushes what is left before it returns
+    end_session(p)  # pushes what is left before it returns
     assert not [t for t in team_source_texts(p) if PRIVATE in t]
     for table in (tables.CONVERSATIONS, tables.TRACES):
         assert not [t for t in cloud_texts(platform, TEAM_DB, table) if PRIVATE in t]

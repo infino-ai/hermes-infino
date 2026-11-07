@@ -3,12 +3,14 @@ them into a profile."""
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from hermes_infino import config, skills, tables
 from hermes_infino.client import InfinoClient
 
-from .helpers import SKILL_MD, TEAM_DB, requests_to, sign_in
+from .helpers import SKILL_MD, TEAM_DB, local_rows, make_manager, requests_to, sign_in
 
 
 class Ctx:
@@ -24,10 +26,15 @@ class Ctx:
         self.registered.append((name, path.read_text(), description))
 
 
-def publish(platform, *rows: dict) -> None:
+def publish(platform, *rows: dict, team: str = TEAM_DB) -> None:
     c = InfinoClient("k", platform.url)
-    tables.ensure_all(c, TEAM_DB)
-    c.append(TEAM_DB, tables.SKILLS, list(rows))
+    tables.ensure_all(c, team)
+    c.append(team, tables.SKILLS, list(rows))
+
+
+def write_skill(path, text: str) -> None:
+    path.parent.mkdir(parents=True)
+    path.write_text(text)
 
 
 @pytest.mark.parametrize("md, description", [
@@ -70,6 +77,30 @@ def test_a_profile_without_skills_has_none(home, tmp_path):
     assert skills.find_local_skill("anything", tmp_path) is None
 
 
+def test_a_copy_the_curator_archived_is_never_the_skill_found(home, tmp_path):
+    # Hermes's curator moves a skill it retires to skills/.archive/<name>; Hermes skips that folder.
+    write_skill(tmp_path / "skills" / ".archive" / "release-checklist" / "SKILL.md", "old")
+    write_skill(tmp_path / "skills" / "devops" / "release-checklist" / "SKILL.md", SKILL_MD)
+    assert skills.find_local_skill("release-checklist", tmp_path).read_text() == SKILL_MD
+
+
+def test_a_skill_is_found_by_the_name_skills_list_shows(home, tmp_path):
+    # skills_list names a skill by its frontmatter; its folder may be named otherwise.
+    skill = tmp_path / "skills" / "release" / "SKILL.md"
+    write_skill(skill, SKILL_MD)  # name: release-checklist
+    assert skills.find_local_skill("release-checklist", tmp_path) == skill
+    assert skills.find_local_skill("release", tmp_path) == skill  # the folder's name still finds it
+
+
+def test_a_skill_named_as_hermes_never_loads_a_team_skill_is_refused_at_publish(home, tmp_path):
+    # Hermes's own skill tool takes dots in a name; a plugin's skills may have none.
+    write_skill(tmp_path / "skills" / "deploy.v2" / "SKILL.md", "---\nname: deploy.v2\ndescription: Ship.\n---\nbody\n")
+    m, _ = make_manager(tmp_path)
+    out = json.loads(m.handle_tool_call("infino_publish_skill", {"name": "deploy.v2"}))
+    assert out["ok"] is False and "'deploy.v2'" in out["error"] and "letters" in out["error"]
+    assert local_rows(tmp_path, tables.SKILLS) == []
+
+
 def test_without_an_account_nothing_is_loaded_or_asked(home, platform, tmp_path):
     assert skills.register_team_skills(Ctx(), config.load(tmp_path), home=tmp_path) == []
     assert platform.requests == []
@@ -91,7 +122,7 @@ def test_the_newest_version_of_each_skill_is_written_and_registered(home, platfo
     assert skills.register_team_skills(ctx, settings, home=tmp_path) == ["deploy", "triage"]
     assert ctx.registered == [("deploy", "v2", "Ship it. (team skill published by alice)"),
                               ("triage", "t1", "(team skill)")]
-    assert (tmp_path / skills.CACHE_DIR / "deploy" / "SKILL.md").read_text() == "v2"
+    assert (skills.cache_root(settings, tmp_path) / "deploy" / "SKILL.md").read_text() == "v2"
 
 
 def test_a_platform_that_does_not_answer_loads_the_last_copies(home, platform, tmp_path):
@@ -108,7 +139,7 @@ def test_a_platform_that_does_not_answer_loads_the_last_copies(home, platform, t
 
 def test_a_copy_without_its_note_reads_the_description_from_the_skill(home, platform, tmp_path):
     settings = sign_in(tmp_path, platform)
-    copy = tmp_path / skills.CACHE_DIR / "release-checklist" / "SKILL.md"
+    copy = skills.cache_root(settings, tmp_path) / "release-checklist" / "SKILL.md"
     copy.parent.mkdir(parents=True)
     copy.write_text(SKILL_MD)
     platform.close()
@@ -160,3 +191,28 @@ def test_a_skill_name_never_writes_outside_the_cache(home, platform, tmp_path):
     publish(platform, {"name": "../../escape", "content": "owned", "created_ms": 1})
     assert skills.register_team_skills(Ctx(), settings, home=tmp_path) == []
     assert not (tmp_path / "escape").exists() and not (tmp_path.parent / "escape").exists()
+
+
+def test_after_a_team_switch_the_last_teams_skills_never_load(home, platform, tmp_path):
+    settings = sign_in(tmp_path, platform, team="team-a")
+    publish(platform, {"name": "deploy", "content": "team a's", "created_ms": 1}, team="team-a")
+    assert skills.register_team_skills(Ctx(), settings, home=tmp_path) == ["deploy"]
+    settings = sign_in(tmp_path, platform, team="team-b")  # no skills table there yet
+    skills._loaded_at.clear()  # a new process
+    ctx = Ctx()
+    assert skills.register_team_skills(ctx, settings, home=tmp_path) == []
+    assert ctx.registered == []
+
+
+def test_a_skill_gone_from_the_teams_table_never_loads_from_its_copy(home, platform, tmp_path):
+    settings = sign_in(tmp_path, platform)
+    publish(platform, {"name": "deploy", "content": "d", "created_ms": 1},
+            {"name": "triage", "content": "t", "created_ms": 1})
+    assert skills.register_team_skills(Ctx(), settings, home=tmp_path) == ["deploy", "triage"]
+    platform.databases[TEAM_DB][tables.SKILLS] = [r for r in platform.rows(TEAM_DB, tables.SKILLS)
+                                                  if r["name"] == "deploy"]  # triage deleted from the table
+    skills._loaded_at.clear()
+    assert skills.register_team_skills(Ctx(), settings, home=tmp_path) == ["deploy"]
+    platform.close()
+    skills._loaded_at.clear()
+    assert skills.register_team_skills(Ctx(), settings, home=tmp_path) == ["deploy"]

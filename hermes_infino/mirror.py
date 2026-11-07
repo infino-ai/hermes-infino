@@ -35,18 +35,25 @@ database's, nor the forgets to it.
 
 A batch whose append was never answered may still have reached the cloud (a
 timeout after the platform committed it, or a process killed mid-append). A
-note is written before each append and cleared after it, so the next sync of
-that source first asks the cloud which of its first batch's rows it has, and
-sends only the rest. (The platform's append is not idempotent by `row_id`;
-this check is how the plugin keeps from sending a batch twice.)
+note is written before each append, naming its source with every other one
+still unsure, and that source is cleared once a batch of it is accepted, so
+the next sync of each first asks the cloud which of its first batch's rows it
+has, and sends only the rest. (The platform's append is not idempotent by
+`row_id`; this check is how the plugin keeps from sending a batch twice.) The
+marks and notes are kept in STATE_FILE, written whole; one that is there but
+cannot be read (a power loss) has lost where the marks were, so every row
+stored by then is checked with the cloud the same way before it is sent.
 
 A row the cloud refuses outright (too large, malformed) is set aside in
 REFUSED_FILE and the source goes on; a source the cloud is failing on stops
-without stopping the others, or the forgets.
+without stopping the others, or the forgets. A worker too busy to take a
+batch (413, its memory over budget while other queries fill it) refuses no
+row: that is the sync's failure, and the rows go with a later one.
 
-A local commit slower than the settle window may have been passed by a mark
-before it was visible (local.LATE_COMMITS_FILE notes it): the next sync
-moves the mark back before it and re-sends what the cloud lacks.
+A local commit slower than the settle window, or stamped behind its table's
+latest row (a clock put back), may have been passed by a mark before it was
+visible (local.LATE_COMMITS_FILE notes it): the next sync moves the mark back
+before it and re-sends what the cloud lacks.
 
 A memory deleted locally (`infino_forget`, or Hermes replacing a built-in
 memory) is deleted in the cloud by its `row_id`s, from a small queue applied
@@ -57,8 +64,11 @@ time (no answer) is queued as its match instead, bounded by `stored_ms` so a
 memory saved again later is still kept. Each queued forget is applied on its
 own: one the cloud fails stays queued for the next sync without holding up
 the ones after it, and one whose database or table no longer exists is
-dropped, there being nothing left there to delete. The queue's lock is held
-only to read and rewrite the file, never across a request to the cloud.
+dropped, there being nothing left there to delete. One for a database these
+settings no longer name stays queued, for when they name it again, and fails
+no sync. The queue's lock is held only to read and rewrite the file, never
+across a request to the cloud; a line that cannot be read (cut short by a
+crash) is taken off, since it can never be applied.
 
 One sync runs at a time per profile (a file lock); the others skip.
 """
@@ -72,11 +82,12 @@ import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterator, Optional
 
 from . import config, tables
 from .client import InfinoClient, InfinoError
-from .local import LATE_COMMITS_FILE, LocalStore
+from .local import LATE_COMMITS_FILE, LocalStore, append_line
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +100,16 @@ REFUSED_FILE = "refused.jsonl"
 # large, unprocessable. Anything else (auth, busy, down) is the sync's failure.
 BAD_REQUEST = 400
 REFUSED_STATUSES = (BAD_REQUEST, 413, 422)
+# The engine's words, in a worker's 413, for a write its memory budget could
+# not take while other queries filled it: the worker was busy, the rows not
+# too large (a plugin batch is far under the platform's body limit), so it is
+# the sync's failure, and the rows go with a later one.
+OVER_BUDGET = "over budget"
+# What `_state` holds for a state file that is there but cannot be read: where
+# the marks were is lost.
+DAMAGED = "damaged"
+# How much of a queue's unreadable line the log shows.
+LOGGED_LINE_CHARS = 200
 # A delete's answer when its database or table no longer exists (never made,
 # dropped, or being purged): nothing is left there to delete.
 GONE_STATUSES = (404, 410)
@@ -131,6 +152,36 @@ def _fit(rows: list[dict]) -> list[dict]:
         if size > PUSH_MAX_BYTES and i:
             return rows[:i]
     return rows
+
+
+def _forget_entry(line: str) -> Optional[dict]:
+    """A queued forget, or None for a line that cannot be read (cut short by a crash)."""
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return None
+    if not (isinstance(entry, dict) and isinstance(entry.get("database"), str) and isinstance(entry.get("table"), str)
+            and (entry.get("predicate") or entry.get("row_ids"))):
+        return None
+    return entry
+
+
+@contextmanager
+def sync_lock(state_dir: Path, wait: bool = True) -> Iterator[bool]:
+    """The profile's sync lock (LOCK_FILE), held by a sync and by whatever must
+    not run beside one; whether it was taken (without `wait`, False while
+    another holds it)."""
+    Path(state_dir).mkdir(parents=True, exist_ok=True)
+    with open(Path(state_dir) / LOCK_FILE, "a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 @dataclass(frozen=True)
@@ -236,7 +287,7 @@ class Mirror:
         mark points at. Many rows, pushed at different times, keep a
         teammate's forget of a few of them, or a cloud slow to show the
         newest, from looking like a dropped table."""
-        with self._lock(wait=True):
+        with sync_lock(self.dir):
             state = self._state()
             marks = self.marks()
             lost = []
@@ -263,22 +314,29 @@ class Mirror:
     # -- state ---------------------------------------------------------------
 
     def _state(self) -> dict:
+        """What the last sync left: {} when nothing yet, and {DAMAGED: why}
+        for a file that is there but cannot be read (a power loss, a disk
+        fault), whose marks are lost."""
         try:
             state = json.loads((self.dir / STATE_FILE).read_text())
-        except (OSError, ValueError):
+        except FileNotFoundError:
             return {}
-        return state if isinstance(state, dict) else {}
+        except (OSError, ValueError) as e:
+            return {DAMAGED: f"{type(e).__name__}: {e}"}
+        return state if isinstance(state, dict) else {DAMAGED: "not a JSON object"}
 
     def marks(self) -> dict[str, tuple[int, str]]:
         """Every mark kept, by `<database>/<source>`. Marks an older version kept
         by table name alone were for the team database it had then, which is
-        taken to be today's."""
+        taken to be today's, and its personal mark for today's personal
+        database: kept by its old name while there is none, for when there is."""
         raw = self._state().get("marks", {})
         raw = raw if isinstance(raw, dict) else {}
         out = {k: (int(v[0]), str(v[1])) for k, v in raw.items() if v and k not in LEGACY_MARKS}
         for legacy in LEGACY_MARKS:
-            if raw.get(legacy) and (legacy != PERSONAL_MEMORY or self.settings.personal_database):
-                out.setdefault(self.mark_of(legacy), (int(raw[legacy][0]), str(raw[legacy][1])))
+            if raw.get(legacy):
+                named = legacy != PERSONAL_MEMORY or self.settings.personal_database
+                out.setdefault(self.mark_of(legacy) if named else legacy, (int(raw[legacy][0]), str(raw[legacy][1])))
         return out
 
     def last_error(self) -> str:
@@ -297,12 +355,16 @@ class Mirror:
         been sent but not answered (`in_flight`: written before every append,
         so a process killed mid-append leaves the next sync a note to check
         what reached the cloud), and the re-checks still to finish (see
-        `_take_late_commits`)."""
+        `_take_late_commits`). On disk before it replaces the last state, so a
+        power loss leaves one or the other whole."""
         path = self.dir / STATE_FILE
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"marks": {t: list(m) if m else None for t, m in marks.items()},
-                                   "last_error": last_error, "in_flight": list(in_flight),
-                                   "recheck": {t: list(m) for t, m in (recheck or {}).items()}, "at_ms": _now_ms()}))
+        with open(tmp, "w") as f:
+            f.write(json.dumps({"marks": {t: list(m) if m else None for t, m in marks.items()},
+                                "last_error": last_error, "in_flight": list(in_flight),
+                                "recheck": {t: list(m) for t, m in (recheck or {}).items()}, "at_ms": _now_ms()}))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
 
     def _in_flight(self, state: dict) -> list[str]:
@@ -315,22 +377,24 @@ class Mirror:
         return list(in_flight)
 
     def _rechecks(self, state: dict) -> dict[str, tuple[int, str]]:
+        """The re-checks still to finish, per source: up to which mark its rows
+        are sent only if the cloud lacks them. For a state that could not be
+        read, every source's, up to now: any row stored by then may be there."""
+        if state.get(DAMAGED):
+            return {src.mark: (_now_ms(), "") for src in self.sources()}
         raw = state.get("recheck")
         return {k: (int(v[0]), str(v[1])) for k, v in raw.items() if v} if isinstance(raw, dict) else {}
 
-    @contextmanager
-    def _lock(self, wait: bool) -> Iterator[bool]:
-        self.dir.mkdir(parents=True, exist_ok=True)
-        with open(self.dir / LOCK_FILE, "a") as f:
-            try:
-                fcntl.flock(f, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
-            except BlockingIOError:
-                yield False
-                return
-            try:
-                yield True
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+    def recheck(self, source: str, upto: tuple[int, str]) -> None:
+        """Have the syncs to come ask the cloud which of a source's rows up to
+        `upto` it has, and send only the rest: rows that may be there already
+        (personal memory an older version pushed, moved since). The caller
+        holds the sync lock (`sync_lock`)."""
+        state = self._state()
+        rechecks = self._rechecks(state)
+        mark = self.mark_of(source)
+        rechecks[mark] = max(rechecks.get(mark, upto), upto)
+        self._save_state(self.marks(), str(state.get("last_error") or ""), self._in_flight(state), rechecks)
 
     # -- sync ----------------------------------------------------------------
 
@@ -346,15 +410,17 @@ class Mirror:
         failed. A failed push or forget comes first, so a database out of
         reach never hides that the other's rows did not go either."""
         waiting = self._ensure_before_push()
-        with self._lock(wait) as held:
+        with sync_lock(self.dir, wait) as held:
             if not held:
                 return {}
             state = self._state()
+            if state.get(DAMAGED):
+                logger.warning("infino: %s could not be read (%s); every row is checked with the cloud before it "
+                               "is sent again", STATE_FILE, state[DAMAGED])
             marks = self.marks()
             unsure = set(self._in_flight(state))
             recheck = self._rechecks(state)
-            for mark, upto in self._take_late_commits(marks).items():
-                recheck[mark] = max(recheck.get(mark, upto), upto)
+            self._take_late_commits(state, marks, unsure, recheck)
             until = _now_ms() - SETTLE_MS
             pushed: dict[str, int] = {}
             failure: Optional[Exception] = None
@@ -372,14 +438,18 @@ class Mirror:
                         upto = recheck.get(src.mark)
                         send = self._not_in_cloud(src, rows) if check or (upto and first <= upto) else rows
                         check = False
-                        self._save_state(marks, in_flight=[src.mark], recheck=recheck)
+                        # The note names every source still unsure, not this one
+                        # alone: a sync killed before the answer leaves them all.
+                        self._save_state(marks, in_flight=sorted(unsure | {src.mark}), recheck=recheck)
                         self._push(src, send)
+                        # Its unanswered batch was checked with this one, and this one went.
+                        unsure.discard(src.mark)
                         # The mark moves after each accepted batch, so a failed
                         # append never sends the rows before it again.
                         marks[src.mark] = (int(rows[-1][tables.STORED]), str(rows[-1][tables.ROW_ID]))
                         if upto and marks[src.mark] >= upto:
                             recheck.pop(src.mark, None)  # past every row that might be in the cloud
-                        self._save_state(marks, recheck=recheck)
+                        self._save_state(marks, in_flight=sorted(unsure), recheck=recheck)
                         pushed[src.mark] += len(rows)
                         if progress:
                             progress(src.mark, pushed[src.mark])
@@ -399,7 +469,7 @@ class Mirror:
             if failure is not None:
                 self._save_state(marks, f"{type(failure).__name__}: {failure}", sorted(unsure), recheck)
                 raise failure
-            self._save_state(marks, recheck=recheck)
+            self._save_state(marks, in_flight=sorted(unsure), recheck=recheck)
             return pushed
 
     def _push(self, src: Source, rows: list[dict]) -> None:
@@ -420,12 +490,13 @@ class Mirror:
 
     def _push_finding_refused(self, src: Source, rows: list[dict], refused: list) -> int:
         """Append rows, halving a refused batch down to the rows refused; how
-        many were accepted. Failures other than refusals are raised."""
+        many were accepted. Failures other than refusals are raised, a busy
+        worker's 413 (OVER_BUDGET) among them."""
         try:
             self.client.append(src.database, src.table, rows)
             return len(rows)
         except InfinoError as e:
-            if e.status not in REFUSED_STATUSES:
+            if e.status not in REFUSED_STATUSES or OVER_BUDGET in e.message:
                 raise
             if len(rows) == 1:
                 refused.append((rows[0], e))
@@ -442,31 +513,41 @@ class Mirror:
         with open(self.dir / REFUSED_FILE, "a") as f:
             f.write(line)
 
-    def _take_late_commits(self, marks: dict) -> dict[str, tuple[int, str]]:
-        """Local commits slower than the settle window (local.LATE_COMMITS_FILE):
-        each source's mark goes back before them, and the rows up to where it
-        was are re-sent only if the cloud lacks them. Returns, per source, the
-        mark the re-check runs up to."""
+    def _take_late_commits(self, state: dict, marks: dict, unsure: set, recheck: dict) -> None:
+        """Rows a mark may have passed before they were visible
+        (local.LATE_COMMITS_FILE): each source's mark (in `marks`) goes back
+        before them, and the rows up to where it was are re-sent only if the
+        cloud lacks them (`recheck` gets, per source, the mark the re-check
+        runs up to). Saved before the notes are taken off the file, so a sync
+        killed after it still goes back for them; a line that cannot be read
+        is skipped."""
         path = self.dir / LATE_COMMITS_FILE
         if not path.exists():
-            return {}
+            return
         with open(path, "r+") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
-            entries = [json.loads(line) for line in f if line.strip()]
+            lines = [line for line in f if line.strip()]
+            if not lines:
+                return
+            for line in lines:
+                try:
+                    e = json.loads(line)
+                    store, table, stored = e["store"], e["table"], int(e["stored_ms"])
+                except (ValueError, KeyError, TypeError) as err:
+                    logger.warning("infino: skipped a line of %s that cannot be read (%s): %r",
+                                   LATE_COMMITS_FILE, err, line[:LOGGED_LINE_CHARS])
+                    continue
+                for src in self.sources():
+                    mark = marks.get(src.mark)
+                    if (src.store.path.name, src.table) != (store, table) or mark is None:
+                        continue
+                    if mark[0] >= stored:
+                        recheck[src.mark] = max(recheck.get(src.mark, mark), mark)
+                        marks[src.mark] = (stored - 1, "")
+            self._save_state(marks, str(state.get("last_error") or ""), sorted(unsure), recheck)
             f.seek(0)
             f.truncate()
             fcntl.flock(f, fcntl.LOCK_UN)
-        recheck: dict[str, tuple[int, str]] = {}
-        for e in entries:
-            for src in self.sources():
-                mark = marks.get(src.mark)
-                if (src.store.path.name, src.table) != (e.get("store"), e.get("table")) or mark is None:
-                    continue
-                stored = int(e["stored_ms"])
-                if mark[0] >= stored:
-                    recheck[src.mark] = max(recheck.get(src.mark, mark), mark)
-                    marks[src.mark] = (stored - 1, "")
-        return recheck
 
     def _not_in_cloud(self, src: Source, rows: list[dict]) -> list[dict]:
         """The rows of a batch the cloud does not have."""
@@ -503,11 +584,7 @@ class Mirror:
 
     def _queue(self, entry: dict) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(entry) + "\n"
-        with open(self.dir / FORGET_FILE, "a") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            f.write(line)
-            fcntl.flock(f, fcntl.LOCK_UN)
+        append_line(self.dir / FORGET_FILE, json.dumps(entry) + "\n")
 
     def _apply_forgets(self, waiting: frozenset[str] = frozenset()) -> None:
         """Apply the queued deletes, each on its own, then take the applied
@@ -515,7 +592,11 @@ class Mirror:
         sync, and holds up none after it (the first failure is raised after
         them all); one whose database or table no longer exists is taken off
         too, there being nothing left there to delete. One for a database in
-        `waiting` (its tables are not right) stays queued, unasked.
+        `waiting` (its tables are not right) stays queued, unasked. One for a
+        database these settings do not name (they did when it was queued)
+        stays queued when the cloud fails it - the key may not reach that
+        database now - for when they name it again, and fails no sync. A line
+        that cannot be read is taken off: it can never be applied.
 
         The lock is held only to read and to rewrite the file: a forget made
         meanwhile queues without waiting on the cloud, and stays queued."""
@@ -526,39 +607,63 @@ class Mirror:
             fcntl.flock(f, fcntl.LOCK_SH)
             lines = [line for line in f if line.strip()]
             fcntl.flock(f, fcntl.LOCK_UN)
+        named = {database for database, _ in self.databases()}
         applied: list[str] = []
+        elsewhere: dict[str, Exception] = {}  # unnamed databases whose forgets failed, with why
         failure: Optional[Exception] = None
         try:
             for line in lines:
-                try:
-                    entry = json.loads(line)
-                    if entry["database"] in waiting:
-                        continue
-                    self._delete(entry)
-                except InfinoError as e:
-                    if e.status not in GONE_STATUSES:
-                        failure = failure or e
-                        continue
-                    logger.info("infino: a queued forget's %s.%s no longer exists; nothing is left there to "
-                                "delete: %s", entry["database"], entry["table"], e)
-                except Exception as e:  # stays queued for the next sync
-                    failure = failure or e
+                entry = _forget_entry(line)
+                if entry is None:
+                    logger.warning("infino: a line of %s cannot be read, and is taken off: %r",
+                                   FORGET_FILE, line[:LOGGED_LINE_CHARS])
+                    applied.append(line)
                     continue
+                if entry["database"] in waiting:
+                    continue
+                try:
+                    self._delete(entry)
+                except Exception as e:
+                    if isinstance(e, InfinoError) and e.status in GONE_STATUSES:
+                        logger.info("infino: a queued forget's %s.%s no longer exists; nothing is left there to "
+                                    "delete: %s", entry["database"], entry["table"], e)
+                    elif entry["database"] in named:
+                        failure = failure or e  # stays queued for the next sync
+                        continue
+                    else:
+                        elsewhere.setdefault(entry["database"], e)
+                        continue
                 applied.append(line)
+            if elsewhere:
+                logger.info("infino: forgets queued for %s, which these settings do not name, stay queued until they "
+                            "do: %s", ", ".join(sorted(elsewhere)), next(iter(elsewhere.values())))
         finally:
             if applied:
-                with open(path, "r+") as f:
-                    fcntl.flock(f, fcntl.LOCK_EX)
-                    current = [line for line in f if line.strip()]
-                    for line in applied:  # one occurrence each: the same forget queued again stays
-                        if line in current:
-                            current.remove(line)
-                    f.seek(0)
-                    f.truncate()
-                    f.writelines(current)
-                    fcntl.flock(f, fcntl.LOCK_UN)
+                self._take_off_queue(path, applied)
         if failure is not None:
             raise failure
+
+    @staticmethod
+    def _take_off_queue(path: Path, applied: list[str]) -> None:
+        """Rewrite the forget queue without `applied` (one occurrence each: the
+        same forget queued again stays), under its lock. The rest is written
+        over the start of the file before the file is cut to its length, so a
+        sync killed between the two leaves the old tail after it (forgets
+        applied again, to no effect, or queued twice), never an empty queue;
+        and it is on disk before the lock is released, so a forget queued next
+        lands after it, not under it."""
+        with open(path, "r+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            current = [line for line in f if line.strip()]
+            for line in applied:
+                if line in current:
+                    current.remove(line)
+            f.seek(0)
+            f.write("".join(current))
+            f.truncate()
+            f.flush()
+            os.fsync(f.fileno())
+            fcntl.flock(f, fcntl.LOCK_UN)
 
     def _delete(self, entry: dict) -> None:
         """Delete in the cloud what one queued forget names: the rows matching

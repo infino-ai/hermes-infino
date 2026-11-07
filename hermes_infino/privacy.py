@@ -2,13 +2,15 @@
 transcripts.
 
 Personal memory. `conversations` and `traces` record every tool call with
-its arguments, and both go to the team's database. A call that writes
-personal memory carries the private text in its arguments - `infino_remember`
-with scope "personal", or Hermes's own `memory` tool on its `user` target
+its arguments, and both go to the team's database. A call that writes,
+changes or deletes personal memory, or may, carries the private text in its
+arguments - a call of `infino_remember` or `infino_forget` that does not keep
+to the team's memory, or Hermes's own `memory` tool on its `user` target
 (USER.md) - so the text is withheld from those rows: the call is kept, with
-WITHHELD in place of the text, and so is its result, which can echo the
-entries. A call that reads the person's own database (`infino_personal_search`)
-is withheld the same way: what it asked, and all it answered.
+WITHHELD in place of the text, and so are its result, which can echo the
+entries, and its error, which can quote them. A call that reads the person's
+own database (`infino_personal_search`) is withheld the same way: what it
+asked, and all it answered.
 
 What a person says in a conversation is the conversation, and is kept as
 said; this covers the memory written from it. What memory recalled for a
@@ -34,11 +36,18 @@ instead of the team's, when:
   under its "Cronjob Response" header) or handed to a profile's Bot Chat as a
   turn (`deliver: bot-chat`). The receiving profile has to list the job;
 - the session read the person's own database (`infino_personal_search`): what
-  it read is in the session now, so the session is personal from then on.
+  it read is in the session now, so the session is personal from then on;
+- the session is a subagent's (Hermes's `delegate_task`) that no
+  `subagent_start` this copy of the plugin heard of started: Hermes ran it as
+  another profile, whose hooks reach that profile's own copy, so whose work it
+  does cannot be told here.
 
 Everything else stays the team's, as before. Which job a run belongs to is
 Hermes's to say (`cron.execution_identity`); a job is named by its id or its
-name, the way Hermes's own `hermes cron` commands name one.
+name, the way Hermes's own `hermes cron` commands name one. Hermes labels a
+job's delivered output with its name: when several of the profile's jobs share
+that name, the output is personal if any of them is listed. A job of another
+profile is known here only by that name.
 """
 
 from __future__ import annotations
@@ -51,12 +60,25 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
+from .recall import TEAM
+
+try:  # Hermes's mark on the code a delegated child (`delegate_task`) runs.
+    from agent.delegation_context import is_delegated_child_context as _is_delegated_child
+except ImportError:  # pragma: no cover - a Hermes without it marks none
+    _is_delegated_child = None
+
 # What stands in for personal text: a personal memory's, or a personal search's.
 WITHHELD = "[personal, kept out of the team's tables]"
 # The text fields of the memory tools' arguments, and of the personal search's.
 TEXT_FIELDS = ("content", "old_text", "new_text", "query")
 # The tools that read the person's own database: every call of one is personal.
 PERSONAL_READ_TOOLS = ("infino_personal_search",)
+# The plugin's own memory tools. A call of one is the team's only when it says
+# so: a scope of "team", or, for a remember, none at all (it saves the team's).
+# A forget with no scope deletes from personal memory too, and a scope the
+# provider refuses names neither: either may carry personal memory's text.
+REMEMBER_TOOL = "infino_remember"
+FORGET_TOOL = "infino_forget"
 
 # How Hermes labels a scheduled job's output when it mirrors it into a chat's
 # transcript: a user message whose first line is "[Cron delivery: <job>]", the
@@ -101,7 +123,8 @@ MAX_SESSIONS = 1_024
 
 
 def _args(arguments: Any) -> Any:
-    """Arguments as a dict when they are JSON text; otherwise as given."""
+    """A tool call's arguments (or answer) as a dict when they are JSON text;
+    otherwise as given."""
     if isinstance(arguments, str):
         try:
             return json.loads(arguments)
@@ -111,18 +134,43 @@ def _args(arguments: Any) -> Any:
 
 
 def is_personal_call(tool_name: str, arguments: Any) -> bool:
-    """Whether a tool call writes, changes or deletes personal memory, or
-    reads the person's own database."""
+    """Whether a tool call writes, changes or deletes personal memory, or may
+    (a call of the plugin's memory tools that does not keep to the team's),
+    or reads the person's own database."""
     if tool_name in PERSONAL_READ_TOOLS:
         return True
     args = _args(arguments)
+    if tool_name in (REMEMBER_TOOL, FORGET_TOOL):
+        return not _keeps_to_team(tool_name, args)
     if not isinstance(args, dict):
         return False
-    if tool_name in ("infino_remember", "infino_forget"):
-        return str(args.get("scope") or "").strip().lower() == "personal"
     if tool_name == "memory":
         return str(args.get("target") or "").strip().lower() == "user"
     return False
+
+
+def _keeps_to_team(tool_name: str, args: Any) -> bool:
+    """Whether a call of the plugin's memory tools keeps to the team's memory:
+    its scope is "team" (in any case or spacing, as the provider reads it), or
+    it is a remember that names none. Arguments that cannot be read say
+    neither."""
+    if not isinstance(args, dict):
+        return False
+    scope = args.get("scope")
+    if tool_name == REMEMBER_TOOL and scope in (None, ""):
+        return True
+    return str(scope or "").strip().lower() == TEAM
+
+
+def read_personal(tool_name: str, result: Any) -> bool:
+    """Whether a call read the person's own database: a call of a personal
+    read tool whose answer does not say it was refused or failed (an
+    `error`, as the provider and Hermes answer one). An answer that cannot be
+    read counts as read."""
+    if tool_name not in PERSONAL_READ_TOOLS:
+        return False
+    answer = _args(result)
+    return not (isinstance(answer, dict) and answer.get("error"))
 
 
 def withhold(tool_name: str, arguments: Any) -> Any:
@@ -165,32 +213,39 @@ def is_personal_job(jobs: Iterable[str], job_id: str, job_name: str) -> bool:
     return any(j == job_id or j.lower() == job_name.lower() for j in jobs)
 
 
-def cron_job(session_id: str = "") -> Optional[tuple[str, str]]:
+def cron_job(session_id: str = "") -> list[tuple[str, str]]:
     """The (id, name) of the scheduled job the running code belongs to, from
     Hermes's record of the run (a delegated child reads none: it is not the
-    run); else from a cron session's id; None outside a cron run."""
+    run); else of each job a cron session's id may name; [] outside a cron run."""
     identity = sys.modules.get(CRON_IDENTITY_MODULE)
     try:
         execution = identity.current_cron_execution() if identity is not None else None
     except Exception:  # a read of Hermes's record never fails a call
         execution = None
     if execution is not None:
-        return str(execution.job_id), str(execution.job_name)
+        return [(str(execution.job_id), str(execution.job_name))]
     found = CRON_SESSION.match(session_id or "")
-    return _job_ref(found.group(1)) if found else None
+    return _job_refs(found.group(1)) if found else []
 
 
-def _job_ref(ref: str) -> tuple[str, str]:
-    """A job's (id, name) from a reference to it (its id, or its name), through
-    Hermes's job store; the reference as both when the store cannot say."""
+def _job_refs(ref: str) -> list[tuple[str, str]]:
+    """The (id, name) of each job a reference (an id, or a name) may name,
+    through Hermes's job store: the job it resolves to, or every job of a name
+    several share (any of them may be the one meant); the reference as both
+    when the store cannot say (no job store in this process, or another
+    profile's job)."""
     try:
-        from cron.jobs import resolve_job_ref  # Hermes's own resolution: exact id, then name
-        job = resolve_job_ref(ref)
-    except Exception:  # no job store in this process, or a name several jobs share
-        job = None
-    if not job:
-        return ref, ref
-    return str(job.get("id") or ref), str(job.get("name") or job.get("id") or ref)
+        from cron.jobs import AmbiguousJobReference, resolve_job_ref  # Hermes's own resolution: exact id, then name
+    except Exception:  # no job store in this process
+        return [(ref, ref)]
+    try:
+        found = [resolve_job_ref(ref)]
+    except AmbiguousJobReference as e:
+        found = list(e.matches)
+    except Exception:  # an unreadable job store says nothing
+        found = []
+    jobs = [(str(j.get("id") or ref), str(j.get("name") or j.get("id") or ref)) for j in found if j]
+    return jobs or [(ref, ref)]
 
 
 def delivered_jobs(messages: Iterable[dict]) -> list[str]:
@@ -267,11 +322,11 @@ def note_cron_job(session_id: str) -> None:
         known = _touch(session_id or "")
         if known is not None and known.runs_job:
             return
-    job = cron_job(session_id)
-    if job is not None:
+    jobs = cron_job(session_id)
+    if jobs:
         with _sessions_lock:
             s = _session(session_id or "")
-            s.jobs.add(job)
+            s.jobs.update(jobs)
             s.runs_job = True
 
 
@@ -280,7 +335,7 @@ def note_deliveries(session_id: str, messages: Iterable[dict]) -> None:
     labels = set(delivered_jobs(messages))
     if not labels:
         return
-    jobs = [_job_ref(label) for label in labels]
+    jobs = [job for label in labels for job in _job_refs(label)]
     with _sessions_lock:
         _session(session_id or "").jobs.update(jobs)
 
@@ -311,8 +366,8 @@ def transcript_personal(settings, session_id: str, messages: Optional[Iterable[d
     """Whether a session's conversation and traces are personal (see the
     module's docstring). `messages`, when given, are the session's messages,
     searched for a delivered job's output unless the session is known to be
-    personal already."""
-    if settings.personal_profile:
+    personal already. Read in the context of the code the session runs."""
+    if settings.personal_profile or _unclaimed_child(session_id):
         return True
     if _noted_personal(settings, session_id):
         return True
@@ -320,6 +375,19 @@ def transcript_personal(settings, session_id: str, messages: Optional[Iterable[d
         return False
     note_deliveries(session_id, messages)
     return _noted_personal(settings, session_id)
+
+
+def _unclaimed_child(session_id: str) -> bool:
+    """Whether the running code is a delegated child's (Hermes's
+    `delegate_task`) whose session no `subagent_start` here named a parent of:
+    the session that started it ran as another profile, whose hooks reach
+    that profile's own copy of this plugin, so whose work it does cannot be
+    told here."""
+    if _is_delegated_child is None or not _is_delegated_child():
+        return False
+    with _sessions_lock:
+        s = _sessions.get(session_id or "")
+        return s is None or not s.parent
 
 
 def _noted_personal(settings, session_id: str) -> bool:

@@ -113,10 +113,25 @@ def in_session(monkeypatch, values: dict, binding="absent"):
         monkeypatch.setattr(chats, "_CHANNEL_MEMORY", SimpleNamespace(get=lambda default=None: binding))
 
 
+def end_session(provider) -> None:
+    """The provider's part of a session's end, as Hermes runs it
+    (AIAgent.shutdown_memory_provider): on_session_end, then shutdown, which
+    then waits for the session's rows to reach the cloud. A shutdown alone is
+    a soft release, which does not."""
+    provider.on_session_end([])
+    provider.shutdown()
+
+
 def sign_in(tmp_path, platform, team=TEAM_DB, **extra) -> config.Settings:
     """Sign the profile at `tmp_path` in, as `hermes infino login` leaves it."""
     config.write_credentials({"url": platform.url, "api_key": "k", "team_database": team, **extra}, tmp_path)
     return config.load(tmp_path)
+
+
+def write_tools_setting(home_dir: Path, line: str) -> None:
+    """A config whose tools block holds one setting, written as a person
+    writes YAML (a bare `off` is a boolean to Hermes's loader)."""
+    (home_dir / "config.yaml").write_text(f"mcp_servers:\n  infino:\n    command: hermes\n    env:\n      {line}\n")
 
 
 def requests_to(platform, route: str) -> int:

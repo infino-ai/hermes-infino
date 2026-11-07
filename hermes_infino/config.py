@@ -9,9 +9,12 @@
    each profile on a multiplexed gateway reads its own;
 3. the profile's sign-in (`credentials.json`, written by `hermes infino login`).
 
-The config block comes first because it is also the tools' environment: Hermes
-starts the tools with that block, so the plugin and its tools always read the
-same team. A `${VAR}` reference that resolves to nothing counts as unset.
+The config block comes first, for the plugin and for its tools alike (their
+launcher reads it the same way), so both always read the same team, whatever
+the profile's `.env` says. A `${VAR}` reference that resolves to nothing counts
+as unset. Hermes starts the tools with that block as their environment, which
+holds only text: a value YAML reads as something else (a bare `on`, a number,
+a list) is warned about, since the tools would not start with it.
 
 Without a key and a team database the plugin runs on the local database
 alone. With both it is signed in: the cloud database is written too, and read
@@ -32,16 +35,20 @@ first.
                              teammates publish (default on)
 - INFINO_PERSONAL_PROFILE    `on` makes this profile's conversations and traces
                              personal: kept in the personal database, or on
-                             this machine, never the team's (default off)
-- INFINO_PERSONAL_JOBS       the scheduled jobs (ids or names, comma-separated)
-                             whose runs, and the chats their output is
-                             delivered into, are personal the same way
+                             this machine, never the team's (default off). Any
+                             value but an off one counts as on: a spelling read
+                             wrongly must not put personal work in the team's
+                             tables
+- INFINO_PERSONAL_JOBS       the scheduled jobs (ids or names, comma-separated,
+                             or a list) whose runs, and the chats their output
+                             is delivered into, are personal the same way
 
 A variable that is set wins over the sign-in, so a deployment's `.env` is
-never overridden by a file on the machine. The sign-in's URL and personal
-database go with its key, so they apply only when the key in use is the
-sign-in's: another key, from the config block or the environment, is never
-sent to the sign-in's platform, and never writes into its personal database.
+never overridden by a file on the machine (and `login` refuses a sign-in one
+of them would override). The sign-in's URL and personal database go with its
+key, so they apply only when the key in use is the sign-in's: another key,
+from the config block or the environment, is never sent to the sign-in's
+platform, and never writes into its personal database.
 
 A personal database that is the team database counts as none: personal rows
 would land in the team's tables, where everyone reads them.
@@ -82,11 +89,16 @@ PERSONAL_PROFILE_ENV = "INFINO_PERSONAL_PROFILE"
 PERSONAL_JOBS_ENV = "INFINO_PERSONAL_JOBS"
 
 DEFAULT_MCP_SERVER = "infino"
-# Values of INFINO_TEAM_SKILLS that turn the team's skills off.
+# The settings a sign-in holds. The config block or the environment may set
+# each instead, and then that value is the one in effect.
+SIGN_IN_SETTINGS = (KEY_ENV, TEAM_DB_ENV, PERSONAL_DB_ENV, URL_ENV)
+# Values that turn a switch off (INFINO_TEAM_SKILLS, INFINO_PERSONAL_PROFILE).
 OFF_VALUES = ("off", "false", "no", "0")
-# Values of INFINO_PERSONAL_PROFILE that make the profile personal.
+# Values that turn a switch on; any other spelling of INFINO_PERSONAL_PROFILE
+# turns it on too, with a warning.
 ON_VALUES = ("on", "true", "yes", "1")
-# What separates the jobs INFINO_PERSONAL_JOBS names.
+# What separates the jobs INFINO_PERSONAL_JOBS names (a YAML list's items are
+# joined with it).
 JOBS_SEPARATOR = ","
 # A `${VAR}` reference Hermes left as written: its variable is not set.
 UNRESOLVED_REF = re.compile(r"^\$\{[^}]*\}$")
@@ -109,9 +121,9 @@ CREDENTIALS_MODE = 0o600
 # (unless HERMES_HOME_MODE says so), where a data directory is often shared.
 PRIVATE_DIR_MODE = 0o700
 
-# The (home, name) of each personal database already warned about for being
-# the team database: settings load on every turn, and one warning says it.
-_warned_personal_is_team: set[tuple[str, str]] = set()
+# What was warned about already, each with the profile home it was found in:
+# settings load on every turn, and one warning says it.
+_warned: set[tuple[str, ...]] = set()
 
 
 def make_private_dir(path: Path) -> None:
@@ -134,11 +146,14 @@ def state_dir(home_dir: Optional[Path] = None) -> Path:
 def _set(value) -> str:
     """`value` as a setting, or "" when it is missing, empty or an unresolved
     `${VAR}`. A YAML boolean or number from the config block is the setting
-    it was written as (`off` is "off", `0` is "0"), never unset."""
+    it was written as (`off` is "off", `0` is "0"), never unset; a YAML list
+    is its items, as INFINO_PERSONAL_JOBS lists them."""
     if value is None:
         return ""
     if isinstance(value, bool):
         value = BOOLEAN_SETTINGS[value]
+    elif isinstance(value, list):
+        value = JOBS_SEPARATOR.join(item for item in map(_set, value) if item)
     value = str(value).strip()
     return "" if UNRESOLVED_REF.match(value) else value
 
@@ -225,31 +240,90 @@ class Settings:
         return bool(self.api_key and self.team_database)
 
 
+def _warn_once(seen: tuple[str, ...], message: str, *args) -> None:
+    """Log `message` the first time `seen` comes up in this process."""
+    if seen in _warned:
+        return
+    _warned.add(seen)
+    logger.warning(message, *args)
+
+
 def _warn_personal_is_team(home_dir: Path, name: str) -> None:
     """Say once per profile that its personal database is the team's, so none is used."""
-    seen = (str(home_dir), name)
-    if seen in _warned_personal_is_team:
-        return
-    _warned_personal_is_team.add(seen)
-    logger.warning("infino: the personal database '%s' is the team database, so none is used: what is personal "
-                   "stays on this machine. Name another with %s, or sign in again.", name, PERSONAL_DB_ENV)
+    _warn_once(("personal is team", str(home_dir), name),
+               "infino: the personal database '%s' is the team database, so none is used: what is personal "
+               "stays on this machine. Name another with %s, or sign in again.", name, PERSONAL_DB_ENV)
+
+
+def _warn_not_text(home_dir: Path, server: str, block: dict) -> None:
+    """Say once per profile and setting that a value in the config block is
+    not text (YAML reads a bare on, off, yes, no, true or false, a number or a
+    list as something else). Hermes starts the tools with the block as their
+    environment, which holds only text, so they would not start; written in
+    quotes, it is text."""
+    for name, value in block.items():
+        if not isinstance(value, str):
+            _warn_once(("not text", str(home_dir), str(name)),
+                       "infino: mcp_servers.%s.env.%s is %r, not text: Hermes starts the Infino tools with that "
+                       "block as their environment, which takes only text, so they will not start. Quote it in "
+                       "the config: %s: \"%s\"", server, name, value, name, _set(value))
+
+
+def _personal_profile(home_dir: Path, value: str) -> bool:
+    """INFINO_PERSONAL_PROFILE as a switch. Only an off value (or none) turns
+    it off: a spelling this plugin does not know (`y`, `enabled`) turns it on,
+    with a warning, since reading it as off would put the profile's
+    conversations and traces in the team's tables."""
+    setting = value.lower()
+    if not setting or setting in OFF_VALUES:
+        return False
+    if setting not in ON_VALUES:
+        _warn_once(("personal profile", str(home_dir), value),
+                   "infino: %s is '%s', which is neither on nor off, so this profile is personal: its "
+                   "conversations and traces stay out of the team database. Set it to on or off.",
+                   PERSONAL_PROFILE_ENV, value)
+    return True
+
+
+def _server() -> str:
+    """The Infino tools' name under `mcp_servers`: whose `env` block is read."""
+    return _read(MCP_SERVER_ENV) or DEFAULT_MCP_SERVER
+
+
+def _outside_sign_in(name: str, block: dict) -> tuple[str, str]:
+    """`name`'s value from the config block, else the environment, with where
+    it came from; ("", "") when neither sets it."""
+    for value, where in ((_set(block.get(name)), FROM_CONFIG), (_read(name), FROM_ENVIRONMENT)):
+        if value:
+            return value, where
+    return "", ""
+
+
+def overrides(home_dir: Optional[Path] = None) -> dict[str, tuple[str, str]]:
+    """The settings a sign-in holds that the config block or the environment
+    sets, each taking precedence over any sign-in: {variable: (value, where)}."""
+    home_dir = home_dir or home()
+    block = tools_env(_server(), home_dir)
+    found = {name: _outside_sign_in(name, block) for name in SIGN_IN_SETTINGS}
+    return {name: found[name] for name in SIGN_IN_SETTINGS if found[name][0]}
 
 
 def load(home_dir: Optional[Path] = None, *, from_config: bool = True) -> Settings:
-    """This profile's settings. `from_config=False` skips the config block: the
-    tools' launcher is started with that block as its environment already, and
-    a process Hermes did not start must not open Remote Config itself."""
+    """This profile's settings. `from_config=False` skips the config block: for
+    the tools' launcher run as a script, which Hermes starts with that block as
+    its environment already, and which must not open Remote Config itself."""
     home_dir = home_dir or home()
     creds = read_credentials(home_dir)
-    server = _read(MCP_SERVER_ENV) or DEFAULT_MCP_SERVER
+    server = _server()
     block = tools_env(server, home_dir) if from_config else {}
+    _warn_not_text(home_dir, server, block)
 
     def pick(env_name: str, cred_key: str = "") -> tuple[str, str]:
-        for value, where in ((_set(block.get(env_name)), FROM_CONFIG), (_read(env_name), FROM_ENVIRONMENT),
-                             (_set(creds.get(cred_key)) if cred_key else "", FROM_SIGN_IN)):
-            if value:
-                return value, where
-        return "", ""
+        value, where = _outside_sign_in(env_name, block)
+        if value or not cred_key:
+            return value, where
+        value = _set(creds.get(cred_key))
+        return (value, FROM_SIGN_IN) if value else ("", "")
 
     api_key, key_from = pick(KEY_ENV, "api_key")
     team_database, team_from = pick(TEAM_DB_ENV, "team_database")
@@ -271,7 +345,7 @@ def load(home_dir: Optional[Path] = None, *, from_config: bool = True) -> Settin
         home=home_dir,
         source=team_from if team_from == key_from else "+".join(w for w in (team_from, key_from) if w),
         team_skills=pick(TEAM_SKILLS_ENV)[0].lower() not in OFF_VALUES,
-        personal_profile=pick(PERSONAL_PROFILE_ENV)[0].lower() in ON_VALUES,
+        personal_profile=_personal_profile(home_dir, pick(PERSONAL_PROFILE_ENV)[0]),
         personal_jobs=tuple(j.strip() for j in pick(PERSONAL_JOBS_ENV)[0].split(JOBS_SEPARATOR) if j.strip()),
     )
 
@@ -279,7 +353,12 @@ def load(home_dir: Optional[Path] = None, *, from_config: bool = True) -> Settin
 def config_schema() -> list[dict]:
     """Fields for `hermes memory setup`; every one is an env var, so the
     provider needs no `save_config`. None is required: without a key the
-    plugin keeps everything on this machine (`hermes infino login` signs in)."""
+    plugin keeps everything on this machine (`hermes infino login` signs in).
+
+    The setup writes a field's default into `.env` when the person just
+    presses Enter, and `.env` takes precedence over a sign-in: so no setting a
+    sign-in holds has a default here (the URL's is in its description), or a
+    later `login --url` would be overridden by a value nobody chose."""
     return [
         {
             "key": "api_key",
@@ -310,8 +389,7 @@ def config_schema() -> list[dict]:
         },
         {
             "key": "url",
-            "description": "Infino platform URL",
-            "default": DEFAULT_URL,
+            "description": f"Infino platform URL (empty: {DEFAULT_URL})",
             "env_var": URL_ENV,
         },
         {
@@ -329,8 +407,8 @@ def config_schema() -> list[dict]:
         },
         {
             "key": "personal_jobs",
-            "description": "Scheduled jobs (ids or names, comma-separated) whose runs and delivered output are "
-                           "personal, never the team's",
+            "description": "Scheduled jobs (names, or this profile's job ids, comma-separated) whose runs and "
+                           "delivered output are personal, never the team's",
             "env_var": PERSONAL_JOBS_ENV,
         },
     ]

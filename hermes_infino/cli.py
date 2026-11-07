@@ -24,6 +24,12 @@ a platform that does not answer), the sign-in goes on without one and what is
 personal stays on this machine. The sign-in is saved before that step: the
 platform gives a new account's key only once.
 
+The config block and the environment take precedence over a sign-in
+(config.py). So `login` names the team and personal database they set, and
+refuses, before anything is created or sent, a URL, team database, personal
+database or key they set otherwise: the notice would name a place the rows
+never go.
+
 Hermes imports this module to build its command line for every command, so
 the engine and the model are imported only inside the commands that use them.
 """
@@ -35,6 +41,8 @@ import secrets
 import sys
 import time
 import urllib.error
+from http.client import HTTPException
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Optional
 
@@ -56,6 +64,13 @@ PERSONAL_PART = "-personal-"
 PERSONAL_RANDOM_BYTES = 4
 # The longest database name the platform takes.
 MAX_DATABASE_NAME = 128
+# The `login` option that sets each setting a sign-in holds.
+LOGIN_OPTIONS = {config.KEY_ENV: "--api-key-file", config.URL_ENV: "--url", config.TEAM_DB_ENV: "--team-database",
+                 config.PERSONAL_DB_ENV: "--personal-database"}
+# How to have a personal database without signing in again: name one, and the
+# sync makes it (tables.ensure_all).
+ADD_PERSONAL_DATABASE = (f"To have a personal database without signing in again, name one of your own: "
+                         f"`hermes config set {config.PERSONAL_DB_ENV} <name>`; the next sync makes it.")
 
 
 def register_cli(parser: argparse.ArgumentParser) -> None:
@@ -86,6 +101,11 @@ def infino_command(args: argparse.Namespace) -> int:
         print(f"infino: could not reach the platform: {e.reason}", file=sys.stderr)
     except TimeoutError:
         print("infino: the platform did not answer in time", file=sys.stderr)
+    except (ConnectionError, HTTPException) as e:  # a connection dropped before any answer
+        print(f"infino: could not reach the platform: {e}", file=sys.stderr)
+    except JSONDecodeError:  # a proxy's page, say
+        print("infino: the URL did not answer as the Infino platform does (its answer is not JSON): check the "
+              "URL, and any proxy on the way", file=sys.stderr)
     return 1
 
 
@@ -166,12 +186,13 @@ def _ask(question: str) -> bool:
 NEW_PERSONAL_DATABASE = "a personal database of your own, made now"
 
 
-def _personal_destination(args) -> str:
-    """Where what is personal goes, in the upload notice's words."""
-    if args.no_personal_database:
+def _personal_destination(personal: Optional[str]) -> str:
+    """Where what is personal goes, in the upload notice's words: `personal`
+    is the database named, "" for a new one, None for none."""
+    if personal is None:
         return "nowhere: it stays on this machine (--no-personal-database)"
-    if args.personal_database:
-        return f"your personal database '{args.personal_database}'"
+    if personal:
+        return f"your personal database '{personal}'"
     return NEW_PERSONAL_DATABASE
 
 
@@ -197,27 +218,50 @@ def _new_personal_name(team: str) -> str:
     return team[:MAX_DATABASE_NAME - len(PERSONAL_PART) - len(token)] + PERSONAL_PART + token
 
 
-def _personal_database(client: InfinoClient, args, team: str) -> Optional[str]:
+def _personal_database(client: InfinoClient, personal: Optional[str], team: str) -> Optional[str]:
     """The personal database this sign-in uses, ready in the cloud: the one
-    named (made if missing), else a new one, never one that exists already (it
-    could be anyone's). None with --no-personal-database, or when it cannot be
-    made, for any reason (refused, unreachable, timed out): what is personal
-    then stays on this machine, and the sign-in, saved already, goes on, rather
-    than naming a personal database whose rows would never go."""
-    if args.no_personal_database:
+    named (`personal`, made if missing), else ("") a new one, never one that
+    exists already (it could be anyone's). None with none wanted (`personal`
+    None), or when it cannot be made, for any reason (refused, unreachable,
+    timed out): what is personal then stays on this machine, and the sign-in,
+    saved already, goes on, rather than naming a personal database whose rows
+    would never go."""
+    if personal is None:
         return None
-    name = args.personal_database or _new_personal_name(team)
+    name = personal or _new_personal_name(team)
     try:
-        if args.personal_database:
+        if personal:
             client.ensure_database(name)
         else:
             client.create_database(name)
     except Exception as e:
         print(f"No personal database: '{name}' could not be made ({e}). Personal memory, and the "
-              f"conversations and traces of personal profiles and scheduled jobs, stay on this machine.",
-              file=sys.stderr)
+              f"conversations and traces of personal profiles and scheduled jobs, stay on this machine. "
+              f"{ADD_PERSONAL_DATABASE}", file=sys.stderr)
         return None
     return name
+
+
+def _overridden(signing_in: dict, server: str) -> str:
+    """Why the sign-in would not be the settings in effect: the first of
+    `signing_in` ({variable: what the sign-in would hold}) that the config
+    block or the environment sets otherwise, which takes precedence over a
+    sign-in; "" when there is none. A personal database is None when none is
+    wanted, and a key "" when a new account is to make it."""
+    for name, (value, where) in config.overrides().items():
+        wanted = signing_in[name]
+        if wanted == value or (name == config.URL_ENV and wanted == value.rstrip("/")):
+            continue
+        place = (f"the `env` block of mcp_servers.{server} in the config" if where == config.FROM_CONFIG
+                 else "this profile's environment (its .env)")
+        if name == config.KEY_ENV:  # never printed: it is a secret
+            return (f"{name} is set in {place}, and a key set there is used instead of a sign-in's, so the key "
+                    "this sign-in would save would never be used. Remove it there, or sign in with that key "
+                    "(--api-key-file).")
+        option = "--no-personal-database" if wanted is None else LOGIN_OPTIONS[name]
+        return (f"{name} is '{value}' in {place}, which takes precedence over a sign-in, so rows would go to "
+                f"'{value}', not where {option} says. Change or remove it there, or leave out {option}.")
+    return ""
 
 
 def _local_counts() -> dict:
@@ -239,22 +283,42 @@ def _login(args) -> int:
     if current.signed_in:
         print(f"Already signed in: {current.url} / {current.team_database}, from the {current.source}. "
               "`hermes infino status` shows how far the cloud is.")
-        print(f"To sign in again, remove {config.credentials_path()} and run `hermes infino login`. The `env` "
-              f"block of mcp_servers.{current.mcp_server} in the config, and the environment, take precedence "
-              "over a sign-in: change a setting there to change it.")
+        if config.FROM_SIGN_IN in current.source:
+            # The file may hold the only copy of a free account's key.
+            path = config.credentials_path()
+            print(f"To sign in again, keep the key: it is the `api_key` in {path}, and the platform gives a free "
+                  f"account's key only once. Save it to a file, remove {path}, and run `hermes infino login "
+                  f"--url {current.url} --api-key-file <that file> --team-database {current.team_database}`.")
+        print(f"The `env` block of mcp_servers.{current.mcp_server} in the config, and the environment, take "
+              "precedence over a sign-in: change a setting there to change it.")
+        if not current.personal_database:
+            print(ADD_PERSONAL_DATABASE)
         return 0
+    new_account = not args.api_key_file
+    api_key = ""  # a new account's comes from the platform
+    if not new_account:
+        try:
+            api_key = Path(args.api_key_file).expanduser().read_text().strip()
+        except OSError as e:
+            print(f"infino: cannot read the key file: {e}", file=sys.stderr)
+            return 1
     url = (args.url or current.url or DEFAULT_URL).rstrip("/")
-    # The team the profile already names, so the notice, the account and the
-    # rows all name the same one.
+    # The team and personal database the profile already names, so the
+    # notice, the account and the rows all name the same ones.
     database = args.team_database or current.team_database or DEFAULT_DATABASE
-    if args.personal_database and args.personal_database == database:
+    personal = None if args.no_personal_database else (args.personal_database or current.personal_database or "")
+    overridden = _overridden({config.KEY_ENV: api_key, config.URL_ENV: url, config.TEAM_DB_ENV: database,
+                              config.PERSONAL_DB_ENV: personal}, current.mcp_server)
+    if overridden:
+        print(f"infino: {overridden} Nothing was created or sent.", file=sys.stderr)
+        return 1
+    if personal and personal == database:
         print(f"infino: '{database}' is the team database, so it cannot be your personal database: what is "
               "personal would go into the team's tables. Name another, or leave out --personal-database and "
               "one is made. Nothing was created or sent.", file=sys.stderr)
         return 1
-    new_account = not args.api_key_file
     counts = _local_counts()
-    print(_upload_notice(url, database, counts, new_account, _personal_destination(args)))
+    print(_upload_notice(url, database, counts, new_account, _personal_destination(personal)))
     if new_account or not args.yes:
         # Creating an account is a question only the person at the terminal answers.
         if not sys.stdin.isatty():
@@ -278,11 +342,6 @@ def _login(args) -> int:
             return 1
         api_key, database = str(trial["api_key"]), str(trial.get("database") or database)
     else:
-        try:
-            api_key = Path(args.api_key_file).expanduser().read_text().strip()
-        except OSError as e:
-            print(f"infino: cannot read the key file: {e}", file=sys.stderr)
-            return 1
         client = InfinoClient(api_key, url)
         client.list_databases()  # the key works before anything is stored
         client.ensure_database(database)
@@ -298,12 +357,12 @@ def _login(args) -> int:
         if trial.get("console_url"):
             print(f"   manage it at {trial['console_url']}")
     print(f"Signed in; the key is in {path} (owner-only).")
-    personal = _personal_database(InfinoClient(api_key, url), args, database)
-    if personal:
-        creds["personal_database"] = personal
+    made = _personal_database(InfinoClient(api_key, url), personal, database)
+    if made:
+        creds["personal_database"] = made
         config.write_credentials(creds)
-        print(f"Your personal database is '{personal}'. To use it from another machine too, sign in there "
-              f"with --personal-database {personal}.")
+        print(f"Your personal database is '{made}'. To use it from another machine too, sign in there "
+              f"with --personal-database {made}.")
     status = _catch_up(config.load())
     # The launcher picks the database when Hermes starts the tool server, and a
     # running Hermes (its gateway) keeps the one it started.
