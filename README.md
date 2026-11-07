@@ -16,7 +16,7 @@ The plugin keeps four tables.
 
 **`traces`** records every model call (model, provider, tokens, time) and every tool call (name, arguments, result, status, time). Secrets are masked the same way Hermes masks them for any memory plugin.
 
-**`skills`** holds the skills your agents share with `infino_publish_skill`. Once you sign in, every profile on the team can use them as read-only `infino:<name>` skills, from its next session. Only the profile's owner publishes: from their own sessions, and on a profile marked personal, from a direct message or a webhook route listed in `INFINO_OWNER_ROUTES`. A scheduled job publishes as the chat it was made in. Group chat members, a shared profile's gateway users, hosted rooms and messages from other agents can't. Secrets are masked first. A shared skill's name can have only letters, digits, `-` and `_`, the only names Hermes loads a plugin's skills under. Set `INFINO_TEAM_SKILLS=off` to keep a profile to its own skills.
+**`skills`** holds the skills your agents share with `infino_publish_skill`. Once you sign in, every profile on the team can use them as read-only `infino:<name>` skills, from its next session. Only the profile's owner publishes: from their own sessions, and on a profile marked personal, from a direct message or a webhook route listed in `INFINO_OWNER_ROUTES`. A scheduled job publishes as the chat it was made in. One made where you weren't the one talking (an API server session, a gateway `/background` run, a Kanban worker, a message from another agent) can't publish. Group chat members, a shared profile's gateway users, hosted rooms and messages from other agents can't. Secrets are masked first. A shared skill's name can have only letters, digits, `-` and `_`, the only names Hermes loads a plugin's skills under. Set `INFINO_TEAM_SKILLS=off` to keep a profile to its own skills.
 
 A turn and its traces share a `session_id` and a `turn_id`, so you can join them. Every row has a `row_id`.
 
@@ -150,7 +150,7 @@ Personal memory lives in its own database. On your machine it's in `$HERMES_HOME
 
 Personal memory belongs to the profile's owner. A shared profile on a gateway answers whoever writes to it, so it keeps no personal memory. On a profile that serves only you, such as your own bot, set `INFINO_PERSONAL_PROFILE=on`. Its chats can then keep your personal memory, and its conversations and traces stay personal too.
 
-A scheduled job made in a gateway chat runs as that chat. It keeps no personal memory on a shared profile, and none on any profile if it was made in a group chat. Neither does a message another agent sends into your Bot Chat.
+A scheduled job made in a gateway chat runs as that chat. It keeps no personal memory on a shared profile, and none on any profile if it was made in a group chat. Neither does a message another agent sends into your Bot Chat. A job made there gets no personal memory either, nor does any job made where you aren't the one talking and Hermes keeps no record of the chat: in an API server session (Open WebUI, a hosted room), a gateway `/background` run, or a Kanban worker. A job you make at the terminal, in the TUI or the Desktop, or with `hermes cron` is yours, and so is one made before this version.
 
 ## Keeping work personal
 
@@ -176,7 +176,7 @@ When Hermes is in a group chat through the gateway, memory belongs to that chat:
 - What members ask the agent to remember is saved for that chat and credited to whoever said it. It never goes into anyone's personal memory.
 - Recall in the group shows that chat's notes and the team's memory, never anyone's personal memory or other chats' notes.
 - Recall anywhere else doesn't show that group's notes.
-- Notes Hermes's background review saves after a group's turn stay with that chat, and never go into anyone's personal memory. If several groups talked in the same half hour, those notes show in no chat's recall.
+- Notes Hermes's background review saves after a group's turn stay with that chat, however long after the turn the review runs, and never go into anyone's personal memory. A note the reviews of several groups both saved shows in no chat's recall, and any of those chats can forget it. An entry you add to `MEMORY.md` or `USER.md` by hand is yours.
 
 ```mermaid
 flowchart LR
@@ -192,9 +192,9 @@ flowchart LR
   R2 --> PM
 ```
 
-Hermes tells the plugin which chat a message came from. Any chat that isn't a direct message counts as a group, including one whose type Hermes can't tell, and nobody writes to the owner's personal memory from a group. With Hermes's proposed channel memory ([#144822](https://github.com/NousResearch/hermes-agent/pull/144822)), its setting for each chat decides instead.
+Hermes tells the plugin which chat a message came from. Any chat that isn't a direct message counts as a group, including one whose type Hermes can't tell, and nobody writes to the owner's personal memory from a group. With Hermes's proposed channel memory ([#144822](https://github.com/NousResearch/hermes-agent/pull/144822)), its setting for each chat decides instead. A chat whose type Hermes can't tell may be your own direct message behind a relay. So asking for a personal memory there is refused instead of being saved for the chat, and a `USER.md` entry written there is kept nowhere.
 
-**Webhooks.** A webhook route on Hermes's webhook platform (a GitHub event, an email, an alert) works like a group chat of its own. What the agent saves during one delivery is kept for that route and recalled in its later deliveries. It isn't recalled in other chats or routes, and never goes into anyone's personal memory, since a webhook's content comes from outside. On a profile marked personal, list the routes whose events are your own business in `INFINO_OWNER_ROUTES`, such as `review-requested,my-alerts`. Their turns are then yours, with your personal memory, like a turn at the terminal.
+**Webhooks.** A webhook route on Hermes's webhook platform (a GitHub event, an email, an alert) works like a group chat of its own. What the agent saves during one delivery is kept for that route and recalled in its later deliveries. It isn't recalled in other chats or routes, and never goes into anyone's personal memory, since a webhook's content comes from outside: asking for a personal memory there is refused. On a profile marked personal, list the routes whose events are your own business in `INFINO_OWNER_ROUTES`, such as `review-requested,my-alerts`. Their turns are then yours, with your personal memory, like a turn at the terminal.
 
 **The Infino tools search the whole team database.** Recall keeps each chat's notes to that chat, but an agent can use the tools to read another chat's notes and conversations.
 

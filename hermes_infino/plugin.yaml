@@ -47,6 +47,7 @@ optional_env:
 # The plugin hooks registered (traces.py); the memory provider's own methods are not hooks.
 hooks:
   - pre_llm_call
+  - pre_tool_call
   - post_api_request
   - post_tool_call
   - subagent_start
