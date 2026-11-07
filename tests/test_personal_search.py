@@ -214,6 +214,15 @@ def test_a_group_chat_is_refused_even_where_the_owner_may_write_their_memory(hom
     assert search(p, query="Dr. Lee")["ok"] is False
 
 
+def test_a_personal_profile_refuses_it_in_a_chat_of_no_known_type(home, tmp_path, monkeypatch):
+    # A blank chat type may be a group's (chats.py): no personal data is searched there.
+    home.setenv("INFINO_PERSONAL_PROFILE", "on")
+    _, p = make_manager(tmp_path, platform="telegram")
+    p._backend.append(tables.CONVERSATIONS, [conversation("digest", PRIVATE)], personal=True)
+    in_session(monkeypatch, {**GROUP, "HERMES_SESSION_CHAT_TYPE": ""})
+    assert search(p, query="Dr. Lee") == {"ok": False, "error": provider_mod.NO_PERSONAL_SEARCH_HERE}
+
+
 def test_a_flush_run_never_searches(home, tmp_path):
     _, p = make_manager(tmp_path, agent_context="flush")
     assert not offered(p) and search(p, query="Dr. Lee")["ok"] is False
@@ -391,6 +400,41 @@ def test_after_a_session_switch_the_search_marks_the_new_session(home, tmp_path)
     assert team_rows_of(tmp_path, "s2") == [] and len(team_rows_of(tmp_path, "s1")) == 2
 
 
+def test_a_search_marks_the_session_hermes_ran_it_in_when_the_provider_was_not_told(home, tmp_path):
+    # Hermes moves an agent that waited on a session another process held to the session that
+    # one rotated to, and tells no provider: the provider still knows the old id, and the hooks
+    # and the sync carry the new one.
+    mgr, p = make_manager(tmp_path, session_id="old")
+    hooks = hook_ctx()
+    p._backend.append(tables.CONVERSATIONS, [conversation("digest", PRIVATE)], personal=True)
+    args = {"query": "Dr. Lee"}
+    result = mgr.handle_tool_call(PERSONAL_SEARCH_TOOL, args)
+    hooks["post_tool_call"](session_id="new", turn_id="t1", tool_name=PERSONAL_SEARCH_TOOL, tool_call_id="c1",
+                            args=args, result=result, status="ok")
+    hooks["post_api_request"](session_id="new", turn_id="t1", model="m", assistant_message="Dr. Lee sent results.")
+    hooks["on_session_end"](session_id="new")
+    p.sync_turn("What did my doctor send?", "Dr. Lee sent results.", session_id="new")
+    p._drain()
+    assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES) + texts(personal(tmp_path), tables.TRACES)) == 2)
+    assert team_rows_of(tmp_path, "new") == [] and len(personal_rows_of(tmp_path, "new")) == 2
+    assert local_rows(tmp_path, tables.TRACES) == []
+
+
+def test_a_refused_search_marks_no_session_from_its_trace_either(home, tmp_path, monkeypatch):
+    # A shared profile's gateway chat: the sender's conversation never goes to the owner's database.
+    mgr, p = make_manager(tmp_path, platform="telegram", session_id="g1")
+    hooks = hook_ctx()
+    in_session(monkeypatch, DM)
+    args = {"query": "Dr. Lee"}
+    result = mgr.handle_tool_call(PERSONAL_SEARCH_TOOL, args)
+    assert json.loads(result)["ok"] is False
+    hooks["post_tool_call"](session_id="g1", turn_id="t1", tool_name=PERSONAL_SEARCH_TOOL, tool_call_id="c1",
+                            args=args, result=result, status="error", error_message=json.loads(result)["error"])
+    p.sync_turn("hi", "hello", session_id="g1")
+    p._drain()
+    assert len(team_rows_of(tmp_path, "g1")) == 2 and personal_rows_of(tmp_path, "g1") == []
+
+
 @pytest.mark.parametrize("reason", ["branch", "compression"])
 def test_a_session_that_continues_one_that_searched_is_personal(home, tmp_path, reason):
     # /branch, and compaction that starts a new session, carry the history on under a new id.
@@ -448,9 +492,9 @@ def test_even_if_the_session_were_not_marked_the_call_reaches_no_team_row(home, 
     p._backend.append(tables.CONVERSATIONS, [conversation("digest", PRIVATE)], personal=True)
     args = {"query": "Dr. Lee"}
     result = mgr.handle_tool_call(PERSONAL_SEARCH_TOOL, args)
-    privacy._sessions.clear()  # the mark lost (another process, or evicted): the session reads as the team's
     hooks["post_tool_call"](session_id="s1", turn_id="t1", tool_name=PERSONAL_SEARCH_TOOL, tool_call_id="c1",
                             args=args, result=result, status="ok")
+    privacy._sessions.clear()  # the marks lost (another process, or evicted): the session reads as the team's
     hooks["on_session_end"](session_id="s1")
     messages = [{"role": "user", "content": "What did my doctor send?"},
                 {"role": "assistant", "content": "", "tool_calls": [

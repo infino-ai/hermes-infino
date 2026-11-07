@@ -36,10 +36,18 @@ def test_the_owners_own_sessions_are_never_a_group(monkeypatch, platform):
     assert chats.current() == chats.NO_CHAT
 
 
-@pytest.mark.parametrize("chat_type", ["dm", "private", "DM", "direct", ""])
+@pytest.mark.parametrize("chat_type", ["dm", "private", "DM", "direct", " dm "])
 def test_a_one_to_one_chat_is_not_a_group(monkeypatch, chat_type):
     in_session(monkeypatch, {**DM, "HERMES_SESSION_CHAT_TYPE": chat_type})
     assert chats.current() == chats.NO_CHAT
+
+
+@pytest.mark.parametrize("chat_type", ["", "  "])
+def test_a_chat_of_no_known_type_is_a_group(monkeypatch, chat_type):
+    # Hermes's own access check reads a blank type as ambiguous (a relay frame's "" or null, a
+    # restored session's stored empty value) and settles it as a group: the safe side here too.
+    in_session(monkeypatch, {**DM, "HERMES_SESSION_CHAT_TYPE": chat_type})
+    assert chats.current() == chats.Chat(key="telegram:111", group=True, owner_writes=False)
 
 
 def test_a_dm_is_what_hermes_calls_a_dm():

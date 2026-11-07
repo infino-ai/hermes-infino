@@ -14,7 +14,8 @@ prefixes it. Whether the chat is a group is Hermes's to decide:
   decides, including whether this sender may write the owner's own memory from
   the group (a sender the gateway would also admit in a DM);
 - without it, the chat type decides, as Hermes itself then does: anything but
-  a DM is a group.
+  a DM is a group. A chat of no known type (blank) may be either, and is a
+  group, as Hermes's own access check settles it.
 
 The owner's own surfaces (OWNER_PLATFORMS) have no gateway chat: a session
 there is never a group. Hermes's hosted Group Chat rooms and turns another
@@ -37,7 +38,10 @@ try:  # Hermes's channel memory binding (when Hermes has channel memory).
 except ImportError:
     _CHANNEL_MEMORY = None
 
-try:  # The chat types Hermes itself treats as a one-to-one chat ("" included).
+try:  # The chat types Hermes itself treats as a one-to-one chat. The set lists
+    # "" too, but Hermes reads a blank type as ambiguous - a relay frame sends ""
+    # or null for it, and a restored session keeps a stored empty one - and its
+    # access check settles that as a group (gateway/slash_access.py): so does `current`.
     from gateway.slash_access import _DM_CHAT_TYPES as DM_TYPES
 except ImportError:  # the same set, for a Hermes that does not name it
     DM_TYPES = frozenset({"dm", "direct", "private", ""})
@@ -103,7 +107,8 @@ def current() -> Chat:
         if binding is None:
             return NO_CHAT
         return Chat(key=key, group=True, owner_writes=bool(getattr(binding, "owner_writes", False)))
-    if session("HERMES_SESSION_CHAT_TYPE").lower() in DM_TYPES:
+    chat_type = session("HERMES_SESSION_CHAT_TYPE").strip().lower()
+    if chat_type and chat_type in DM_TYPES:  # a blank type may be a group's: a group
         return NO_CHAT
     # Without channel memory Hermes cannot say whether the sender may write the
     # owner's memory from a group, so no one does from here.

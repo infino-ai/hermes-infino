@@ -4,13 +4,17 @@ traces out of the team's database; everything else still goes there."""
 
 from __future__ import annotations
 
+import json
 import time
 from contextlib import contextmanager
 
 import pytest
 
+from agent.delegation_context import delegated_child_context
 from cron.execution_identity import enter_cron_execution, exit_cron_execution
+from cron.jobs import create_job, use_cron_store
 from cron.scheduler_delivery import bot_chat_message
+from tools.delegate_tool_routes import delegated_profile_scope
 
 from hermes_infino import backend, config, privacy, tables
 from hermes_infino.local import PERSONAL_DB_DIR, LocalStore
@@ -33,6 +37,8 @@ LATER_MS = 60_000
 # A registry of sessions this small, and more sessions noted than it holds.
 SMALL_REGISTRY = 3
 MANY_SESSIONS = 10
+# How often the jobs in these tests run, as Hermes's scheduler reads a schedule.
+HOURLY = "every 1h"
 
 
 def personal(tmp_path) -> LocalStore:
@@ -44,7 +50,7 @@ def texts(store: LocalStore, table: str) -> list[str]:
     the store has no such table)."""
     if table not in store.list_tables():
         return []
-    cells = ("content", "tool_args", "tool_result") if table == tables.CONVERSATIONS else ("args", "result")
+    cells = ("content", "tool_args", "tool_result") if table == tables.CONVERSATIONS else ("args", "result", "error")
     return [" ".join(str(r.get(c) or "") for c in cells) for r in store.query_sql(f"SELECT * FROM {table}")]
 
 
@@ -319,6 +325,27 @@ def test_a_team_jobs_output_noted_into_a_local_or_bot_chat_stays_the_teams(diges
     assert not privacy.transcript_personal(settings, "bot-chat-2", turn(bot_chat_message(REPORT, "12 deploys."), "ok"))
 
 
+def jobs_named(tmp_path, name: str, prompts: tuple[str, ...]) -> list[dict]:
+    """Jobs of the profile at `tmp_path` that share one name, made by Hermes's own job store."""
+    with use_cron_store(tmp_path):
+        return [create_job(prompt=prompt, schedule=HOURLY, name=name) for prompt in prompts]
+
+
+@pytest.mark.parametrize("delivered", [
+    lambda job: f"[Cron delivery: {job['name']}]\n{TRIAGE}",
+    lambda job: bot_chat_message(job, TRIAGE),
+    lambda job: room_turn(job["name"], TRIAGE),
+])
+def test_a_job_listed_by_its_id_is_recognized_when_another_job_shares_its_name(home, tmp_path, delivered):
+    """Hermes labels a job's output by its name. When two of the profile's jobs
+    share it, either may be the one listed: the output counts as personal (so
+    the other job's does too)."""
+    digest, _ = jobs_named(tmp_path, DIGEST["name"], ("Triage my inbox.", "Triage the team's inbox."))
+    home.setenv("INFINO_PERSONAL_JOBS", digest["id"])
+    messages = turn(delivered(digest), "Drafted a reply to Dr. Lee.")
+    assert privacy.transcript_personal(config.load(tmp_path), "chat-1", messages)
+
+
 def test_a_session_still_making_calls_stays_remembered(home, tmp_path, monkeypatch):
     monkeypatch.setattr(privacy, "MAX_SESSIONS", SMALL_REGISTRY)
     settings = config.load(tmp_path)
@@ -389,6 +416,72 @@ def test_a_personal_profile_setting_in_an_unknown_spelling_is_named_once(home, t
     config.load(tmp_path)
     config.load(tmp_path)  # settings load on every turn: one warning says it
     assert len(warned) == 1 and "'enabled'" in warned[0] and "INFINO_PERSONAL_PROFILE" in warned[0]
+
+
+def tools_settings(home_dir, env: dict) -> None:
+    """One profile's own settings, in the env block of its Infino tools' entry."""
+    (home_dir / "config.yaml").write_text(json.dumps({"mcp_servers": {"infino": {"command": "hermes", "env": env}}}))
+
+
+def a_subagent_turn(hooks, child: str) -> None:
+    """A subagent's tool call and turn end, as Hermes runs its conversation:
+    marked as a delegated child's (and, routed, inside the other profile)."""
+    with delegated_child_context(child):
+        hooks["post_tool_call"](session_id=child, turn_id="c1", tool_name="terminal", args={}, result=MAIL)
+        hooks["on_session_end"](session_id=child)
+
+
+@pytest.mark.parametrize("own_copy", [False, True])
+def test_a_subagent_routed_to_another_profile_keeps_a_personal_sessions_work_personal(home, tmp_path, own_copy):
+    tools_settings(tmp_path, {"INFINO_PERSONAL_PROFILE": "on"})
+    make_manager(tmp_path, session_id="errands")
+    coder = tmp_path / "profiles" / "coder"  # a team profile on the same machine
+    coder.mkdir(parents=True)
+    backend.for_settings(config.load(coder)).ensure_local()
+    hooks = hook_ctx()
+    # Hermes fires subagent_start as the parent, then runs the child as the profile its route names.
+    hooks["subagent_start"](parent_session_id="errands", child_session_id="child-1")
+    if own_copy:  # that profile loads its own copy of the plugin, which knows nothing this one noted
+        privacy._sessions.clear()
+    with delegated_profile_scope(coder):
+        a_subagent_turn(hooks, "child-1")
+    assert wait_for(lambda: len(texts(local(coder), tables.TRACES) + texts(personal(coder), tables.TRACES)) == 1)
+    assert texts(local(coder), tables.TRACES) == []
+
+
+def test_a_subagent_of_a_team_session_stays_the_teams_as_hermes_runs_it(home, tmp_path):
+    make_manager(tmp_path, session_id="work")
+    hooks = hook_ctx()
+    hooks["subagent_start"](parent_session_id="work", child_session_id="child-1")
+    a_subagent_turn(hooks, "child-1")
+    assert wait_for(lambda: len(texts(local(tmp_path), tables.TRACES)) == 1)
+    assert texts(personal(tmp_path), tables.TRACES) == []
+
+
+# -- memory calls that may reach personal memory ------------------------------------------
+
+@pytest.mark.parametrize("tool, args", [
+    ("infino_forget", {"content": "About Ann: her therapist is Dr. Lee"}),  # no scope: personal memory too
+    ("infino_remember", {"content": "Ann's therapist is Dr. Lee", "scope": "private"}),  # refused, still said
+])
+def test_a_memory_call_that_may_reach_personal_memory_keeps_its_text_out_of_the_teams_rows(home, tmp_path, tool,
+                                                                                            args):
+    mgr, p = make_manager(tmp_path, session_id="s1")
+    hooks = hook_ctx()
+    result = mgr.handle_tool_call(tool, args)
+    hooks["post_tool_call"](session_id="s1", turn_id="t1", tool_name=tool, tool_call_id="c1", args=args,
+                            result=result, status="ok")
+    hooks["on_session_end"](session_id="s1")
+    messages = [{"role": "user", "content": "Forget that."},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c1", "function": {"name": tool, "arguments": json.dumps(args)}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": result},
+                {"role": "assistant", "content": "Done."}]
+    p.sync_turn("Forget that.", "Done.", session_id="s1", messages=messages)
+    p._drain()
+    assert wait_for(lambda: len(texts(local(tmp_path), tables.TRACES)) == 1)
+    team = texts(local(tmp_path), tables.CONVERSATIONS) + texts(local(tmp_path), tables.TRACES)
+    assert len(team) == 5 and not [t for t in team if PRIVATE in t]
 
 
 # -- what reaches the cloud ----------------------------------------------------------

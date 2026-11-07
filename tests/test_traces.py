@@ -201,6 +201,11 @@ def test_a_model_calls_row_keeps_its_text_not_its_tool_calls(hooks, tmp_path):
     ("infino_remember", {"content": "my dentist is Tuesday", "scope": "Personal"}),
     ("memory", {"target": "user", "operations": [{"action": "add", "content": "my dentist is Tuesday"}]}),
     ("memory", json.dumps({"target": "user", "action": "add", "content": "my dentist is Tuesday"})),
+    # A forget with no scope deletes from personal memory too.
+    ("infino_forget", {"content": "About Ann: my dentist is Tuesday"}),
+    # A scope the provider refuses: nothing is saved, but the call still carries the text.
+    ("infino_remember", {"content": "my dentist is Tuesday", "scope": "private"}),
+    ("infino_forget", {"content": "my dentist is Tuesday", "scope": "mine"}),
 ])
 def test_a_personal_memory_call_is_traced_without_its_text(hooks, tmp_path, tool, args):
     hooks["post_tool_call"](session_id="s9", turn_id="t1", tool_name=tool, args=args,
@@ -212,12 +217,29 @@ def test_a_personal_memory_call_is_traced_without_its_text(hooks, tmp_path, tool
     assert privacy.WITHHELD in row["args"] and row["tool"] == tool
 
 
-def test_a_team_memory_call_is_traced_whole(hooks, tmp_path):
-    hooks["post_tool_call"](session_id="s9", turn_id="t1", tool_name="infino_remember",
-                            args={"content": "deploys freeze Dec 20"}, result="ok")
+@pytest.mark.parametrize("tool, args", [
+    ("infino_remember", {"content": "deploys freeze Dec 20"}),
+    ("infino_remember", {"content": "deploys freeze Dec 20", "scope": " Team"}),
+    ("infino_forget", {"content": "deploys freeze Dec 20", "scope": "team"}),
+])
+def test_a_team_memory_call_is_traced_whole(hooks, tmp_path, tool, args):
+    hooks["post_tool_call"](session_id="s9", turn_id="t1", tool_name=tool, args=args, result="ok")
     hooks["on_session_end"](session_id="s9")
     assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 1)
     assert "deploys freeze Dec 20" in local_rows(tmp_path, tables.TRACES)[0]["args"]
+
+
+def test_a_personal_calls_error_is_withheld_too(hooks, tmp_path):
+    # Hermes hands the hook the error its memory tool answered, which quotes the text it looked for.
+    hooks["post_tool_call"](session_id="s9", turn_id="t1", tool_name="memory", tool_call_id="c1",
+                            args={"action": "remove", "target": "user", "old_text": "Dr. Lee"},
+                            result=json.dumps({"success": False, "error": "No entry matched 'Dr. Lee'."}),
+                            status="error", error_message="No entry matched 'Dr. Lee'.")
+    hooks["on_session_end"](session_id="s9")
+    assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 1)
+    [row] = local_rows(tmp_path, tables.TRACES)
+    assert "Dr. Lee" not in row["error"]
+    assert (row["status"], row["error"]) == ("error", privacy.WITHHELD)
 
 
 def test_a_session_nobody_identified_has_no_author(hooks, tmp_path):
