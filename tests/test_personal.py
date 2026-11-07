@@ -10,6 +10,7 @@ from contextlib import contextmanager
 import pytest
 
 from cron.execution_identity import enter_cron_execution, exit_cron_execution
+from cron.scheduler_delivery import bot_chat_message
 
 from hermes_infino import backend, config, privacy, tables
 from hermes_infino.local import PERSONAL_DB_DIR, LocalStore
@@ -29,6 +30,9 @@ DIGEST_SESSION = f"cron_{DIGEST['id']}_20261105_070000"
 REPORT_SESSION = f"cron_{REPORT['id']}_20261105_070000"
 # Far enough ahead that every row stored is "settled" for a read of the sources.
 LATER_MS = 60_000
+# A registry of sessions this small, and more sessions noted than it holds.
+SMALL_REGISTRY = 3
+MANY_SESSIONS = 10
 
 
 def personal(tmp_path) -> LocalStore:
@@ -272,6 +276,56 @@ def test_a_group_chat_member_whose_profile_does_not_list_the_job_writes_to_the_t
 def test_a_person_quoting_a_room_label_mid_line_names_no_job():
     said = 'User (user): it printed Scheduled job "email-digest" (automated post, not the user): hi'
     assert privacy.delivered_jobs([{"role": "user", "content": said}]) == []
+
+
+def local_chat_note(job: dict, output: str) -> str:
+    """A scheduled job's output as Hermes writes it into a local chat's history
+    (`deliver: local:<chat>`): the wrapped text cron/scheduler_delivery.py sends."""
+    return (f"Cronjob Response: {job['name']}\n"
+            f"(job_id: {job['id']})\n"
+            f"-------------\n\n"
+            f"{output}\n\n"
+            "To stop or manage this job, send me a new message "
+            f"(e.g. \"stop reminder {job['name']}\").")
+
+
+@pytest.mark.parametrize("listed", [DIGEST["name"], DIGEST["id"]])
+def test_a_local_chat_a_personal_jobs_output_was_noted_into_is_personal(home, tmp_path, listed):
+    home.setenv("INFINO_PERSONAL_JOBS", listed)
+    messages = [{"role": "user", "content": local_chat_note(DIGEST, TRIAGE)}] + turn("Draft a reply.", "Drafted.")
+    assert privacy.transcript_personal(config.load(tmp_path), "local-1", messages)
+
+
+def test_a_bot_chat_a_personal_jobs_output_was_handed_to_is_personal(digest_is_personal, tmp_path):
+    messages = turn(bot_chat_message(DIGEST, TRIAGE), "Summarized: Dr. Lee wrote.")  # Hermes's own turn text
+    assert privacy.transcript_personal(config.load(tmp_path), "bot-chat-1", messages)
+
+
+def test_a_team_jobs_output_noted_into_a_local_or_bot_chat_stays_the_teams(digest_is_personal, tmp_path):
+    settings = config.load(tmp_path)
+    assert not privacy.transcript_personal(settings, "local-2", turn(local_chat_note(REPORT, "12 deploys."), "ok"))
+    assert not privacy.transcript_personal(settings, "bot-chat-2", turn(bot_chat_message(REPORT, "12 deploys."), "ok"))
+
+
+def test_a_session_still_making_calls_stays_remembered(home, tmp_path, monkeypatch):
+    monkeypatch.setattr(privacy, "MAX_SESSIONS", SMALL_REGISTRY)
+    settings = config.load(tmp_path)
+    privacy.note_personal("parent")
+    for i in range(MANY_SESSIONS):  # a gateway noting other sessions meanwhile
+        privacy.note_personal(f"other-{i}")
+        privacy.note_cron_job("parent")  # the parent's own model and tool calls
+    assert privacy.transcript_personal(settings, "parent")
+
+
+def test_a_subagent_still_running_keeps_the_session_that_started_it(home, tmp_path, monkeypatch):
+    monkeypatch.setattr(privacy, "MAX_SESSIONS", SMALL_REGISTRY)
+    settings = config.load(tmp_path)
+    privacy.note_personal("parent")
+    privacy.note_parent("child", "parent")
+    for i in range(MANY_SESSIONS):  # the parent waits on its subagent, which makes the calls
+        privacy.note_personal(f"other-{i}")
+        privacy.note_cron_job("child")
+    assert privacy.transcript_personal(settings, "child")
 
 
 def test_a_chat_a_team_jobs_output_was_delivered_into_stays_the_teams(chat, tmp_path):

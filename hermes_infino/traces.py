@@ -13,7 +13,12 @@ calls is one append, not eleven. No OpenTelemetry collector is involved. The
 buffers belong to the process, not to one registration of the hooks: Hermes
 registers them anew each time it builds an agent (a gateway builds one per
 message), and a turn still running in one chat keeps its rows when another
-chat's message arrives.
+chat's message arrives. Hermes's background review and `/btw` are forks that
+share the session's id and have no turn end of their own: their rows wait
+for the session's next turn end, are written when the provider shuts down,
+and, once more sessions wait than are remembered, the oldest session's rows
+are written then, never dropped. A session's rows are written in the profile
+scope they were made in, whichever turn's call sets them going.
 
 Hermes scrubs secrets from everything it hands a memory provider, but these
 hooks get tool arguments and results as the tool saw them. So every text
@@ -33,7 +38,7 @@ hook sets in a context variable reaches `sync_turn`. `sync_turn` takes the
 turn whose user message it was handed, since the person's next message may
 start the next turn before the last one's sync runs. The person is the
 gateway's sender for the turn (the turn's session values), or this machine's
-owner.
+owner; a subagent's is the session's that started it.
 """
 
 from __future__ import annotations
@@ -44,9 +49,11 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from typing import Any
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Optional
 
-from agent.memory_provider import spawn_context_thread
+from agent.memory_provider import ctx_bound, spawn_context_thread
 
 from . import backend, chats, config, privacy, tables
 
@@ -64,9 +71,12 @@ MAX_TRACE_CELL_CHARS = 4_000
 # (a secret straddling the cut is dropped with what follows it), not a
 # multi-megabyte tool output scrubbed on the turn's thread.
 SCRUB_CHARS = 2 * MAX_TRACE_CELL_CHARS
-# Sessions whose person is remembered; a long-running gateway sees many, and
-# only the latest few are still running.
+# Sessions whose person, started turns and unwritten rows are remembered; a
+# long-running gateway sees many, and only the latest few are still running.
 MAX_SESSIONS = 1_024
+# Seconds a shutdown waits for the rows still buffered to be written: local
+# appends, quick, but a stuck disk must not hold up Hermes's exit.
+SHUTDOWN_WRITE_WAIT_S = 5.0
 # How much of a turn's user message ties the turn's start to its sync.
 TURN_KEY_CHARS = 200
 # Turns remembered per session: those started and not synced yet. A turn
@@ -174,8 +184,10 @@ def turn_id_for(session_id: str, user_content: str) -> str:
         return turns[-1][1]
 
 
-# This machine's person for each session the provider started (`initialize`).
-# A gateway turn's person is its sender instead, read from the turn.
+# This machine's person and the profile for each session the provider started
+# (`initialize`) or moved to (`on_session_switch`), and for each subagent's
+# session (the session's that started it). A gateway turn's person is its
+# sender instead, read from the turn.
 _identity: OrderedDict[str, tuple[str, str]] = OrderedDict()
 _identity_lock = threading.Lock()
 
@@ -195,22 +207,84 @@ def _identity_of(session_id: str) -> tuple[str, str]:
 
 def turn_person(session_id: str) -> str:
     """Who the running turn is for: the gateway's sender, or this machine's person."""
-    if chats.session("HERMES_SESSION_PLATFORM").lower() not in chats.LOCAL_PLATFORMS:
+    if chats.session("HERMES_SESSION_PLATFORM").lower() not in chats.OWNER_PLATFORMS:
         return chats.session("HERMES_SESSION_USER_NAME") or chats.session("HERMES_SESSION_USER_ID")
     return _identity_of(session_id)[0]
 
 
-# Each session's rows not written yet, shared by every registration of the hooks.
-_buffers: dict[str, list[dict]] = {}
+def _write(session_id: str, rows: list[dict], author: Optional[str] = None) -> None:
+    """Write a session's rows, in the profile scope this runs in: to the
+    person's own tables when the session is personal (privacy.py). `author`
+    is the person when the caller read it in the turn's own context; else
+    whoever this context's turn is for."""
+    author = turn_person(session_id) if author is None else author
+    profile = _identity_of(session_id)[1]
+    for row in rows:
+        row["author"] = author
+        row["profile"] = profile
+    try:
+        b = backend.for_settings(config.load())
+        b.append(tables.TRACES, rows, b.transcript_personal(session_id))
+    except Exception as e:
+        logger.warning("infino-traces: %d trace rows not written: %s", len(rows), e)
+
+
+@dataclass
+class _Waiting:
+    """A session's rows not written yet."""
+    home: Path                                         # the profile they were made in
+    write: Callable[..., None]                         # `_write`, bound to the scope they were made in
+    rows: list[dict] = field(default_factory=list)
+
+
+# Each session's rows not written yet, oldest session first, shared by every
+# registration of the hooks.
+_buffers: OrderedDict[str, _Waiting] = OrderedDict()
 _buffers_lock = threading.Lock()
+
+
+def _write_later(session_id: str, waiting: _Waiting) -> None:
+    """Write rows taken out of the buffers on a thread of their own, in the
+    scope they were made in."""
+    spawn_context_thread(lambda: waiting.write(session_id, waiting.rows), name="infino-traces-flush").start()
+
+
+def write_buffered(home: Path, wait_s: float = SHUTDOWN_WRITE_WAIT_S) -> None:
+    """Write now every row still buffered for the profile at `home` - those a
+    fork added after its session's last turn ended - and wait for them, at
+    most `wait_s`. The provider calls this as it shuts down; other profiles'
+    rows wait for their own."""
+    profile = Path(home).resolve()
+    with _buffers_lock:
+        mine = [(s, _buffers.pop(s)) for s in [s for s, w in _buffers.items() if w.home == profile]]
+    if not mine:
+        return
+
+    def write_all() -> None:
+        for session_id, waiting in mine:
+            waiting.write(session_id, waiting.rows)
+
+    writer = spawn_context_thread(write_all, name="infino-traces-shutdown")
+    writer.start()
+    writer.join(wait_s)
 
 
 class TraceRecorder:
     def _add(self, session_id: str, row: dict) -> None:
         # Read in the call's own context: a scheduled job's run says which job it is.
         privacy.note_cron_job(session_id or "")
+        session = session_id or ""
         with _buffers_lock:
-            _buffers.setdefault(session_id or "", []).append(row)
+            waiting = _buffers.get(session)
+            if waiting is None:
+                waiting = _buffers[session] = _Waiting(Path(config.home()).resolve(), ctx_bound(_write))
+            waiting.rows.append(row)
+            _buffers.move_to_end(session)
+            evicted = []
+            while len(_buffers) > MAX_SESSIONS:
+                evicted.append(_buffers.popitem(last=False))
+        for old_session, old in evicted:
+            _write_later(old_session, old)
 
     def on_llm_call(self, **kw: Any) -> None:
         """As a turn starts, before its first model call: note the turn's id
@@ -222,8 +296,14 @@ class TraceRecorder:
         privacy.note_deliveries(str(kw.get("session_id") or ""), history)
 
     def on_subagent(self, **kw: Any) -> None:
-        """A subagent's session is as personal as the session that started it."""
-        privacy.note_parent(str(kw.get("child_session_id") or ""), str(kw.get("parent_session_id") or ""))
+        """A subagent's session is as personal as the session that started it,
+        and its rows are that session's person's and profile's: Hermes starts
+        no provider for a subagent, which would note them."""
+        child, parent = str(kw.get("child_session_id") or ""), str(kw.get("parent_session_id") or "")
+        privacy.note_parent(child, parent)
+        identity = _identity_of(parent)
+        if child and child != parent and any(identity) and not any(_identity_of(child)):
+            note_identity(child, *identity)
 
     def on_api(self, **kw: Any) -> None:
         inp, out, cached = _tokens(kw.get("usage"))
@@ -275,23 +355,12 @@ class TraceRecorder:
     def on_turn_end(self, **kw: Any) -> None:
         session = str(kw.get("session_id") or "")
         with _buffers_lock:
-            rows = _buffers.pop(session, [])
-        if not rows:
+            waiting = _buffers.pop(session, None)
+        if waiting is None or not waiting.rows:
             return
-        settings = config.load()  # read in the hook's own profile scope
-        author, profile = turn_person(session), _identity_of(session)[1]
-        for row in rows:
-            row["author"] = author
-            row["profile"] = profile
-
-        def flush() -> None:
-            try:
-                b = backend.for_settings(settings)
-                b.append(tables.TRACES, rows, b.transcript_personal(session))
-            except Exception as e:
-                logger.warning("infino-traces: %d trace rows not written: %s", len(rows), e)
-
-        spawn_context_thread(flush, name="infino-traces-flush").start()
+        # The person as the turn that ends names them, read in the hook's own context.
+        author = turn_person(session)
+        spawn_context_thread(lambda: waiting.write(session, waiting.rows, author), name="infino-traces-flush").start()
 
 
 def register_hooks(ctx) -> None:

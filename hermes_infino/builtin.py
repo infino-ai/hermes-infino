@@ -8,9 +8,10 @@ to save what a conversation taught it - writes the same files with every
 memory provider switched off, and a person may edit them by hand. So the
 provider compares the files with the rows it keeps from them (`memory` rows
 of origin `builtin:memory` / `builtin:user`, on this machine) at its start
-and after each turn: an entry no row holds is added the way `on_memory_write`
-adds one, and a row whose entry has left the file is deleted, here and in the
-cloud.
+and after each turn: an entry no row holds is added as the profile owner's -
+nothing says which conversation or chat it came from, so never as the
+running turn's - and a row whose entry has left the file is deleted, here
+and in the cloud.
 
 A file that is missing or cannot be read says nothing: no row is deleted for
 it. Entries are compared scrubbed of secrets, as Hermes scrubs what it hands

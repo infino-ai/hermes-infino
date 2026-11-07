@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import argparse
 import io
+import urllib.error
 from types import SimpleNamespace
 
 import pytest
 
 from hermes_infino import cli, config, tables
 
-from .helpers import TEAM_DB, make_manager, sign_in
+from .helpers import PERSONAL_DB, TEAM_DB, make_manager, sign_in
 
 # A port nothing listens on.
 DEAD_URL = "http://127.0.0.1:9"
+# A row carrying this text is refused by the fake platform, when told to.
+REFUSED_TEXT = "refuse-this-row"
+# "Too large": a refusal that sets the row aside rather than stopping the sync.
+TOO_LARGE = 413
 
 
 def run(*argv: str) -> int:
@@ -211,7 +216,7 @@ def test_a_personal_database_the_platform_refuses_leaves_the_sign_in_working(hom
                                                                              capsys, named):
     m, _ = make_manager(tmp_path)
     m.handle_tool_call("infino_remember", {"content": "kept before sign-in"})
-    platform.database_limit = 1  # a free plan with room for the team's database only
+    platform.database_limit = 1  # a key that may make no database past the team's
     terminal("yes")
     assert run("login", "--url", platform.url, "--team-database", TEAM_DB, *named) == 0
     assert personal_database_of(tmp_path) == "" and set(platform.databases) == {TEAM_DB}
@@ -244,3 +249,114 @@ def test_sync_to_an_unreachable_platform_reports_it(home, tmp_path, capsys):
     config.write_credentials({"url": DEAD_URL, "api_key": "k", "team_database": TEAM_DB}, tmp_path)
     assert run("sync") == 1
     assert "could not reach the platform" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("failure", [urllib.error.URLError("connection reset"), TimeoutError("timed out")])
+def test_a_new_accounts_key_is_kept_whatever_stops_the_personal_database(home, platform, tmp_path, terminal,
+                                                                         monkeypatch, capsys, failure):
+    # The platform gives one free account per network, and its key only once.
+    def fail(client, name):
+        raise failure
+
+    monkeypatch.setattr(cli.InfinoClient, "create_database", fail)
+    terminal("yes")
+    code = run("login", "--url", platform.url, "--team-database", TEAM_DB)
+    creds = config.read_credentials(tmp_path)
+    assert (creds.get("api_key"), creds.get("team_database"), creds.get("url")) == ("trial-key-1", TEAM_DB,
+                                                                                    platform.url)
+    assert "personal_database" not in creds and "No personal database" in capsys.readouterr().err
+    assert code == 0
+
+
+def test_login_refuses_a_personal_database_that_is_the_team_database(home, platform, tmp_path, no_terminal,
+                                                                     key_file, capsys):
+    assert login_with_key(platform, key_file, "--personal-database", TEAM_DB) == 1
+    assert config.read_credentials(tmp_path) == {} and platform.databases == {}
+    assert f"'{TEAM_DB}' is the team database" in capsys.readouterr().err
+
+
+def test_login_names_the_team_database_already_set(home, platform, tmp_path, no_terminal, key_file, capsys):
+    home.setenv("INFINO_TEAM_DATABASE", "ops")
+    assert run("login", "--url", platform.url, "--api-key-file", str(key_file), "--yes") == 0
+    assert "database 'ops'" in capsys.readouterr().out
+    assert config.read_credentials(tmp_path)["team_database"] == "ops"
+    assert cli.DEFAULT_DATABASE not in platform.databases
+
+
+def test_already_signed_in_says_how_to_sign_in_again(home, platform, tmp_path, capsys):
+    sign_in(tmp_path, platform)
+    assert run("login") == 0
+    out = capsys.readouterr().out
+    assert str(config.state_dir(tmp_path) / config.CREDENTIALS_FILE) in out
+    assert "environment" in out and "mcp_servers.infino" in out
+
+
+def test_status_before_hermes_has_run_says_no_vectors_yet(home, capsys):
+    assert run("status") == 0
+    out = capsys.readouterr().out
+    assert "the cloud embeds" not in out and "memory vectors not made yet" in out
+
+
+def test_sync_without_a_personal_database_says_what_stays_here(home, platform, tmp_path, capsys):
+    m, _ = make_manager(tmp_path)
+    m.handle_tool_call("infino_remember", {"content": "the deploy freeze starts December 20"})
+    m.handle_tool_call("infino_remember", {"content": "my dentist is Tuesday", "scope": "personal"})
+    sign_in(tmp_path, platform)
+    assert run("sync") == 0
+    out = capsys.readouterr().out
+    assert "The cloud has everything kept here (" not in out
+    assert "what is personal" in out and "no personal database" in out
+
+
+def test_sync_counts_the_rows_the_cloud_refused(home, platform, tmp_path, capsys):
+    m, _ = make_manager(tmp_path)
+    m.handle_tool_call("infino_remember", {"content": f"too large to take: {REFUSED_TEXT}"})
+    sign_in(tmp_path, platform, personal_database=PERSONAL_DB)
+    platform.refused_marker, platform.refused_status = REFUSED_TEXT, TOO_LARGE
+    assert run("sync") == 0
+    out = capsys.readouterr().out
+    assert "The cloud has everything kept here (" not in out
+    assert "1 rows the cloud would not take" in out
+
+
+def remember_team_and_personal(tmp_path) -> None:
+    m, _ = make_manager(tmp_path)
+    m.handle_tool_call("infino_remember", {"content": "the deploy freeze starts December 20"})
+    m.handle_tool_call("infino_remember", {"content": "my dentist is Tuesday", "scope": "personal"})
+
+
+def test_sync_pushes_the_teams_rows_past_a_personal_database_out_of_reach(home, platform, tmp_path, capsys):
+    remember_team_and_personal(tmp_path)
+    sign_in(tmp_path, platform, personal_database=PERSONAL_DB)
+    platform.refused_databases = {PERSONAL_DB}  # a key limited to other databases
+    assert run("sync") == 1
+    out = capsys.readouterr().out
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["the deploy freeze starts December 20"]
+    assert PERSONAL_DB not in platform.databases
+    assert f"what is personal: '{PERSONAL_DB}' could not be made ready" in out and "403" in out
+    assert "The cloud has everything kept here (" not in out
+    # Once it can be made, the next sync sends what is personal.
+    platform.refused_databases = set()
+    assert run("sync") == 0
+    assert [r["content"] for r in platform.rows(PERSONAL_DB, tables.MEMORY)] == ["my dentist is Tuesday"]
+    assert len(platform.rows(TEAM_DB, tables.MEMORY)) == 1
+
+
+def test_sync_says_the_team_push_failed_while_the_personal_database_is_out_of_reach(home, platform, tmp_path,
+                                                                                    capsys):
+    remember_team_and_personal(tmp_path)
+    sign_in(tmp_path, platform, personal_database=PERSONAL_DB)
+    platform.refused_databases = {PERSONAL_DB}
+    platform.failed_appends = 1
+    assert run("sync") == 1
+    err = capsys.readouterr().err
+    assert "The cloud stopped accepting rows: " in err and "HTTP 500" in err
+
+
+def test_sync_where_no_database_can_be_made_ready_says_why(home, platform, tmp_path, capsys):
+    remember_team_and_personal(tmp_path)
+    sign_in(tmp_path, platform, personal_database=PERSONAL_DB)
+    platform.refused_databases = {TEAM_DB, PERSONAL_DB}
+    assert run("sync") == 1
+    assert "the platform refused" in capsys.readouterr().err
+    assert platform.databases == {}
