@@ -12,16 +12,18 @@ import pytest
 
 from agent.delegation_context import delegated_child_context
 from cron.execution_identity import enter_cron_execution, exit_cron_execution
-from cron.jobs import create_job, use_cron_store
+from cron.jobs import create_job, get_job, use_cron_store
 from cron.scheduler_delivery import bot_chat_message
+from gateway.session_context import reset_session_vars, set_session_vars
 from tools.delegate_tool_routes import delegated_profile_scope
 
 from hermes_infino import backend, config, privacy, tables
 from hermes_infino.local import PERSONAL_DB_DIR, LocalStore
-from hermes_infino.provider import OTHERS_MARK
+from hermes_infino.provider import NO_PERSONAL_IN_GROUP, OTHERS_MARK
 
-from .helpers import (DM, PERSONAL_DB, SKILL_MD, TEAM_DB, end_session, hook_ctx, in_session, local, make_manager,
-                      personal_rows, wait_for, webhook_delivery, write_tools_setting)
+from .helpers import (DM, PERSONAL_DB, SKILL_MD, TEAM_DB, agent_tool_call, end_session, hermes_dispatch, hook_ctx,
+                      in_session, local, local_rows, make_manager, personal_rows, wait_for, webhook_delivery,
+                      write_tools_setting)
 
 # A person's email digest (personal) and the team's weekly report (not).
 DIGEST = {"id": "a1b2c3", "name": "email-digest"}
@@ -48,6 +50,12 @@ CHANNEL = {"platform": "slack", "chat_id": "C1", "user_id": "U7"}
 SLACK_DM = {"platform": "slack", "chat_id": "D1", "user_id": "U7"}
 # The owner's personal memory, saved at the terminal.
 PRIVATE_PLAN = "Dana is interviewing at Acme"
+# Hermes's cron tool, as its dispatch names it, and a job the agent is asked to make with it.
+CRON_TOOL = "cronjob_manage"
+APPOINTMENTS = {"action": "create", "prompt": "Summarize Dana's appointments.", "schedule": HOURLY,
+                "name": "appointments"}
+# The author Hermes names for a turn another agent wrote into the owner's Bot Chat, as on_turn_start is handed it.
+PEER_AGENT = {"author_id": "bot:spark/researcher", "author_name": "researcher", "author_is_bot": True}
 
 
 def personal(tmp_path) -> LocalStore:
@@ -454,6 +462,59 @@ def test_a_run_whose_job_cannot_be_read_keeps_out_the_owners_personal_memory(hom
         assert "Acme" not in p.prefetch("Acme deal")
 
 
+@contextmanager
+def bound_as(surface: str):
+    """The session values Hermes binds for a turn on `surface`: an API server
+    turn (Open WebUI, a hosted room's dispatch) can deliver nothing back
+    later; the Desktop binds no gateway session."""
+    if surface == "api_server":
+        set_session_vars(platform=surface, chat_id="desk-1", session_key="desk-1", user_id="u-17",
+                         async_delivery=False)
+    try:
+        yield
+    finally:
+        reset_session_vars()  # as a fresh task starts: nothing bound
+
+
+def a_job_made_with_the_cron_tool(tmp_path, surface: str, turn_author: dict) -> dict:
+    """A job the agent makes with Hermes's own cron tool, through Hermes's own
+    dispatch, in a turn of a session on `surface` (hermes_dispatch first)."""
+    with bound_as(surface):
+        m, _ = make_manager(tmp_path, platform=surface, agent_identity="bot", session_id="maker")
+        m.on_turn_start(1, "Every hour, summarize Dana's appointments.", **turn_author)
+        made = agent_tool_call("maker", CRON_TOOL, APPOINTMENTS, platform=surface)
+    assert made["success"]
+    return get_job(made["job_id"])
+
+
+@pytest.mark.parametrize("surface, turn_author", [
+    ("api_server", {}),        # an API server session: Open WebUI, or a hosted room's turn
+    ("desktop", PEER_AGENT),   # another agent's turn in the owner's Bot Chat
+])
+def test_a_job_made_where_the_owner_is_not_the_one_talking_keeps_out_their_personal_memory(
+        home, tmp_path, monkeypatch, surface, turn_author):
+    home.setenv("HERMES_GATEWAY_SESSION", "1")  # where Hermes offers its cron tool
+    remembered_at_the_terminal(tmp_path)
+    hermes_dispatch(monkeypatch)
+    job = a_job_made_with_the_cron_tool(tmp_path, surface, turn_author)
+    assert not job.get("origin")  # Hermes keeps no origin: nothing in the job says where it was made
+    m, p = a_run_of(tmp_path, job)
+    with running(job):
+        assert "Acme" not in p.prefetch("Acme deal")
+        assert call(m, "infino_remember", content="Dana sees Dr. Lee on Tuesday", scope="personal")["ok"] is False
+    assert [r["content"] for r in personal_rows(tmp_path)] == [PRIVATE_PLAN]
+
+
+def test_a_job_the_owner_makes_with_the_cron_tool_at_the_terminal_is_theirs(home, tmp_path, monkeypatch):
+    home.setenv("HERMES_INTERACTIVE", "1")  # where Hermes offers its cron tool
+    remembered_at_the_terminal(tmp_path)
+    hermes_dispatch(monkeypatch)
+    job = a_job_made_with_the_cron_tool(tmp_path, "cli", {})
+    _, p = a_run_of(tmp_path, job)
+    with running(job):
+        assert "Acme" in p.prefetch("Acme deal")
+
+
 def test_a_run_of_a_job_made_in_a_channel_does_not_publish_a_skill(home, tmp_path):
     skill = tmp_path / "skills" / "release-checklist" / "SKILL.md"
     skill.parent.mkdir(parents=True)
@@ -672,6 +733,8 @@ def test_any_other_route_keeps_out_the_owners_personal_memory(home, tmp_path, pe
         a_webhook_turn_starts(m, OWN_ROUTE)
         assert "Acme" not in p.prefetch("Acme deal")
         assert call(m, "infino_personal_search", query="Acme")["ok"] is False
-        # Kept as the route's note, as in any group chat: never as personal memory.
-        call(m, "infino_remember", content="Bob is job hunting", scope="personal")
+        # Refused: a route's content is a stranger's, and no members share it to keep it for.
+        assert call(m, "infino_remember", content="Bob is job hunting", scope="personal") == {
+            "ok": False, "error": NO_PERSONAL_IN_GROUP}
     assert [r["content"] for r in personal_rows(tmp_path)] == [PRIVATE_PLAN]
+    assert not [r for r in local_rows(tmp_path, tables.MEMORY) if "Bob" in r["content"]]

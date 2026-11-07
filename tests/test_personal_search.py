@@ -4,6 +4,7 @@ turn is the owner's, and a session that searches it kept personal."""
 from __future__ import annotations
 
 import json
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -491,6 +492,27 @@ def test_a_desktop_branch_of_a_session_that_searched_is_personal(home, tmp_path,
     b._drain()
     assert len(team_rows_of(tmp_path, "b")) == (0 if branched else 2)
     assert len(personal_rows_of(tmp_path, "b")) == (2 if branched else 0)
+
+
+def a_busy_store(self, session_id):
+    """Hermes's session store when another process holds it."""
+    raise sqlite3.OperationalError("database is locked")
+
+
+def test_a_desktop_session_whose_row_cannot_be_read_is_personal(home, tmp_path, monkeypatch):
+    # Its row may say it is a branch of a session that searched: what it says is never taken for the team's.
+    _, p = make_manager(tmp_path, platform="desktop", session_id="p")
+    search(p, query="Dr. Lee")
+    stored_sessions(tmp_path, {"session_id": "p", "source": "desktop"},
+                    {"session_id": "b", "source": "desktop", "parent_session_id": "p",
+                     "model_config": {"_branched_from": "p"}})
+    db = acquire(tmp_path / SESSIONS_DB)
+    monkeypatch.setattr(type(db), "get_session", a_busy_store)
+    release_or_close(db)
+    _, b = make_manager(tmp_path, platform="desktop", session_id="b")
+    b.sync_turn("and the bank?", "Nothing from the bank.", session_id="b")
+    b._drain()
+    assert team_rows_of(tmp_path, "b") == [] and len(personal_rows_of(tmp_path, "b")) == 2
 
 
 @pytest.mark.parametrize("switch", [{"reset": False, "reason": "resume"}, {"reset": True, "reason": "new_session"}])

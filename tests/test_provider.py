@@ -18,8 +18,8 @@ from hermes_infino import backend, config, embed, mirror, privacy, provider as p
 from hermes_infino.local import VECTORS
 from hermes_infino.provider import PERSONAL_SEARCH_TOOL, InfinoMemoryProvider
 
-from .helpers import (DM, GROUP, SKILL_MD, TEAM_DB, end_session, fake_embed, hook_ctx, in_session, local, local_rows,
-                      make_manager, personal_rows, wait_for, webhook_delivery)
+from .helpers import (DM, GROUP, SKILL_MD, TEAM_DB, agent_tool_call, end_session, fake_embed, hermes_dispatch, hook_ctx,
+                      in_session, local, local_rows, make_manager, personal_rows, wait_for, webhook_delivery)
 
 # What a provider declares before it starts, which is what Hermes routes by:
 # every tool, the personal search included (it is shown only where offered).
@@ -140,6 +140,30 @@ def test_a_removed_builtin_memory_is_forgotten(mgr, tmp_path):
     p.on_memory_write("remove", "memory", "", None)  # nothing named: nothing to do
     p._drain()
     assert local_rows(tmp_path, tables.MEMORY) == []
+
+
+def test_a_chat_of_no_known_type_writes_none_of_the_owners_personal_memory_to_the_team(home, tmp_path, monkeypatch):
+    # A profile that is one person's, behind a relay: the owner's own DM may come with no chat type.
+    home.setenv("INFINO_PERSONAL_PROFILE", "on")
+    hermes_dispatch(monkeypatch)
+    in_session(monkeypatch, {**DM, "HERMES_SESSION_CHAT_TYPE": ""})
+    m, p = make_manager(tmp_path, platform="telegram", session_id="relay-1")
+    m.on_turn_start(1, "Remember my PIN, it's personal.")
+    assert call(m, "infino_remember", content="Dana's PIN is 4321", scope="personal") == {
+        "ok": False, "error": provider_mod.NO_PERSONAL_IN_GROUP}
+    # Hermes's own memory tool, as the agent calls it: it tells the provider.
+    added = agent_tool_call("relay-1", "memory", {"action": "add", "target": "user", "content": "PIN is 4321"}, m,
+                            platform="telegram")
+    assert added["success"]
+    p._drain()
+    assert not [r for r in local_rows(tmp_path, tables.MEMORY) + personal_rows(tmp_path) if "4321" in r["content"]]
+    # The profile is not marked as one others talked to for good, and the
+    # owner's next session still does not take the entry for theirs.
+    assert not (config.state_dir(tmp_path) / provider_mod.OTHERS_MARK).exists()
+    in_session(monkeypatch, {})
+    _, at_the_terminal = make_manager(tmp_path, session_id="cli")
+    at_the_terminal._drain()
+    assert not [r for r in personal_rows(tmp_path) if "4321" in r["content"]]
 
 
 def test_a_users_entry_without_a_name_is_kept_as_written(mgr, tmp_path):

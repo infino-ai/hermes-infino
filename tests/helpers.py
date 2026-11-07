@@ -4,21 +4,29 @@ drive the provider and read the local databases."""
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
+import threading
 import time
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterator
+from typing import Iterator, Optional
 
 import hermes_cli
 
+from agent.agent_runtime_helpers import invoke_tool
+from agent.background_review import build_memory_write_metadata
 from agent.memory_manager import MemoryManager
 from gateway.config import PlatformConfig
 from gateway.platforms.webhook import WebhookAdapter
 from gateway.session_context import reset_session_vars, set_session_vars
+from hermes_cli import plugins as hermes_plugins
 from hermes_cli.plugins import PluginManager
+from tools.memory_tool_store import MemoryStore
+from tools.thread_context import propagate_context_to_thread
 
 from hermes_infino import chats, config, embed, traces
 from hermes_infino.local import PERSONAL_DB_DIR, LocalStore
@@ -32,6 +40,9 @@ REMOTE_CONFIG_STUB = Path(hermes_cli.__file__).resolve().parent.parent / "tests"
 WRITE_WAIT_S = 5.0
 # How long a scheduled sync waits in these tests (the settle window is off).
 TEST_SYNC_DELAY_S = 0.05
+# The task and call ids of a tool call these tests make through Hermes's dispatch.
+TOOL_TASK = "task-1"
+TOOL_CALL = "call-1"
 
 # A gateway turn's session values: a group chat, another group, and a one-to-one chat.
 GROUP = {"HERMES_SESSION_PLATFORM": "telegram", "HERMES_SESSION_CHAT_ID": "-100", "HERMES_SESSION_CHAT_TYPE": "group",
@@ -93,10 +104,9 @@ def wait_for(predicate, timeout: float = WRITE_WAIT_S):
     return predicate()
 
 
-def hook_ctx():
-    """The plugin's trace hooks, each called the way Hermes calls a plugin's
-    hooks: through Hermes's own plugin manager, which runs most of them on a
-    thread of their own with a copy of the caller's context."""
+def plugin_manager() -> PluginManager:
+    """Hermes's own plugin manager, with the plugin's trace hooks registered
+    as Hermes registers them."""
     manager = PluginManager()
 
     class Ctx:
@@ -104,11 +114,55 @@ def hook_ctx():
             manager._hooks.setdefault(name, []).append(fn)
 
     traces.register_hooks(Ctx())
+    return manager
+
+
+def hook_ctx():
+    """The plugin's trace hooks, each called the way Hermes calls a plugin's
+    hooks: through Hermes's own plugin manager, which runs most of them on a
+    thread of their own with a copy of the caller's context."""
+    manager = plugin_manager()
 
     def caller(name):
         return lambda **kw: manager.invoke_hook(name, **kw)
 
     return {name: caller(name) for name in manager._hooks}
+
+
+def hermes_dispatch(monkeypatch) -> None:
+    """Hermes's own tool dispatch reaching the plugin's hooks: the profile's
+    plugin manager is one with the plugin loaded (and nothing else to load),
+    so a tool call runs its pre_tool_call hooks, the tool, then its
+    post_tool_call hooks, as in a running Hermes."""
+    manager = plugin_manager()
+    manager._discovered = True
+    monkeypatch.setattr(hermes_plugins, "_plugin_managers_by_home", {})
+    monkeypatch.setattr(hermes_plugins, "_plugin_manager", manager)
+
+
+def agent_tool_call(session_id: str, name: str, args: dict, manager: Optional[MemoryManager] = None,
+                    platform: str = "cli") -> dict:
+    """A tool call an agent of `session_id` makes, through Hermes's own
+    dispatch (`invoke_tool`: the plugins' pre_tool_call hooks, the tool, their
+    post_tool_call hooks; hermes_dispatch first), on a thread of its own
+    carrying this one's context. Without `manager`, as Hermes's background
+    review calls its memory tool: the review's fork shares the id of the
+    session whose turn it follows, and has no memory manager. With it, as the
+    agent itself does, which tells the session's memory providers of a write."""
+    store = MemoryStore()
+    store.load_from_disk()
+    agent = SimpleNamespace(session_id=session_id, _parent_session_id="", platform=platform, _memory_store=store,
+                            _memory_manager=manager, valid_tool_names=set())
+    agent._build_memory_write_metadata = partial(build_memory_write_metadata, agent)
+    answer = {}
+
+    def call():
+        answer["result"] = invoke_tool(agent, name, args, TOOL_TASK, tool_call_id=TOOL_CALL)
+
+    worker = threading.Thread(target=propagate_context_to_thread(call))
+    worker.start()
+    worker.join()
+    return json.loads(answer["result"])
 
 
 def local(tmp_path) -> LocalStore:

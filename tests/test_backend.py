@@ -236,6 +236,18 @@ def test_a_look_at_the_personal_tables_that_failed_keeps_the_turn_personal(local
     assert local_backend.transcript_personal("kept") is True  # read this time
 
 
+def test_a_look_that_failed_is_asked_again_by_the_backend_a_change_of_settings_makes(local_backend, home, tmp_path,
+                                                                                       monkeypatch):
+    local_backend.append(tables.CONVERSATIONS, [{"session_id": "kept", "seq": 0, "role": "user", "content": "mine"}],
+                         personal=True)
+    fail_the_first_look(local_backend.personal, monkeypatch)
+    assert local_backend.transcript_personal("kept") is True  # could not tell: the safe side
+    home.setenv("INFINO_PERSONAL_JOBS", "weekly-finances")  # the settings change: another backend takes over
+    replacement = backend.for_settings(config.load(tmp_path))
+    assert replacement is not local_backend
+    assert replacement.transcript_personal("kept") is True  # it asks, and finds the session's turns personal
+
+
 def test_a_session_whose_look_failed_is_asked_again_and_is_the_teams(local_backend, monkeypatch):
     fail_the_first_look(local_backend.personal, monkeypatch)
     assert local_backend.transcript_personal("team-chat") is True  # could not tell this time

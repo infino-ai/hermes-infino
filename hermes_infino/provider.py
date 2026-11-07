@@ -9,9 +9,9 @@ person's, in a personal profile) once signed in (`backend.py`):
   `infino_remember` tool append to `memory` - the files' entries whoever
   wrote them, Hermes's background review included (builtin.py), an entry
   found by comparing the files credited to the owner, kept for the group chat
-  it may have come from, and taken as the owner's personal memory only where
-  no one else's turn has run (_mirror_builtin); `infino_forget` deletes,
-  every machine's copy;
+  whose turn wrote it, and taken as the owner's personal memory only where
+  no one else's turn has run or wrote it (_mirror_builtin); `infino_forget`
+  deletes, every machine's copy;
 - conversations: the messages of each completed turn, tool calls and
   results included, to `conversations` - the person's own, not the team's,
   for a personal session (privacy.py);
@@ -66,7 +66,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sys
 import threading
 import time
@@ -77,6 +76,7 @@ from typing import Any, Optional
 from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_thread
 
 from . import backend, builtin, chats, config, instructions, privacy, recall, skills, tables
+from .chats import CHATS_JOIN
 from .traces import note_identity, scrub, turn_id_for, write_buffered
 
 try:  # Hermes's session store, shared within a process.
@@ -116,10 +116,11 @@ RESUME_REASON = "resume"
 # The run Hermes starts a provider in: a person's own session. The others are
 # "subagent", "cron" and "flush".
 PRIMARY_CONTEXT = "primary"
+SUBAGENT_CONTEXT = "subagent"
 # The runs the memory tools write from. The agent calls a tool on purpose, so a
 # subagent or a scheduled job saving what it found writes like a session does.
 # A flush run is Hermes saving its own memory before compaction: not here.
-TOOL_WRITE_CONTEXTS = (PRIMARY_CONTEXT, "subagent", "cron")
+TOOL_WRITE_CONTEXTS = (PRIMARY_CONTEXT, SUBAGENT_CONTEXT, "cron")
 # The tool that searches the person's own database.
 PERSONAL_SEARCH_TOOL = privacy.PERSONAL_READ_TOOLS[0]
 # Rows a personal search returns when the call names no number, and the most it may ask for.
@@ -139,27 +140,15 @@ GATEWAY_MARK = "served_a_gateway"
 # profile (a group chat's, or one several parties share: _multi_party), or
 # wrote its USER.md: Hermes's background review, which follows a turn and
 # writes the memory files without telling any provider, may then have written
-# USER.md entries about anyone in it, and nothing tells them from the owner's.
-# It names why, one reason a line, as GATEWAY_MARK does.
+# USER.md entries about anyone in it. It names why, one reason a line, as
+# GATEWAY_MARK does. A chat of no known type, which may be the owner's own,
+# marks nothing: the entries written in it are noted as not the owner's
+# instead (builtin.py).
 OTHERS_MARK = "served_others"
 # The reasons OTHERS_MARK gives, besides a platform several parties share.
 GROUP_CHAT = "group-chat"
 BY_AGENT = "another-agent"
 USER_FILE = "user-file"
-# Beside the plugin's databases: the group chats whose turns ran lately, each
-# with when its latest one ran (JSON: chat key -> milliseconds), and the lock
-# its writers take. Hermes's background review follows a turn and writes
-# MEMORY.md without telling any provider: the file comparison reads this to
-# keep what it finds to the chat it may have come from (_review_chat).
-REVIEW_CHATS = "review_chats.json"
-REVIEW_CHATS_LOCK = "review_chats.lock"
-# How long after a group chat's turn its background review may still write:
-# the review makes at most 16 model calls (agent/background_review.py), and
-# Hermes cancels it when the chat's next turn starts.
-REVIEW_WINDOW_MS = 30 * 60 * 1000
-# Joins the keys of the group chats a file entry may have come from, when there
-# are several: no chat's recall shows it (a chat's key is "<platform>:<chat>").
-CHATS_JOIN = "|"
 # How Hermes names this machine's own user when a Desktop, TUI or editor
 # session reaches it (gateway/owner_identity.py): "uid:<n>", or "sid:<sid>" on
 # Windows. It names no one a teammate would know.
@@ -278,16 +267,6 @@ def _someone(name: Any) -> str:
     return "" if s.startswith(MACHINE_USER_PREFIXES) else s
 
 
-def _review_chats(state: Path, now_ms: int) -> dict[str, int]:
-    """The group chats whose turns ran within REVIEW_WINDOW_MS of `now_ms`
-    (REVIEW_CHATS); raises when the note is there but cannot be read."""
-    path = state / REVIEW_CHATS
-    if not path.exists():
-        return {}
-    noted = json.loads(path.read_text())
-    return {str(key): int(at) for key, at in noted.items() if now_ms - int(at) < REVIEW_WINDOW_MS}
-
-
 def dependencies_missing() -> list[str]:
     """The local database's libraries this Python cannot import."""
     missing = []
@@ -381,11 +360,15 @@ class InfinoMemoryProvider(MemoryProvider):
         # as Hermes asks of providers; the memory tools follow TOOL_WRITE_CONTEXTS.
         self._agent_context = str(kwargs.get("agent_context") or PRIMARY_CONTEXT)
         self._writes_enabled = self._agent_context == PRIMARY_CONTEXT
+        self._note_writer(self._chat())
         spawn_context_thread(self._ensure_tables, name="infino-ensure-tables").start()
         # The Desktop and the TUI branch a session into a new agent, whose
         # provider starts here: what it carries on is as personal as its parent.
+        # A row that cannot be read may say so: the session is personal.
         parent = self._branched_from(session_id) if self._writes_enabled and local else ""
-        if parent:
+        if parent is None:
+            privacy.note_personal(session_id)
+        elif parent:
             self._carry_on(parent, session_id)
         # What Hermes's background review wrote since this profile last ran.
         self._run_write(self._mirror_builtin, self._chat())
@@ -402,22 +385,23 @@ class InfinoMemoryProvider(MemoryProvider):
             logger.info("infino: could not read this machine's user as Hermes names it: %s", e)
             return ""
 
-    def _branched_from(self, session_id: str) -> str:
+    def _branched_from(self, session_id: str) -> Optional[str]:
         """The session Hermes's row for this one says it was branched from; ""
-        for none, or when there is no row to read."""
+        for none, or when there is no store to read; None when the store is
+        there but this session's row cannot be read, which may say it was."""
         path = (self._home or config.home()) / SESSIONS_DB
         if _acquire_sessions is None or _release_sessions is None or not path.exists():
             return ""
         try:
             db = _acquire_sessions(path)
-        except Exception as e:  # no store to read: nothing says it was branched
-            logger.info("infino: could not open Hermes's session store: %s", e)
-            return ""
+        except Exception as e:
+            logger.info("infino: could not open Hermes's session store (session %s kept personal): %s", session_id, e)
+            return None
         try:
             row = db.get_session(session_id) or {}
         except Exception as e:
-            logger.info("infino: could not read session %s's row: %s", session_id, e)
-            row = {}
+            logger.info("infino: could not read session %s's row (kept personal): %s", session_id, e)
+            return None
         finally:
             with suppress(Exception):  # a store that will not let go never fails a start
                 _release_sessions(db)
@@ -425,8 +409,9 @@ class InfinoMemoryProvider(MemoryProvider):
         if isinstance(settings, str):
             try:
                 settings = json.loads(settings)
-            except ValueError:
-                settings = None
+            except ValueError as e:
+                logger.info("infino: could not read session %s's settings (kept personal): %s", session_id, e)
+                return None
         return str(settings.get(BRANCHED_FROM) or "") if isinstance(settings, dict) else ""
 
     def _mark_gateway(self) -> None:
@@ -529,9 +514,11 @@ class InfinoMemoryProvider(MemoryProvider):
         answers it there (Hermes delivers its output back): None outside a cron
         run and for a job made at the owner's own surfaces (it has no gateway
         origin); ORIGIN_DM for a gateway's one-to-one chat; ORIGIN_GROUP for any
-        other chat, and for a job that cannot be read. Hermes keeps no chat type
-        with a job made in a chat (tools/cronjob_job_args.py), so only a chat
-        Hermes itself reads as one-to-one counts as one."""
+        other chat, for a job made in a turn that was not the owner's own
+        though Hermes kept no origin for it, and for a job that cannot be read.
+        Hermes keeps no chat type with a job made in a chat
+        (tools/cronjob_job_args.py), so only a chat Hermes itself reads as
+        one-to-one counts as one."""
         if self._platform != CRON_PLATFORM:
             return None
         if self._session_id not in self._job_origins:
@@ -561,7 +548,15 @@ class InfinoMemoryProvider(MemoryProvider):
             return ORIGIN_GROUP
         origin = record.get("origin")
         if not origin:
-            return None
+            # Hermes keeps none for a job made at the owner's own surfaces, nor
+            # for one made where nothing can be delivered back (an API server
+            # session, a gateway's /background run, a Kanban worker): the cron
+            # tool's hook noted those made in a turn not the owner's own
+            # (traces.py). A job no hook noted - made before this version
+            # noted any, or with `hermes cron` at the terminal - is the
+            # owner's, as the jobs the owner makes at their own surfaces are.
+            state = config.state_dir(self._settings.home if self._settings else None)
+            return ORIGIN_GROUP if privacy.others_job(state, job_id) else None
         if not isinstance(origin, dict):
             return ORIGIN_GROUP
         if str(origin.get("platform") or "").lower() in chats.OWNER_PLATFORMS:
@@ -646,57 +641,63 @@ class InfinoMemoryProvider(MemoryProvider):
             config.state_dir(self._settings.home if self._settings else None) / OTHERS_MARK).exists()
 
     def _note_turn(self, chat: chats.Chat, by_agent: bool) -> None:
-        """Note a turn that is not the owner's before Hermes's background review
-        can follow it (Hermes spawns the review once the turn's sync is under
-        way): a group chat's, for the chat a MEMORY.md entry may come from
-        (_note_review_chat), and any such turn, for USER.md (OTHERS_MARK). The
-        review follows a person's own session only, so other runs note none."""
+        """Note a turn before Hermes's background review can follow it (Hermes
+        spawns the review once the turn's sync is under way): whose its writes
+        are (_note_writer), and, for a turn that is not the owner's, that
+        USER.md may now hold entries about others (OTHERS_MARK). A chat of no
+        known type marks nothing: it may be the owner's own, and the entries
+        written in it are noted as not the owner's instead. The review follows a
+        person's own session only, so other runs mark nothing."""
+        self._note_writer(chat)
         if not self._settings or not self._writes_enabled:
             return
-        if chat.group:
-            self._note_review_chat(chat.key)
+        if chat.group and not chat.untyped:
             self._mark(OTHERS_MARK, GROUP_CHAT)
         if by_agent:
             self._mark(OTHERS_MARK, BY_AGENT)
         if self._platform in chats.MULTI_PARTY_PLATFORMS:
             self._mark(OTHERS_MARK, self._platform)
 
-    def _note_review_chat(self, key: str) -> None:
-        """Note that a group chat's turn ran just now (REVIEW_CHATS), dropping
-        what is past REVIEW_WINDOW_MS. A note that cannot be read is begun again."""
-        assert self._settings is not None
-        state = config.state_dir(self._settings.home)
-        now = _now_ms()
-        try:
-            config.make_private_dir(state)
-            with builtin.lock(state, REVIEW_CHATS_LOCK):
-                try:
-                    noted = _review_chats(state, now)
-                except (OSError, ValueError, AttributeError, TypeError) as e:
-                    logger.info("infino: could not read which group chats ran lately; beginning again: %s", e)
-                    noted = {}
-                noted[key] = now
-                fresh = state / (REVIEW_CHATS + ".tmp")
-                fresh.write_text(json.dumps(noted))
-                os.replace(fresh, state / REVIEW_CHATS)
-        except OSError as e:
-            logger.warning("infino: could not note group chat %s's turn: %s", key, e)
+    def _note_writer(self, chat: chats.Chat) -> None:
+        """Note whose the running turn's writes are (privacy.Writer), for the
+        writes that follow from it with no provider told: the memory files
+        Hermes's background review saves to under this session's id, and the
+        jobs Hermes's cron tool makes (traces.py). A MEMORY.md entry is the
+        group chat's the turn is in; a USER.md entry may be the owner's where
+        the turn may write the owner's personal memory outside any group chat;
+        a job is the owner's only from the owner's own turn. A subagent's are
+        the session's that started it (privacy.writer_of)."""
+        if not self._settings or self._agent_context == SUBAGENT_CONTEXT:
+            return
+        privacy.note_writer(self._session_id, privacy.Writer(
+            chat=chat.key if chat.group else "",
+            owners_entries=not chat.group and self._keeps_personal(chat),
+            owners_jobs=self._owners_own() and not self._multi_party()))
 
-    def _review_chat(self, chat: chats.Chat) -> chats.Chat:
-        """The chat a MEMORY.md entry found by the file comparison is kept for.
-        Nothing says which conversation Hermes's background review learned it
-        from: any group chat whose turn ran within REVIEW_WINDOW_MS
-        (REVIEW_CHATS), the running turn's included. With one, the entry is that
-        chat's, recalled there alone; with several, it is kept for all of them
-        together, which no chat's recall shows; with none, it is the team's in
-        no chat, as the owner's own work knowledge is."""
-        assert self._settings is not None
-        keys = set(_review_chats(config.state_dir(self._settings.home), _now_ms()))
-        if chat.group:
-            keys.add(chat.key)
+    @staticmethod
+    def _kept_for(written_in: Optional[frozenset[str]]) -> chats.Chat:
+        """The chat a MEMORY.md entry found by the file comparison is kept for,
+        from the group chats of the turns that wrote it (builtin.writers): that
+        chat, recalled there alone; several together, which no chat's recall
+        shows, as none shows chats.UNATTRIBUTED (a writer no one can tell); no
+        chat when no group chat's turn wrote it, as the owner's own work
+        knowledge is."""
+        keys = sorted(k for k in written_in or () if k)
         if not keys:
             return chats.NO_CHAT
-        return chats.Chat(key=CHATS_JOIN.join(sorted(keys)), group=True, owner_writes=False)
+        return chats.Chat(key=CHATS_JOIN.join(keys), group=True, owner_writes=False)
+
+    def _written_in(self, home: Path) -> Optional[dict[str, dict[str, list[str]]]]:
+        """The noted writers of the memory files' entries (builtin.writers);
+        None when the note cannot be read, which says nothing of who wrote
+        any entry."""
+        assert self._settings is not None
+        try:
+            return builtin.writers(config.state_dir(self._settings.home), home)
+        except OSError as e:
+            logger.warning("infino: could not read who wrote the memory files' entries (the entries found now are "
+                           "added next time): %s", e)
+            return None
 
     def system_prompt_block(self) -> str:
         if not self._settings:
@@ -798,13 +799,17 @@ class InfinoMemoryProvider(MemoryProvider):
         A group member's note is the chat's and the team's, credited to
         whoever said it: Hermes's channel memory keeps these out of the
         owner's files, and this keeps them out of the owner's personal memory
-        too. Otherwise USER.md
-        is about this person: personal (kept on this machine when there is no
-        personal database), and not kept at all where the turn may not write
-        the owner's personal memory (`_keeps_personal`); MEMORY.md is what the
-        agent learns about the work: the team's."""
+        too. A USER.md entry in a chat of no known type, which may be the
+        owner's own one-to-one chat, is kept nowhere: never the team's as a
+        member's. Otherwise USER.md is about this person: personal (kept on
+        this machine when there is no personal database), and not kept at all
+        where the turn may not write the owner's personal memory
+        (`_keeps_personal`); MEMORY.md is what the agent learns about the
+        work: the team's."""
         content = content.strip()
         if chat.group and not chat.owner_writes:
+            if target == "user" and chat.untyped:
+                return None
             sender = self._sender()
             about = ABOUT_PERSON.format(author=sender) if target == "user" and sender else ""
             return self._memory_row(about + content, TEAM, f"builtin:{target}", chat, sender)
@@ -840,20 +845,22 @@ class InfinoMemoryProvider(MemoryProvider):
             row = self._builtin_row(target, content, chat)
             if row is not None:
                 self._run_write(self._add_builtin, row)
-            if target == "user" and (row is None or row["scope"] != PERSONAL):
+            if target == "user" and (row is None or row["scope"] != PERSONAL) and not chat.untyped:
                 # USER.md now holds an entry that is not the owner's: the file
-                # comparison must never take one of its entries for theirs.
+                # comparison must never take one of its entries for theirs. In a
+                # chat of no known type, which may be the owner's own, the entry
+                # alone is noted as not theirs (traces.py), not the whole file.
                 self._mark(OTHERS_MARK, USER_FILE)
 
     def _mirrored_row(self, target: str, entry: str, chat: chats.Chat) -> dict:
         """The `memory` row of an entry found by comparing a built-in memory
-        file with the table. Nothing says who wrote it: Hermes's background
+        file with the table. Nothing names who said it: Hermes's background
         review may have written it after a conversation, and a person may edit
         the file by hand. So it is credited to the profile's owner, never the
         running turn's sender. A USER.md entry is the owner's personal memory
-        (taken only where the file is the owner's alone: _mirror_builtin); a
-        MEMORY.md entry is the team's, kept for `chat`, the chat it may have
-        come from (_review_chat)."""
+        (taken only where the file is the owner's alone and no other turn wrote
+        it: _mirror_builtin); a MEMORY.md entry is the team's, kept for `chat`,
+        the group chat whose turn wrote it (_kept_for)."""
         owner = self._owner()
         if target == "user":
             about = ABOUT_PERSON.format(author=owner) if owner else ""
@@ -867,29 +874,48 @@ class InfinoMemoryProvider(MemoryProvider):
         in the cloud. `chat` and `by_agent` are the running turn's.
 
         Hermes's background review follows a turn and writes the files with no
-        provider to tell, so what the comparison finds may come from any recent
-        conversation. A MEMORY.md entry is kept for the group chat it may have
-        come from, if any (_review_chat), so no other chat recalls a group's
-        notes. A USER.md entry is the owner's personal memory only where the
-        file is the owner's alone (_user_file_is_owners), and never while a
-        turn that is not the owner's runs: once a shared gateway, a group chat,
-        several parties or another agent have had a turn on the profile, its
-        USER.md may be about any of them, and none of it is taken."""
+        provider to tell; the tool hooks note who wrote each entry of a turn
+        that was not the owner's own, before it is written (builtin.py). A
+        MEMORY.md entry is kept for the group chat whose turn wrote it, if any
+        (_kept_for), so no other chat recalls a group's notes. A USER.md entry
+        is the owner's personal memory only where no such turn wrote it, the
+        file is the owner's alone (_user_file_is_owners), and no turn that is
+        not the owner's runs: once a shared gateway, a group chat, several
+        parties or another agent have had a turn on the profile, its USER.md
+        may be about any of them, and none of it is taken. An entry no note
+        names is the owner's (a hand edit, the owner's own session). While the
+        note cannot be read (another process holding it too long, a disk
+        error), no entry is added - the next comparison adds them - and rows
+        whose entry left its file are still deleted; a note that is damaged is
+        begun again (builtin.writers)."""
         assert self._backend is not None and self._settings is not None
         home = self._home or config.home()
         owners_turn = not chat.group and not by_agent and self._platform not in chats.MULTI_PARTY_PLATFORMS
         with builtin.lock(config.state_dir(self._settings.home)):
+            written = self._written_in(home)
             for target in builtin.FILES:
                 if target == "user" and not (owners_turn and self._user_file_is_owners()):
                     continue
-                entries = builtin.read_entries(home, target)
-                if entries is None:  # missing or unreadable: says nothing
+                raw = builtin.read_entries(home, target)
+                if raw is None:  # missing or unreadable: says nothing
                     continue
-                entries = list(dict.fromkeys(_clip(scrub(e)) for e in entries))
-                missing, stale = builtin.compare(entries, self._backend.builtin_rows(target))
-                found_in = self._review_chat(chat) if missing and target == "memory" else chats.NO_CHAT
+                # Each entry as the table keeps it, with the group chats of the
+                # turns not the owner's own that wrote it (None: no such turn).
+                entries: dict[str, Optional[frozenset[str]]] = {}
+                for e in raw:
+                    noted = (written or {}).get(target, {}).get(e)
+                    key = _clip(scrub(e))
+                    if noted is None:
+                        entries.setdefault(key, None)
+                    else:
+                        entries[key] = frozenset(noted) | (entries.get(key) or frozenset())
+                missing, stale = builtin.compare(list(entries), self._backend.builtin_rows(target))
+                if written is None:  # who wrote them cannot be told now: added next time
+                    missing = []
                 for entry in missing:
-                    row = self._mirrored_row(target, entry, found_in)
+                    if target == "user" and entries[entry] is not None:
+                        continue  # written in a turn that was not the owner's own
+                    row = self._mirrored_row(target, entry, self._kept_for(entries[entry]))
                     if not self._backend.has_memory(row):
                         self._append(tables.MEMORY, [row])
                 if stale:
@@ -1077,6 +1103,10 @@ class InfinoMemoryProvider(MemoryProvider):
             self._ready.wait(READY_WAIT_S)
             if tool_name == "infino_remember":
                 content = str(args["content"])
+                if chat.group and asked == PERSONAL and chat.refuses_personal:
+                    # No members share the chat to keep it for: it may be the
+                    # owner's own, or a stranger's content. Never the team's.
+                    return json.dumps({"ok": False, "error": NO_PERSONAL_IN_GROUP})
                 if chat.group:
                     # In a group chat a memory is the chat's, whatever scope was asked for.
                     sender = self._sender()

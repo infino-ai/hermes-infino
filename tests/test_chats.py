@@ -51,7 +51,10 @@ def test_a_chat_of_no_known_type_is_a_group(monkeypatch, chat_type):
     # Hermes's own access check reads a blank type as ambiguous (a relay frame's "" or null, a
     # restored session's stored empty value) and settles it as a group: the safe side here too.
     in_session(monkeypatch, {**DM, "HERMES_SESSION_CHAT_TYPE": chat_type})
-    assert chats.current() == chats.Chat(key="telegram:111", group=True, owner_writes=False)
+    chat = chats.current()
+    assert chat == chats.Chat(key="telegram:111", group=True, owner_writes=False, untyped=True)
+    # It may be the owner's own one-to-one chat: a personal memory asked for there is refused, not the chat's.
+    assert chat.refuses_personal
 
 
 def test_a_dm_is_what_hermes_calls_a_dm():
@@ -63,6 +66,7 @@ def test_without_channel_memory_a_group_writes_nobodys_own_memory(monkeypatch):
     chat = chats.current()
     assert chat == chats.Chat(key="telegram:-100", group=True, owner_writes=False)
     assert chat.visible == ("", "telegram:-100")
+    assert not chat.refuses_personal  # its members' memory is the chat's
 
 
 def test_a_chat_with_no_id_is_no_chat(monkeypatch):
@@ -109,8 +113,9 @@ def test_a_webhook_turn_is_its_routes_chat_whatever_the_delivery():
         second = chats.current()
     with webhook_delivery(OTHER_ROUTE, "delivery-3"):
         other = chats.current()
-    assert first == second == chats.Chat(key=f"webhook:{ROUTE}", group=True, owner_writes=False)
-    assert other == chats.Chat(key=f"webhook:{OTHER_ROUTE}", group=True, owner_writes=False)
+    assert first == second == chats.Chat(key=f"webhook:{ROUTE}", group=True, owner_writes=False, route=True)
+    assert other == chats.Chat(key=f"webhook:{OTHER_ROUTE}", group=True, owner_writes=False, route=True)
+    assert first.refuses_personal  # outside content, from no member
 
 
 def test_a_route_the_owner_calls_their_own_is_no_group_chat():

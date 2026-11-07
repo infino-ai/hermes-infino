@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import config, embed, privacy, recall, tables
+from .chats import CHATS_JOIN
 from .client import InfinoClient
 from .local import PERSONAL_DB_DIR, LocalStore
 from .mirror import PERSONAL_MEMORY, PERSONAL_SOURCE_PREFIX, SETTLE_MS, Mirror, sync_lock
@@ -92,10 +93,6 @@ class Backend:
         # The sync of the latest session end, which may still be waiting on the
         # cloud after that session stopped waiting for it (`flush`).
         self._flushing: Optional[threading.Thread] = None
-        # Sessions whose look at the personal tables could not read them:
-        # looked at again, since privacy.first_look counts a look only once.
-        # Few: a session leaves once a read succeeds.
-        self._look_again: set[str] = set()
 
     @property
     def signed_in(self) -> bool:
@@ -193,16 +190,16 @@ class Backend:
         once per session, counted only when they could be read. A read that
         failed answers personal for that call, since a turn written to the
         team's tables cannot be taken back, and the session's next call asks
-        again (finding that turn, it stays personal: the safe side)."""
+        again (finding that turn, it stays personal: the safe side), through
+        whichever backend serves it then (privacy.first_look)."""
         if privacy.transcript_personal(self.settings, session_id, messages):
             return True
-        if not (privacy.first_look(session_id) or session_id in self._look_again):
+        if not privacy.first_look(session_id):
             return False
         kept = self._kept_personal(session_id)
         if kept is None:
-            self._look_again.add(session_id)
+            privacy.look_again(session_id)
             return True
-        self._look_again.discard(session_id)
         if kept:
             privacy.note_personal(session_id)
         return kept
@@ -230,7 +227,9 @@ class Backend:
                       everywhere: bool = False) -> int:
         """Delete memories with exactly this text, of the chats in `visible`
         ("" is no chat), in `scope` when given: a chat forgets only what it
-        can recall. `people` limits personal memory to the rows of those
+        can recall, and what is kept for several chats together that it is
+        one of (chats.CHATS_JOIN), which no chat's recall shows and any of
+        them may forget. `people` limits personal memory to the rows of those
         authors (none: no personal memory; None: all of it). `about_prefix`
         also matches the text after any "About <name>: " prefix of that shape
         (a group's entries about its members, whoever wrote them).
@@ -247,7 +246,12 @@ class Backend:
         if about_prefix:
             match = (f"({match} OR (content LIKE {tables.sql_string(about_prefix + '%')} "
                      f"AND ends_with(content, {tables.sql_string(': ' + content)})))")
-        predicate = f"{match} AND {tables.chat_predicate(visible)}"
+        # A chat's key is among a joined value's when the value, fenced by the
+        # joiner at both ends, holds the key fenced the same way.
+        joiner = tables.sql_string(CHATS_JOIN)
+        among = [f"strpos(concat({joiner}, {tables.CHAT}, {joiner}), "
+                 f"{tables.sql_string(CHATS_JOIN + key + CHATS_JOIN)}) > 0" for key in visible if key]
+        predicate = f"{match} AND ({' OR '.join([tables.chat_predicate(visible), *among])})"
         if scope:
             predicate += f" AND scope = {tables.sql_string(scope)}"
         team = self.local.delete(tables.MEMORY, predicate) if scope != recall.PERSONAL else []

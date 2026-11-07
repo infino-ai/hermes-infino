@@ -32,6 +32,16 @@ withheld (privacy.py): from its arguments, its result and its error. A model
 call's row keeps the text the model wrote; its tool calls are rows of their
 own.
 
+Two tools' calls are read for whose they are, besides being traced. Hermes's
+memory tool, which its background review also calls (a copy of the agent,
+under the id of the session whose turn it follows), is noted before it writes
+the memory files (`pre_tool_call`): an entry a turn that was not the owner's
+own writes is noted with that turn's group chat (builtin.py), from what the
+provider noted of the session (privacy.writer_of), and a write whose note
+cannot be made is refused. A job Hermes's cron tool makes in such a turn is
+noted too (privacy.note_others_job): Hermes keeps no origin for a job made
+where nothing can be delivered back, and its runs must not be the owner's.
+
 Hermes hands `sync_turn` no turn id, so the conversation rows take theirs
 from the turn's start: `pre_llm_call` fires once as each turn starts, with
 the turn's id and its user message, and never for Hermes's background review
@@ -59,7 +69,7 @@ from typing import Any, Callable, Optional
 
 from agent.memory_provider import ctx_bound, spawn_context_thread
 
-from . import backend, chats, config, privacy, tables
+from . import backend, builtin, chats, config, privacy, tables
 
 try:  # Hermes's scrub for anything leaving the agent.
     from agent.redact import redact_for_egress as _scrub
@@ -90,6 +100,15 @@ TURNS_KEPT = 16
 # How Hermes marks a message's images when it flattens the message for a
 # memory provider: "[1 image] what is this?".
 IMAGES_MARK = re.compile(r"^\[\d+ images?\]\s*")
+# Hermes's built-in memory tool and its cron tool, as its dispatch names them
+# to the tool hooks (an older name of a tool is mapped to its name first), and
+# the cron tool's action that makes a job.
+MEMORY_TOOL = "memory"
+CRON_TOOL = "cronjob_manage"
+CRON_CREATE = "create"
+# What a memory tool call is told when whose its entries are cannot be noted.
+NOT_NOTED = ("not saved: Infino could not note whose this memory is (its note was busy or could not be written); "
+             "nothing was changed, so try again")
 
 
 def scrub(text: str) -> str:
@@ -244,6 +263,37 @@ def _personal(session_id: str) -> bool:
         return True
 
 
+def _note_entries(session_id: str, target: str, entries: list[str]) -> None:
+    """Note whose the entries a call of Hermes's memory tool writes are
+    (builtin.note_writers), in the profile scope this runs in: unless the
+    session's latest turn was the owner's own, whose entries are the owner's
+    with no note. A session nothing here noted is no one's: its entries are
+    kept for no chat's recall, and never taken for the owner's. Raises when
+    the note cannot be written."""
+    writer = privacy.writer_of(session_id)
+    if not entries or (writer is not None and writer.owners_entries):
+        return
+    home = config.home()
+    builtin.note_writers(config.state_dir(home), home, target, entries,
+                         chats.UNATTRIBUTED if writer is None else writer.chat)
+
+
+def _note_job(session_id: str, args: Any, result: Any) -> None:
+    """Note a job Hermes's cron tool made in a turn that was not the owner's
+    own (privacy.note_others_job): Hermes keeps no origin for a job made where
+    nothing can be delivered back (an API server session, a gateway's
+    `/background` run, a Kanban worker, the Desktop's Bot Chat), and the job's
+    runs must keep out the owner's personal memory. A session nothing here
+    noted is not the owner's."""
+    call, answer = privacy.json_value(args), privacy.json_value(result)
+    if not isinstance(call, dict) or str(call.get("action") or "").strip().lower() != CRON_CREATE:
+        return
+    job_id = answer.get("job_id") if isinstance(answer, dict) and answer.get("success") else None
+    writer = privacy.writer_of(session_id)
+    if job_id and not (writer is not None and writer.owners_jobs):
+        privacy.note_others_job(config.state_dir(config.home()), str(job_id))
+
+
 @dataclass
 class _Waiting:
     """A session's rows not written yet."""
@@ -357,9 +407,37 @@ class TraceRecorder:
             "created_ms": int(time.time() * 1000),
         })
 
+    def on_tool_start(self, **kw: Any) -> Optional[dict]:
+        """Before a call of Hermes's memory tool writes a memory file: note
+        whose the entries it writes whole are (_note_entries), so no comparison
+        of the files, in any process, finds one before its note. A write whose
+        note cannot be made is refused, as Hermes refuses any call this hook
+        fails or hangs on (`pre_tool_call` fails closed)."""
+        if kw.get("tool_name") != MEMORY_TOOL:
+            return None
+        try:
+            _note_entries(str(kw.get("session_id") or ""), *builtin.call_entries(privacy.json_value(kw.get("args"))))
+        except Exception as e:
+            logger.warning("infino: a memory write was refused, since whose it is could not be noted: %s", e)
+            return {"action": "block", "message": NOT_NOTED}
+        return None
+
+    def _note_call(self, tool: str, session: str, kw: dict) -> None:
+        """After a call: note whose the entries a memory tool call edited in
+        place are (a patch's, known only now), and a job the cron tool made."""
+        try:
+            if tool == MEMORY_TOOL:
+                target, _ = builtin.call_entries(privacy.json_value(kw.get("args")))
+                _note_entries(session, target, builtin.patched_entries(privacy.json_value(kw.get("result"))))
+            elif tool == CRON_TOOL:
+                _note_job(session, kw.get("args"), kw.get("result"))
+        except Exception as e:
+            logger.warning("infino: could not note whose a %s call's write is: %s", tool, e)
+
     def on_tool(self, **kw: Any) -> None:
         tool = str(kw.get("tool_name") or "")
         session = str(kw.get("session_id") or "")
+        self._note_call(tool, session, kw)
         if session and privacy.read_personal(tool, kw.get("result")):
             # The session the agent runs, as Hermes names it for the call: Hermes may have moved
             # the agent to another session without telling the provider, which notes the one it knows.
@@ -401,6 +479,7 @@ class TraceRecorder:
 def register_hooks(ctx) -> None:
     recorder = TraceRecorder()
     ctx.register_hook("pre_llm_call", recorder.on_llm_call)
+    ctx.register_hook("pre_tool_call", recorder.on_tool_start)
     ctx.register_hook("post_api_request", recorder.on_api)
     ctx.register_hook("post_tool_call", recorder.on_tool)
     ctx.register_hook("subagent_start", recorder.on_subagent)
