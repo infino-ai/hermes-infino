@@ -6,7 +6,7 @@ Without an account, everything stays on your machine, in databases run by Infino
 
 When you [sign in](#signing-in), everything is kept in Infino Cloud too. Work goes to a team database, and everyone who signs in to the same team database shares it, so every agent on the team can search what the others did. Personal memory, and any work you mark as personal, goes to a personal database of your own instead.
 
-## What it stores
+## What it stores in Infino
 
 The plugin keeps four tables.
 
@@ -24,7 +24,7 @@ Teammates read each other's memories, so a memory names people ("Dana prefers…
 
 ## Where your data lives
 
-An Infino database is just files. Each table is a set of Parquet files with keyword and vector indexes built in, and search and SQL read those files directly. On your machine, the Infino engine runs inside Hermes and keeps the files on your disk. In Infino Cloud, your data lives on object storage, either Infino's or a bucket in your own AWS, Google Cloud or Azure account, and you can encrypt your bucket with a key you own (CMEK).
+An Infino database is just files. Each table is a set of Parquet files with keyword and vector indexes built in, and search and SQL read those files directly. On your machine, Infino's open source core engine runs inside Hermes and keeps the files on your disk. In Infino Cloud, your data lives on object storage, either Infino's or a bucket in your own AWS, Google Cloud or Azure account, and you can encrypt your bucket with a key you own (CMEK).
 
 ```mermaid
 flowchart LR
