@@ -32,7 +32,7 @@ from typing import Any, Optional
 from . import config, embed, privacy, recall, tables
 from .client import InfinoClient
 from .local import PERSONAL_DB_DIR, LocalStore
-from .mirror import PERSONAL_MEMORY, PERSONAL_SOURCE_PREFIX, SETTLE_MS, Mirror
+from .mirror import PERSONAL_MEMORY, PERSONAL_SOURCE_PREFIX, SETTLE_MS, Mirror, sync_lock
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,9 @@ class Backend:
         # The backend made for this home's new settings, once this one is
         # retired (`for_settings`): the syncs asked of this one are its.
         self._successor: Optional[Backend] = None
+        # The sync of the latest session end, which may still be waiting on the
+        # cloud after that session stopped waiting for it (`flush`).
+        self._flushing: Optional[threading.Thread] = None
         # Sessions whose look at the personal tables could not read them:
         # looked at again, since privacy.first_look counts a look only once.
         # Few: a session leaves once a read succeeds.
@@ -132,13 +135,37 @@ class Backend:
 
     def _move_personal_memory(self) -> None:
         """Personal memories an older version kept in the team's local
-        database (where the tools read) move to the personal one."""
-        found = self.local.query_sql(f"SELECT * FROM {tables.MEMORY} WHERE scope = 'personal'")
-        if not found:
+        database (where the tools read) move to the personal one, keeping
+        their ids. Signed in, the copies it pushed to the team's cloud
+        database (when there was no personal database) are forgotten there,
+        and the personal database's syncs ask the cloud which of them it has
+        before sending them (it pushed them there when there was one).
+
+        Under the sync lock, so no sync runs meanwhile and no other process
+        of the profile moves them too; a move cut short is finished by the
+        next start, which copies only the rows not moved yet."""
+        select = f"SELECT * FROM {tables.MEMORY} WHERE scope = 'personal'"
+        if not self.local.query_sql(select):  # nearly always: only an upgrade leaves any
             return
-        keep = {f["name"] for f in tables.MEMORY_SCHEMA if f["type"] != "embedding"}
-        self.personal.append(tables.MEMORY, [{k: v for k, v in r.items() if k in keep} for r in found])
-        self.local.delete(tables.MEMORY, "scope = 'personal'")
+        with sync_lock(config.state_dir(self.settings.home)):
+            found = self.local.query_sql(select)
+            if not found:  # another process moved them first
+                return
+            ids = f"{tables.ROW_ID} IN ({', '.join(tables.sql_string(str(r[tables.ROW_ID])) for r in found)})"
+            moved = {str(r[tables.ROW_ID]) for r in
+                     self.personal.query_sql(f"SELECT {tables.ROW_ID} FROM {tables.MEMORY} WHERE {ids}")}
+            keep = {f["name"] for f in tables.MEMORY_SCHEMA if f["type"] != "embedding"}
+            self.personal.append(tables.MEMORY, [{k: v for k, v in r.items() if k in keep}
+                                                 for r in found if str(r[tables.ROW_ID]) not in moved])
+            if self.mirror is not None:
+                self.mirror.forget(tables.MEMORY, self.settings.team_database,
+                                   [str(r[tables.ROW_ID]) for r in found])
+                if self.settings.personal_database:
+                    [last] = self.personal.query_sql(f"SELECT {tables.STORED}, {tables.ROW_ID} FROM {tables.MEMORY} "
+                                                     f"WHERE {ids} ORDER BY {tables.STORED} DESC, {tables.ROW_ID} DESC "
+                                                     f"LIMIT 1")
+                    self.mirror.recheck(PERSONAL_MEMORY, (int(last[tables.STORED]), str(last[tables.ROW_ID])))
+            self.local.delete(tables.MEMORY, ids)
         logger.info("infino: moved %d personal memories out of the team's local database", len(found))
 
     # -- writes --------------------------------------------------------------
@@ -365,32 +392,50 @@ class Backend:
         if waiting:  # rows written through this one are waiting for a sync
             successor.schedule_sync()
 
-    def flush(self) -> None:
+    def flush(self, wrote_at: float = 0.0) -> None:
         """At a session's end: wait for this process's rows to settle, then
         push them, so a one-shot session's work reaches the cloud before it
-        exits. Bounded; whatever is left goes with the next sync."""
+        exits. Bounded; whatever is left goes with the next sync. A retired
+        backend's flush is its successor's, which waits for the rows written
+        through either (`wrote_at`: the last write made through one it
+        replaced).
+
+        One session end's sync at a time: while an earlier session end's sync
+        still waits (another process's sync holding the profile's lock, a slow
+        cloud), a session end waits for it, within the same bound, rather than
+        queueing another behind it."""
         with self._timer_lock:
             successor = self._successor
+        wrote_at = max(wrote_at, self._last_write)
         if successor is not None:
-            successor.flush()
+            successor.flush(wrote_at)
             return
         if self.mirror is None:
             return
-        settle = SETTLE_MS / 1000 - (time.monotonic() - self._last_write)
+        settle = SETTLE_MS / 1000 - (time.monotonic() - wrote_at)
         if settle > 0:
             time.sleep(min(settle + 0.1, FLUSH_TIMEOUT_S))
-        done = threading.Event()
+        deadline = time.monotonic() + FLUSH_TIMEOUT_S
+        while True:
+            with self._timer_lock:
+                earlier = self._flushing
+                if earlier is None or not earlier.is_alive():
+                    mine = self._flushing = threading.Thread(target=self._sync_at_end, name="infino-flush",
+                                                             daemon=True)
+                    mine.start()
+                    break
+            earlier.join(max(0.0, deadline - time.monotonic()))
+            if earlier.is_alive():
+                logger.info("infino: an earlier session end's sync is still waiting on the cloud; this one's rows "
+                            "go with it or the next sync")
+                return
+        mine.join(max(0.0, deadline - time.monotonic()))
 
-        def run():
-            try:
-                self.mirror.sync(wait=True)
-            except Exception as e:
-                logger.warning("infino: sync at session end stopped (the rows stay local): %s", e)
-            finally:
-                done.set()
-
-        threading.Thread(target=run, name="infino-flush", daemon=True).start()
-        done.wait(FLUSH_TIMEOUT_S)
+    def _sync_at_end(self) -> None:
+        try:
+            self.mirror.sync(wait=True)
+        except Exception as e:
+            logger.warning("infino: sync at session end stopped (the rows stay local): %s", e)
 
     # -- reads ---------------------------------------------------------------
 

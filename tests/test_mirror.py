@@ -9,7 +9,7 @@ import json
 import pyarrow as pa
 import pytest
 
-from hermes_infino import config, mirror, tables
+from hermes_infino import config, local, mirror, tables
 from hermes_infino.client import InfinoError
 from hermes_infino.local import LATE_COMMITS_FILE, PERSONAL_DB_DIR, LocalStore, arrow_schema
 from hermes_infino.mirror import Mirror
@@ -24,6 +24,12 @@ LONG_SETTLE_MS = 3_600_000
 ANOTHER_TEAM_DB = "team-other"
 # A database deleted since a forget for it was queued.
 GONE_DB = "deleted-since"
+# A database the settings named when a forget for it was queued, and no longer do.
+EARLIER_DB = "named-by-earlier-settings"
+# How far ahead this machine's clock was before it was put right.
+CLOCK_AHEAD_MS = 3_600_000
+# Row ids in a queued forget whose line is far longer than another forget's.
+LONG_FORGET_IDS = 200
 
 
 def local_mirror(tmp_path, settings) -> Mirror:
@@ -175,14 +181,40 @@ def test_an_unreadable_state_file_starts_over(m, platform):
     assert m.last_error() == ""
 
 
+def test_a_damaged_state_file_sends_no_row_twice(m, platform, monkeypatch):
+    monkeypatch.setattr(mirror, "PUSH_BATCH", SMALL_BATCH)
+    m.local.append(tables.CONVERSATIONS, conversation_rows(ROWS))
+    m.sync(wait=True)
+    (m.dir / mirror.STATE_FILE).write_text("")  # a power loss before the state reached the disk
+    m.local.append(tables.CONVERSATIONS, conversation_rows(1))
+    m.sync(wait=True)
+    assert len(platform.rows(TEAM_DB, tables.CONVERSATIONS)) == ROWS + 1
+    assert len({r[tables.ROW_ID] for r in platform.rows(TEAM_DB, tables.CONVERSATIONS)}) == ROWS + 1
+
+
+def test_an_older_versions_personal_mark_outlasts_a_time_without_a_personal_database(home, platform, tmp_path):
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform, personal_database=PERSONAL_DB))
+    m.personal.append(tables.MEMORY, [{tables.ROW_ID: "p", "content": "mine", "scope": "personal"}])
+    [row] = m.personal.query_sql("SELECT stored_ms, row_id FROM memory")
+    m.client.append(PERSONAL_DB, tables.MEMORY, [{tables.ROW_ID: "p", "content": "mine", "scope": "personal"}])
+    (m.dir / mirror.STATE_FILE).write_text(json.dumps({"marks": {mirror.PERSONAL_MEMORY: [row[tables.STORED], "p"]}}))
+    # A while without the personal database: its syncs save their state.
+    make_mirror(tmp_path, sign_in(tmp_path, platform)).sync(wait=True)
+    back = make_mirror(tmp_path, sign_in(tmp_path, platform, personal_database=PERSONAL_DB))
+    back.sync(wait=True)
+    assert [r["content"] for r in platform.rows(PERSONAL_DB, tables.MEMORY)] == ["mine"]
+
+
 def test_marks_an_older_version_kept_by_table_carry_over(m, platform):
     m.local.append(tables.MEMORY, [{tables.ROW_ID: "old", "content": "pushed by the older version"}])
     [row] = m.local.query_sql("SELECT stored_ms, row_id FROM memory")
     (m.dir / mirror.STATE_FILE).write_text(json.dumps(
         {"marks": {tables.MEMORY: [row[tables.STORED], "old"], mirror.PERSONAL_MEMORY: [1, "x"]}}))
-    assert m.marks() == {m.mark_of(tables.MEMORY): (row[tables.STORED], "old")}  # no personal database here
+    # No personal database here: its mark is kept by its old name, for when there is one.
+    assert m.marks() == {m.mark_of(tables.MEMORY): (row[tables.STORED], "old"), mirror.PERSONAL_MEMORY: (1, "x")}
     assert m.sync(wait=True)[m.mark_of(tables.MEMORY)] == 0
-    assert set(json.loads((m.dir / mirror.STATE_FILE).read_text())["marks"]) == {m.mark_of(tables.MEMORY)}
+    assert set(json.loads((m.dir / mirror.STATE_FILE).read_text())["marks"]) == {m.mark_of(tables.MEMORY),
+                                                                                mirror.PERSONAL_MEMORY}
 
 
 def test_a_big_batch_is_cut_to_fit_one_append(m, platform, monkeypatch):
@@ -237,6 +269,16 @@ def test_a_row_too_large_alone_is_set_aside(m, platform):
     assert m.refused() == 1 and platform.rows(TEAM_DB, tables.MEMORY) == []
 
 
+def test_a_busy_worker_refusing_an_append_leaves_its_rows_for_the_next_sync(m, platform):
+    m.local.append(tables.CONVERSATIONS, conversation_rows(3))
+    platform.over_budget = True  # other queries fill the worker's memory budget
+    with pytest.raises(InfinoError):  # the sync's failure, tried again: no row set aside
+        m.sync(wait=True)
+    platform.over_budget = False
+    m.sync(wait=True)
+    assert len(platform.rows(TEAM_DB, tables.CONVERSATIONS)) == 3 and m.refused() == 0
+
+
 def test_a_plain_400_on_every_row_is_the_tables_trouble_not_a_rows(m, platform):
     m.local.append(tables.CONVERSATIONS, [{"seq": i, "content": f"BAD {i}"} for i in range(3)])
     platform.refused_marker = "BAD"
@@ -284,6 +326,31 @@ def test_a_process_killed_mid_append_does_not_send_the_batch_twice(m, platform, 
     assert len(platform.rows(TEAM_DB, tables.CONVERSATIONS)) == 3
 
 
+def test_an_unanswered_append_is_still_checked_after_another_sources_append_is_cut_short(m, platform, monkeypatch):
+    real = m.client.append
+
+    def stores_then_raises(table, error):
+        def append(db, t, rows):
+            real(db, t, rows)
+            if t == table:
+                raise error
+        return append
+
+    m.local.append(tables.CONVERSATIONS, conversation_rows(3))
+    monkeypatch.setattr(m.client, "append", stores_then_raises(tables.CONVERSATIONS, TimeoutError("no answer")))
+    with pytest.raises(TimeoutError):
+        m.sync(wait=True)
+    # The next sync pushes memory first, and its process is killed mid-append.
+    m.local.append(tables.MEMORY, [{"content": "saved after"}])
+    monkeypatch.setattr(m.client, "append", stores_then_raises(tables.MEMORY, KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        m.sync(wait=True)
+    monkeypatch.setattr(m.client, "append", real)
+    m.sync(wait=True)
+    assert len(platform.rows(TEAM_DB, tables.CONVERSATIONS)) == 3
+    assert len(platform.rows(TEAM_DB, tables.MEMORY)) == 1
+
+
 def test_a_slow_local_commit_is_pushed_after_all(m, platform):
     m.local.append(tables.MEMORY, [{tables.ROW_ID: "a", "content": "pushed"}])
     m.sync(wait=True)
@@ -298,6 +365,63 @@ def test_a_slow_local_commit_is_pushed_after_all(m, platform):
         f.write(json.dumps({"store": m.local.path.name, "table": tables.MEMORY, "stored_ms": stored}) + "\n")
     m.sync(wait=True)
     assert sorted(r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)) == ["committed slowly", "pushed"]
+
+
+def test_a_sync_killed_after_taking_the_late_commit_notes_keeps_them(m, platform, monkeypatch):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "a", "content": "pushed"}])
+    m.sync(wait=True)
+    [stored] = {r[tables.STORED] for r in m.local.query_sql("SELECT stored_ms FROM memory")}
+    late = {tables.ROW_ID: "0-late", "content": "committed slowly", tables.STORED: stored}
+    m.local._connect().open_table(tables.MEMORY).append(
+        pa.Table.from_pylist([{f.name: late.get(f.name) for f in arrow_schema(tables.MEMORY)}],
+                             schema=arrow_schema(tables.MEMORY)))
+    with open(m.dir / LATE_COMMITS_FILE, "a") as f:
+        f.write(json.dumps({"store": m.local.path.name, "table": tables.MEMORY, "stored_ms": stored}) + "\n")
+    real = m.client.query_sql
+
+    def killed(*args, **kwargs):
+        raise KeyboardInterrupt  # the process dies while the re-check asks the cloud
+
+    monkeypatch.setattr(m.client, "query_sql", killed)
+    with pytest.raises(KeyboardInterrupt):
+        m.sync(wait=True)
+    monkeypatch.setattr(m.client, "query_sql", real)
+    m.sync(wait=True)
+    assert sorted(r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)) == ["committed slowly", "pushed"]
+
+
+def test_a_damaged_late_commit_note_stops_no_sync(m, platform):
+    (m.dir / LATE_COMMITS_FILE).write_text('{"store": "db", "ta\n'  # cut short
+                                           + json.dumps({"store": "db", "table": tables.MEMORY}) + "\n")
+    m.local.append(tables.MEMORY, [{"content": "pushed all the same"}])
+    m.sync(wait=True)
+    m.sync(wait=True)
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["pushed all the same"]
+    assert m.last_error() == ""
+
+
+def test_rows_written_after_a_clock_ahead_is_put_right_do_not_wait_for_it(m, platform, monkeypatch):
+    real = local._now_ms
+    monkeypatch.setattr(local, "_now_ms", lambda: real() + CLOCK_AHEAD_MS)
+    m.local.append(tables.MEMORY, [{"content": "stamped while the clock was ahead"}])
+    monkeypatch.setattr(local, "_now_ms", real)
+    m.local.append(tables.MEMORY, [{"content": "written after it was put right"}])
+    m.sync(wait=True)
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["written after it was put right"]
+
+
+def test_a_mark_a_clock_ahead_moved_on_passes_no_row_written_after_it_is_put_right(m, platform, monkeypatch):
+    real_local, real_mirror = local._now_ms, mirror._now_ms
+    monkeypatch.setattr(local, "_now_ms", lambda: real_local() + CLOCK_AHEAD_MS)
+    monkeypatch.setattr(mirror, "_now_ms", lambda: real_mirror() + CLOCK_AHEAD_MS)
+    m.local.append(tables.MEMORY, [{"content": "pushed while the clock was ahead"}])
+    m.sync(wait=True)  # the mark is an hour ahead now
+    monkeypatch.setattr(local, "_now_ms", real_local)
+    monkeypatch.setattr(mirror, "_now_ms", real_mirror)
+    m.local.append(tables.MEMORY, [{"content": "written after it was put right"}])
+    m.sync(wait=True)
+    assert sorted(r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)) == [
+        "pushed while the clock was ahead", "written after it was put right"]
 
 
 def test_a_cloud_slow_to_show_its_newest_row_is_not_a_lost_table(m, platform):
@@ -484,6 +608,56 @@ def test_a_forget_whose_database_is_gone_is_dropped_and_holds_up_none_after_it(m
     m.sync(wait=True)
     assert platform.rows(TEAM_DB, tables.MEMORY) == []
     assert (m.dir / mirror.FORGET_FILE).read_text() == ""
+
+
+def test_a_forget_queued_as_the_queue_is_rewritten_is_kept_whole(m, platform, monkeypatch):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "a", "content": "a"}, {tables.ROW_ID: "b", "content": "b"}])
+    m.sync(wait=True)
+    m.forget(tables.MEMORY, TEAM_DB, ["a"] + [f"long-{i}" for i in range(LONG_FORGET_IDS)])
+    m.forget(tables.MEMORY, TEAM_DB, ["b"])
+    platform.failed_deletes = 1  # the long one stays queued; the other is taken off: the queue is rewritten
+    real = fcntl.flock
+    queued = []
+
+    def flock(f, op):
+        real(f, op)
+        rewriting = getattr(f, "mode", "") == "r+" and str(getattr(f, "name", "")).endswith(mirror.FORGET_FILE)
+        if op == fcntl.LOCK_UN and rewriting and not queued:
+            queued.append(True)  # another process queues a forget the moment the lock is free
+            m.forget(tables.MEMORY, TEAM_DB, ["late"])
+
+    monkeypatch.setattr(mirror.fcntl, "flock", flock)
+    with pytest.raises(InfinoError):
+        m.sync(wait=True)
+    lines = (m.dir / mirror.FORGET_FILE).read_text().splitlines()
+    assert any('"late"' in line for line in lines)
+    assert all(json.loads(line) for line in lines)
+
+
+def test_a_damaged_line_in_the_forget_queue_stops_no_sync(m, platform):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "1", "content": "m"}])
+    m.sync(wait=True)
+    (m.dir / mirror.FORGET_FILE).write_text('{"table": "memory", "datab\n')  # cut short by a crash
+    m.forget(tables.MEMORY, TEAM_DB, ["1"])
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == [] and m.last_error() == ""
+
+
+def test_a_forget_for_a_database_these_settings_do_not_name_fails_no_sync(m, platform, monkeypatch):
+    m.forget(tables.MEMORY, EARLIER_DB, ["x"])  # queued while the settings named it
+    real = m.client.delete
+
+    def out_of_reach(db, table, predicate):
+        if db == EARLIER_DB:
+            raise InfinoError(403, "the API key may not address this database")
+        return real(db, table, predicate)
+
+    monkeypatch.setattr(m.client, "delete", out_of_reach)
+    m.local.append(tables.MEMORY, [{"content": "x"}])
+    m.sync(wait=True)
+    m.sync(wait=True)
+    assert m.last_error() == ""
+    assert EARLIER_DB in (m.dir / mirror.FORGET_FILE).read_text()  # kept for when they name it again
 
 
 def test_a_forget_goes_to_the_database_it_names(home, platform, tmp_path):

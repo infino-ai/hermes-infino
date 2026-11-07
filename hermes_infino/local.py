@@ -34,6 +34,7 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
+import os
 import time
 import uuid
 from pathlib import Path
@@ -60,7 +61,14 @@ APPEND_BATCH = 512
 # A commit slower than this, from its stamp to done, may have been passed by a
 # sync's mark: it must stay well under the mirror's settle window (SETTLE_MS).
 SLOW_COMMIT_MS = 1_000
-# Beside the databases: the commits that were that slow, for the next sync.
+# The furthest past this machine's clock a row is stamped to keep commit order.
+# A table whose latest row is stamped further ahead (written while the clock
+# was ahead, and since put right) would hold every new row back from the cloud
+# until the clock caught up: those are stamped by the clock instead, and noted
+# like a slow commit.
+MAX_STAMP_AHEAD_MS = SLOW_COMMIT_MS
+# Beside the databases: the commits a sync's mark may have passed (slower than
+# that, or stamped behind a table's latest row), for the next sync.
 LATE_COMMITS_FILE = "late_commits.jsonl"
 # The local-only table of memory vectors (local mode).
 VECTORS = "memory_vectors"
@@ -86,6 +94,19 @@ _ARROW_TYPES = {
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def append_line(path: Path, line: str) -> None:
+    """Add a line to a file the profile's processes share (a queue the mirror
+    reads), under the file's lock and on disk before the lock is released:
+    whoever takes the lock next sees the line whole, and a rewrite of the file
+    under the lock cannot write over it."""
+    with open(path, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(line)
+        f.flush()
+        os.fsync(f.fileno())
+        fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def arrow_schema(table: str) -> pa.Schema:
@@ -188,12 +209,22 @@ class LocalStore:
         def attempt():
             # Stamped per attempt, as late as it can be: commit order is what the
             # mirror follows. Past every row already committed, so a clock
-            # stepped back never stamps a row behind the mirror's mark.
-            stored = max(_now_ms(), self._latest_stored(table) + 1)
+            # stepped back never stamps a row behind the mirror's mark - unless
+            # that is more than MAX_STAMP_AHEAD_MS past the clock: then by the
+            # clock, and noted, so the next sync goes back for the row if a mark
+            # moved on by the clock that was ahead has passed it.
+            now, after = _now_ms(), self._latest_stored(table) + 1
+            clock_behind = after - now > MAX_STAMP_AHEAD_MS
+            stored = now if clock_behind else max(now, after)
             columns = {f.name: values[f.name] if f.name != tables.STORED else pa.array([stored] * len(batch), f.type)
                        for f in schema}
             self._connect().open_table(table).append(pa.table(columns, schema=schema))
-            if _now_ms() - stored > SLOW_COMMIT_MS:
+            if clock_behind:
+                logger.info("infino: the latest %s row is stamped ahead of this machine's clock (set back since?); "
+                            "this one is stamped by the clock, and the next sync re-checks it", table)
+                self._note_late_commit(table, stored)
+            elif _now_ms() - stored > SLOW_COMMIT_MS:
+                logger.warning("infino: a %s commit took over %d ms; the next sync re-checks it", table, SLOW_COMMIT_MS)
                 self._note_late_commit(table, stored)
 
         self._retry(attempt)
@@ -205,15 +236,12 @@ class LocalStore:
                                "embedded): %s", len(batch), e)
 
     def _note_late_commit(self, table: str, stored: int) -> None:
-        """A commit that took longer than the mirror's settle window: a sync may
-        have moved its mark past these rows before they were visible. The note
-        makes the next sync go back for them (mirror.py)."""
-        logger.warning("infino: a %s commit took over %d ms; the next sync re-checks it", table, SLOW_COMMIT_MS)
+        """Rows a sync may have moved its mark past before they were visible (a
+        commit slower than the mirror's settle window, or rows stamped behind
+        the table's latest): the note makes the next sync go back for them
+        (mirror.py)."""
         line = json.dumps({"store": self.path.name, "table": table, "stored_ms": stored}) + "\n"
-        with open(self.path.parent / LATE_COMMITS_FILE, "a") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            f.write(line)
-            fcntl.flock(f, fcntl.LOCK_UN)
+        append_line(self.path.parent / LATE_COMMITS_FILE, line)
 
     def _latest_stored(self, table: str) -> int:
         found = self.query_sql(f"SELECT max({tables.STORED}) AS top FROM {table}")
