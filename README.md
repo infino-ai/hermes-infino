@@ -1,6 +1,6 @@
 # Infino for Hermes: Context Automation for Agent Fleets
 
-`hermes-infino` is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that gives teams of agents a durable, shared context layer that scales. It keeps all agent data in Infino, storing memory, conversations, traces and skills. Before each agent turn, the plugin gives the agent the context that matters for that turn, and the agent can search everything stored: the team's data in shared sessions and your personal data in your own sessions.
+`hermes-infino` is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that gives teams of agents a durable, shared context layer that scales. It captures, organizes, and retrieves all agent data together, including memory, conversations, traces and skills, with the appropriate access controls. Before each agent turn, the plugin gives the agent the context that matters for that turn, and the agent can search everything stored: the team's data in shared sessions and your personal data in your own sessions.
 
 If you are not signed in to an Infino account, everything stays on your machine, in databases run by Infino's open source engine.
 
