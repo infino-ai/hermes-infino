@@ -19,7 +19,8 @@ from tools.delegate_tool_routes import delegated_profile_scope
 from hermes_infino import backend, config, privacy, tables
 from hermes_infino.local import PERSONAL_DB_DIR, LocalStore
 
-from .helpers import DM, PERSONAL_DB, TEAM_DB, hook_ctx, in_session, local, make_manager, wait_for, write_tools_setting
+from .helpers import (DM, PERSONAL_DB, SKILL_MD, TEAM_DB, hook_ctx, in_session, local, make_manager, personal_rows,
+                      wait_for, write_tools_setting)
 
 # A person's email digest (personal) and the team's weekly report (not).
 DIGEST = {"id": "a1b2c3", "name": "email-digest"}
@@ -39,6 +40,13 @@ SMALL_REGISTRY = 3
 MANY_SESSIONS = 10
 # How often the jobs in these tests run, as Hermes's scheduler reads a schedule.
 HOURLY = "every 1h"
+# Where a job was made, as Hermes keeps it with the job (`origin`,
+# tools/cronjob_job_args.py): a team's Slack channel, and a Slack one-to-one
+# chat (a chat id that starts with "D", as cron/scheduler_delivery.py reads it).
+CHANNEL = {"platform": "slack", "chat_id": "C1", "user_id": "U7"}
+SLACK_DM = {"platform": "slack", "chat_id": "D1", "user_id": "U7"}
+# The owner's personal memory, saved at the terminal.
+PRIVATE_PLAN = "Dana is interviewing at Acme"
 
 
 def personal(tmp_path) -> LocalStore:
@@ -375,6 +383,84 @@ def test_a_chat_a_team_jobs_output_was_delivered_into_stays_the_teams(chat, tmp_
     p._drain()
     assert len(texts(local(tmp_path), tables.CONVERSATIONS)) == 2
     assert texts(personal(tmp_path), tables.CONVERSATIONS) == []
+
+
+# -- the run of a job made in a chat --------------------------------------------------
+
+def job_made_in(origin) -> dict:
+    """A job as Hermes stores one: made in a chat (`origin`), or at the terminal (None)."""
+    return create_job("Summarize the Acme deal.", "every 1d", name="acme-summary", deliver="origin", origin=origin)
+
+
+def a_run_of(tmp_path, job: dict):
+    """The provider of one of the job's runs, as Hermes's scheduler starts one."""
+    return make_manager(tmp_path, platform="cron", agent_context="cron", agent_identity="bot",
+                        session_id=f"cron_{job['id']}_20261107_090000")
+
+
+def remembered_at_the_terminal(tmp_path) -> None:
+    m, _ = make_manager(tmp_path, agent_identity="bot", session_id="cli")
+    assert json.loads(m.handle_tool_call("infino_remember", {"content": PRIVATE_PLAN, "scope": "personal"}))["ok"]
+
+
+def call(m, tool: str, **args) -> dict:
+    return json.loads(m.handle_tool_call(tool, args))
+
+
+@pytest.mark.parametrize("personal_profile", ["off", "on"])
+def test_a_run_of_a_job_made_in_a_channel_keeps_out_the_owners_personal_memory(home, tmp_path, personal_profile):
+    # A team bot's member asked for it in a channel: the run answers the channel.
+    home.setenv("INFINO_PERSONAL_PROFILE", personal_profile)
+    remembered_at_the_terminal(tmp_path)
+    job = job_made_in(CHANNEL)
+    m, p = a_run_of(tmp_path, job)
+    with running(job):
+        assert "Acme" not in p.prefetch("Acme deal")
+        assert call(m, "infino_remember", content="Bob is job hunting", scope="personal")["ok"] is False
+    assert [r["content"] for r in personal_rows(tmp_path)] == [PRIVATE_PLAN]
+
+
+def test_a_run_of_a_job_made_in_a_shared_profiles_dm_keeps_out_the_owners_personal_memory(home, tmp_path):
+    remembered_at_the_terminal(tmp_path)
+    job = job_made_in(SLACK_DM)
+    _, p = a_run_of(tmp_path, job)
+    with running(job):
+        assert "Acme" not in p.prefetch("Acme deal")
+
+
+def test_a_run_of_a_job_made_in_a_personal_profiles_dm_is_its_owners(home, tmp_path):
+    home.setenv("INFINO_PERSONAL_PROFILE", "on")
+    remembered_at_the_terminal(tmp_path)
+    job = job_made_in(SLACK_DM)
+    _, p = a_run_of(tmp_path, job)
+    with running(job):
+        assert "Acme" in p.prefetch("Acme deal")
+
+
+def test_a_run_of_a_job_made_at_the_terminal_is_its_owners(home, tmp_path):
+    remembered_at_the_terminal(tmp_path)
+    job = job_made_in(None)
+    m, p = a_run_of(tmp_path, job)
+    with running(job):
+        assert "Acme" in p.prefetch("Acme deal")
+        assert call(m, "infino_remember", content="the summary went out", scope="personal")["ok"] is True
+
+
+def test_a_run_whose_job_cannot_be_read_keeps_out_the_owners_personal_memory(home, tmp_path):
+    remembered_at_the_terminal(tmp_path)
+    _, p = make_manager(tmp_path, platform="cron", agent_context="cron", agent_identity="bot", session_id=DIGEST_SESSION)
+    with running(DIGEST):  # a job no store holds
+        assert "Acme" not in p.prefetch("Acme deal")
+
+
+def test_a_run_of_a_job_made_in_a_channel_does_not_publish_a_skill(home, tmp_path):
+    skill = tmp_path / "skills" / "release-checklist" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(SKILL_MD)
+    job = job_made_in(CHANNEL)
+    m, _ = a_run_of(tmp_path, job)
+    with running(job):
+        assert call(m, "infino_publish_skill", name="release-checklist")["ok"] is False
 
 
 # -- a personal profile --------------------------------------------------------------

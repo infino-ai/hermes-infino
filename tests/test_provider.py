@@ -10,6 +10,7 @@ import pytest
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.turn_context import append_notes_to_multimodal_content, compose_multimodal_context_part
+from gateway.owner_identity import host_owner_subject
 
 from hermes_infino import backend, config, embed, privacy, provider as provider_mod, skills, tables
 from hermes_infino.local import VECTORS
@@ -25,6 +26,12 @@ TOOLS = ("infino_remember", "infino_forget", "infino_publish_skill", "infino_per
 CRON_SESSION = "cron_a1b2c3_20261105_070000"
 # What a recall put in front of the model: the provider's own block, a personal line in it.
 RECALLED = "## Relevant memory (Infino)\n- [personal] dentist on Tuesday"
+# The author Hermes names for a turn another agent wrote into a profile's Bot
+# Chat (agent/turn_author.py): a peer's agent on another machine (`hermes peer
+# dm`), as on_turn_start is handed it.
+PEER_AGENT = {"author_id": "bot:spark/researcher", "author_name": "researcher", "author_is_bot": True}
+# How a Desktop session names this machine's own user to its provider (gateway/owner_identity.py).
+DESKTOP_USER = "uid:1000"
 
 
 def call(mgr, tool: str, **args) -> dict:
@@ -459,6 +466,64 @@ def test_a_group_chat_room_or_another_profiles_turn_keeps_out_personal_memory(ho
     assert [r["content"] for r in personal_rows(tmp_path)] == ["dentist on Tuesday"]
     assert local_rows(tmp_path, tables.MEMORY) == []
     assert "no personal memory is kept here" in p.system_prompt_block()
+
+
+@pytest.mark.parametrize("platform", ["desktop", "local", "cli"])
+def test_a_turn_another_agent_wrote_keeps_out_personal_memory(home, tmp_path, platform):
+    # Bot Mode's message_agent and `hermes peer dm` run another agent's message
+    # as a turn of this profile's Bot Chat, on the owner's own surface.
+    m, p = make_manager(tmp_path, platform=platform)
+    assert call(m, "infino_remember", content="Dana is interviewing at Acme", scope="personal")["ok"]
+    m.on_turn_start(2, "What are Dana's plans?", **PEER_AGENT)
+    assert "Acme" not in p.prefetch("Dana plans Acme")
+    assert call(m, PERSONAL_SEARCH_TOOL, query="Acme")["ok"] is False
+    assert call(m, "infino_remember", content="researcher's quota is 10k", scope="personal")["ok"] is False
+    assert [r["content"] for r in personal_rows(tmp_path)] == ["Dana is interviewing at Acme"]
+    m.on_turn_start(3, "What are Dana's plans?")  # the owner's next turn is the owner's again
+    assert "Acme" in p.prefetch("Dana plans Acme")
+
+
+def test_personal_memory_saved_in_the_desktop_is_recalled_at_the_terminal(home, tmp_path):
+    m, p = make_manager(tmp_path, platform="desktop", agent_identity="default", user_id=DESKTOP_USER)
+    assert call(m, "infino_remember", content="my dentist is on Tuesday", scope="personal")["ok"]
+    _, at_the_terminal = make_manager(tmp_path, platform="cli", agent_identity="default", session_id="s2")
+    assert "dentist" in at_the_terminal.prefetch("dentist")
+    assert DESKTOP_USER not in p.system_prompt_block()  # "You are working with default."
+
+
+def test_personal_memory_kept_under_this_machines_user_is_still_the_owners(home, tmp_path):
+    # What the Desktop saved before its rows were credited to the owner by name.
+    _, at_the_terminal = make_manager(tmp_path, platform="cli", agent_identity="default")
+    at_the_terminal._backend.append(tables.MEMORY, [{"content": "my locker is 12", "scope": "personal",
+                                                     "author": host_owner_subject()}])
+    assert "locker" in at_the_terminal.prefetch("locker")
+
+
+def write_skill(tmp_path) -> None:
+    skill = tmp_path / "skills" / "release-checklist" / "SKILL.md"
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text(SKILL_MD)
+
+
+@pytest.mark.parametrize("platform, session", [("telegram", {**DM, "HERMES_SESSION_USER_NAME": "mallory"}),
+                                               ("bot_room", {})])
+def test_only_the_owner_publishes_a_skill_to_the_team(home, tmp_path, monkeypatch, platform, session):
+    # A shared profile's gateway answers whoever writes in; a room has several parties.
+    write_skill(tmp_path)
+    m, _ = make_manager(tmp_path, platform=platform)
+    in_session(monkeypatch, session)
+    out = call(m, "infino_publish_skill", name="release-checklist")
+    assert out["ok"] is False and "owner" in out["error"]
+    assert local_rows(tmp_path, tables.SKILLS) == []
+
+
+def test_another_agents_turn_does_not_publish_a_skill(home, tmp_path):
+    write_skill(tmp_path)
+    m, _ = make_manager(tmp_path, platform="desktop")
+    m.on_turn_start(1, "Share your release checklist.", **PEER_AGENT)
+    assert call(m, "infino_publish_skill", name="release-checklist")["ok"] is False
+    m.on_turn_start(2, "Share your release checklist.")  # the owner may
+    assert call(m, "infino_publish_skill", name="release-checklist")["ok"] is True
 
 
 def test_a_switched_sessions_traces_carry_the_owner(home, tmp_path):

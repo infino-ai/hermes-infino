@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from hermes_state_registry import acquire, release_or_close
+
 from hermes_infino import backend, privacy, provider as provider_mod, tables
 from hermes_infino.client import InfinoClient
 from hermes_infino.provider import (MAX_PERSONAL_SEARCH_K, PERSONAL_RESULT_CELL_CHARS, PERSONAL_SEARCH_TOOL,
@@ -21,6 +23,8 @@ PRIVATE = "Dr. Lee sent the test results"
 MANY_ROWS = MAX_PERSONAL_SEARCH_K + 10
 # A sync delay no test waits out: rows written meanwhile stay on this machine.
 NEVER_S = 3600
+# Hermes's session store in a profile's home.
+SESSIONS_DB = "state.db"
 
 
 def offered(p) -> bool:
@@ -459,6 +463,33 @@ def test_a_branch_of_a_session_kept_personal_before_a_restart_is_personal(home, 
     again.sync_turn("and the bank?", "Nothing from the bank.", session_id="s1-branch")
     again._drain()
     assert team_rows_of(tmp_path, "s1-branch") == [] and len(personal_rows_of(tmp_path, "s1-branch")) == 2
+
+
+def stored_sessions(tmp_path, *rows: dict) -> None:
+    """Session rows in Hermes's own session store, as Hermes writes them."""
+    db = acquire(tmp_path / SESSIONS_DB)
+    try:
+        for row in rows:
+            db.create_session(**row)
+    finally:
+        release_or_close(db)
+
+
+@pytest.mark.parametrize("branched", [True, False])
+def test_a_desktop_branch_of_a_session_that_searched_is_personal(home, tmp_path, branched):
+    # The Desktop's /branch builds a new agent for the branch, with a provider of
+    # its own: only Hermes's session row says what it branched from.
+    _, p = make_manager(tmp_path, platform="desktop", session_id="p")
+    search(p, query="Dr. Lee")
+    branch = {"session_id": "b", "source": "desktop"}
+    if branched:
+        branch.update(parent_session_id="p", model_config={"_branched_from": "p"})
+    stored_sessions(tmp_path, {"session_id": "p", "source": "desktop"}, branch)
+    _, b = make_manager(tmp_path, platform="desktop", session_id="b")
+    b.sync_turn("and the bank?", "Nothing from the bank.", session_id="b")
+    b._drain()
+    assert len(team_rows_of(tmp_path, "b")) == (0 if branched else 2)
+    assert len(personal_rows_of(tmp_path, "b")) == (2 if branched else 0)
 
 
 @pytest.mark.parametrize("switch", [{"reset": False, "reason": "resume"}, {"reset": True, "reason": "new_session"}])
