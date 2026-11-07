@@ -388,7 +388,7 @@ class InfinoMemoryProvider(MemoryProvider):
         if parent:
             self._carry_on(parent, session_id)
         # What Hermes's background review wrote since this profile last ran.
-        self._run_write(self._mirror_builtin, chats.current())
+        self._run_write(self._mirror_builtin, self._chat())
 
     @staticmethod
     def _this_machines_user() -> str:
@@ -497,6 +497,15 @@ class InfinoMemoryProvider(MemoryProvider):
         """Whether the session is anywhere but the owner's own surfaces
         (chats.OWNER_PLATFORMS): there, the turn itself says who wrote it."""
         return self._platform not in chats.OWNER_PLATFORMS
+
+    def _chat(self) -> chats.Chat:
+        """The running turn's chat (chats.current; call it on the turn's own
+        thread), with the webhook routes the owner calls their own
+        (INFINO_OWNER_ROUTES). Honored on a profile that is one person's only:
+        on a shared one a route's events are anyone's business."""
+        settings = self._settings
+        owned = frozenset(settings.owner_routes) if settings and settings.personal_profile else frozenset()
+        return chats.current(owned)
 
     def _multi_party(self) -> bool:
         """Whether several parties may share the running turn with no gateway
@@ -714,14 +723,14 @@ class InfinoMemoryProvider(MemoryProvider):
         writes no personal memory (_multi_party); the next turn the owner
         writes is the owner's again."""
         self._turn_by_agent = bool(kwargs.get("author_is_bot"))
-        self._note_turn(chats.current(), self._turn_by_agent)
+        self._note_turn(self._chat(), self._turn_by_agent)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         self._last_recall = None
         self._refresh_settings()
         if not self._recaller or not query.strip():
             return ""
-        block, count = self._recaller.recall(query, chats.current(), self._people())
+        block, count = self._recaller.recall(query, self._chat(), self._people())
         if count:
             self._last_recall = RecallStatus(provider_label="Infino", count=count)
         return block
@@ -816,7 +825,7 @@ class InfinoMemoryProvider(MemoryProvider):
 
     def on_memory_write(self, action: str, target: str, content: str, metadata: Optional[dict] = None) -> None:
         assert self._settings is not None
-        chat = chats.current()
+        chat = self._chat()
         previous = (metadata or {}).get("previous_content")
         if action in ("replace", "remove") and previous:
             if chat.group and not chat.owner_writes:
@@ -899,7 +908,7 @@ class InfinoMemoryProvider(MemoryProvider):
         if not self._writes_enabled or not self._settings:
             return
         self._refresh_settings()
-        chat = chats.current()
+        chat = self._chat()
         by_agent = bool((turn_author or {}).get("is_bot"))
         self._note_turn(chat, by_agent)
         session = session_id or self._session_id
@@ -1059,7 +1068,7 @@ class InfinoMemoryProvider(MemoryProvider):
                                                      f"'{self._agent_context}' run; they write from a session, "
                                                      "a subagent or a cron job"})
         try:
-            chat = chats.current()  # read here, on the turn's thread
+            chat = self._chat()  # read here, on the turn's thread
             if tool_name in ("infino_remember", "infino_forget"):
                 asked = _scope(args.get("scope"))
                 if asked is None:

@@ -21,6 +21,15 @@ The owner's own surfaces (OWNER_PLATFORMS) have no gateway chat: a session
 there is never a group. Hermes's hosted Group Chat rooms and turns another
 profile forwards (MULTI_PARTY_PLATFORMS) have none either, though several
 parties share them: the provider treats them as a group from their platform.
+
+A webhook delivery (Hermes's webhook adapter) is a turn with no person behind
+it: an event from GitHub, an email, an alert. Hermes gives each delivery a
+chat of its own, which no later turn shares, so a route's turns are keyed by
+the route instead: what one delivery's turn keeps is recalled in the route's
+later deliveries. Its payload is outside content (a stranger's pull request
+or email), so a route is a group for personal memory, unless the profile's
+owner calls the route their own (`owner_routes`: INFINO_OWNER_ROUTES, on a
+profile that is one person's): its turns are then the owner's.
 """
 
 from __future__ import annotations
@@ -56,6 +65,11 @@ OWNER_PLATFORMS = frozenset({"", "local", "cli", "tui", "desktop", "acp", "cron"
 # forwards (A2A, "a2a"). A group for every personal decision, on a profile that
 # is one person's too.
 MULTI_PARTY_PLATFORMS = frozenset({"bot_room", "a2a"})
+# Hermes's webhook adapter, and how it names the route a delivery came in on:
+# the turn's user id is `webhook:<route>` (gateway/platforms/webhook.py,
+# `_admission_source`), while its chat id is the delivery's own.
+WEBHOOK_PLATFORM = "webhook"
+WEBHOOK_USER_PREFIX = "webhook:"
 
 
 @dataclass(frozen=True)
@@ -91,11 +105,25 @@ def chat_key(platform: str, chat_id: str, thread_id: str = "", parent_chat_id: s
     return f"{platform}:{workspace}_{chat}" if workspace else f"{platform}:{chat}"
 
 
-def current() -> Chat:
-    """The chat of the turn running now (call it on the turn's own thread)."""
+def webhook_route() -> str:
+    """The webhook route the running turn came in on; "" for any other turn."""
+    if session("HERMES_SESSION_PLATFORM").lower() != WEBHOOK_PLATFORM:
+        return ""
+    user = session("HERMES_SESSION_USER_ID")
+    return user[len(WEBHOOK_USER_PREFIX):] if user.startswith(WEBHOOK_USER_PREFIX) else ""
+
+
+def current(owner_routes: frozenset[str] = frozenset()) -> Chat:
+    """The chat of the turn running now (call it on the turn's own thread).
+    `owner_routes`: the webhook routes whose turns are the owner's own."""
     platform = session("HERMES_SESSION_PLATFORM").lower()
     if platform in OWNER_PLATFORMS:
         return NO_CHAT
+    route = webhook_route()
+    if route:
+        if route in owner_routes:
+            return NO_CHAT
+        return Chat(key=chat_key(WEBHOOK_PLATFORM, route), group=True, owner_writes=False)
     key = chat_key(platform, session("HERMES_SESSION_CHAT_ID"), session("HERMES_SESSION_THREAD_ID"),
                    session("HERMES_SESSION_PARENT_CHAT_ID"), session("HERMES_SESSION_SCOPE_ID"))
     if not key:

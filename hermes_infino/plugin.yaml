@@ -41,6 +41,9 @@ optional_env:
   - name: INFINO_PERSONAL_JOBS
     description: "Scheduled jobs (names, or this profile's job ids, comma-separated) whose runs and delivered output are personal"
     password: false
+  - name: INFINO_OWNER_ROUTES
+    description: "On a personal profile: webhook routes (comma-separated) whose events are your own, so their turns read and write your personal memory"
+    password: false
 # The plugin hooks registered (traces.py); the memory provider's own methods are not hooks.
 hooks:
   - pre_llm_call

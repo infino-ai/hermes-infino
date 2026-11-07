@@ -42,6 +42,11 @@ first.
 - INFINO_PERSONAL_JOBS       the scheduled jobs (ids or names, comma-separated,
                              or a list) whose runs, and the chats their output
                              is delivered into, are personal the same way
+- INFINO_OWNER_ROUTES        on a personal profile, the webhook routes
+                             (comma-separated, or a list) whose turns are the
+                             owner's own: their events are the owner's
+                             business, so they read and write the owner's
+                             personal memory (chats.py)
 
 A variable that is set wins over the sign-in, so a deployment's `.env` is
 never overridden by a file on the machine (and `login` refuses a sign-in one
@@ -87,6 +92,7 @@ MCP_SERVER_ENV = "INFINO_MCP_SERVER"
 TEAM_SKILLS_ENV = "INFINO_TEAM_SKILLS"
 PERSONAL_PROFILE_ENV = "INFINO_PERSONAL_PROFILE"
 PERSONAL_JOBS_ENV = "INFINO_PERSONAL_JOBS"
+OWNER_ROUTES_ENV = "INFINO_OWNER_ROUTES"
 
 DEFAULT_MCP_SERVER = "infino"
 # The settings a sign-in holds. The config block or the environment may set
@@ -97,8 +103,8 @@ OFF_VALUES = ("off", "false", "no", "0")
 # Values that turn a switch on; any other spelling of INFINO_PERSONAL_PROFILE
 # turns it on too, with a warning.
 ON_VALUES = ("on", "true", "yes", "1")
-# What separates the jobs INFINO_PERSONAL_JOBS names (a YAML list's items are
-# joined with it).
+# What separates the names of a list setting (INFINO_PERSONAL_JOBS,
+# INFINO_OWNER_ROUTES); a YAML list's items are joined with it.
 JOBS_SEPARATOR = ","
 # A `${VAR}` reference Hermes left as written: its variable is not set.
 UNRESOLVED_REF = re.compile(r"^\$\{[^}]*\}$")
@@ -233,6 +239,8 @@ class Settings:
     personal_profile: bool = False
     # The scheduled jobs (ids or names) whose runs and delivered output are personal.
     personal_jobs: tuple[str, ...] = ()
+    # The webhook routes whose turns are the owner's own (on a personal profile only).
+    owner_routes: tuple[str, ...] = ()
 
     @property
     def signed_in(self) -> bool:
@@ -346,8 +354,14 @@ def load(home_dir: Optional[Path] = None, *, from_config: bool = True) -> Settin
         source=team_from if team_from == key_from else "+".join(w for w in (team_from, key_from) if w),
         team_skills=pick(TEAM_SKILLS_ENV)[0].lower() not in OFF_VALUES,
         personal_profile=_personal_profile(home_dir, pick(PERSONAL_PROFILE_ENV)[0]),
-        personal_jobs=tuple(j.strip() for j in pick(PERSONAL_JOBS_ENV)[0].split(JOBS_SEPARATOR) if j.strip()),
+        personal_jobs=_names(pick(PERSONAL_JOBS_ENV)[0]),
+        owner_routes=_names(pick(OWNER_ROUTES_ENV)[0]),
     )
+
+
+def _names(value: str) -> tuple[str, ...]:
+    """The names a list setting holds (comma-separated, as `_set` writes a YAML list)."""
+    return tuple(name.strip() for name in value.split(JOBS_SEPARATOR) if name.strip())
 
 
 def config_schema() -> list[dict]:
@@ -410,5 +424,11 @@ def config_schema() -> list[dict]:
             "description": "Scheduled jobs (names, or this profile's job ids, comma-separated) whose runs and "
                            "delivered output are personal, never the team's",
             "env_var": PERSONAL_JOBS_ENV,
+        },
+        {
+            "key": "owner_routes",
+            "description": "On a personal profile: webhook routes (comma-separated) whose events are your own, so "
+                           "their turns read and write your personal memory",
+            "env_var": OWNER_ROUTES_ENV,
         },
     ]

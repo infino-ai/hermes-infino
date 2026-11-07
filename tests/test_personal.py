@@ -18,9 +18,10 @@ from tools.delegate_tool_routes import delegated_profile_scope
 
 from hermes_infino import backend, config, privacy, tables
 from hermes_infino.local import PERSONAL_DB_DIR, LocalStore
+from hermes_infino.provider import OTHERS_MARK
 
 from .helpers import (DM, PERSONAL_DB, SKILL_MD, TEAM_DB, end_session, hook_ctx, in_session, local, make_manager,
-                      personal_rows, wait_for, write_tools_setting)
+                      personal_rows, wait_for, webhook_delivery, write_tools_setting)
 
 # A person's email digest (personal) and the team's weekly report (not).
 DIGEST = {"id": "a1b2c3", "name": "email-digest"}
@@ -631,3 +632,46 @@ def test_without_a_personal_database_personal_rows_stay_on_this_machine(env, pla
     assert platform.rows(TEAM_DB, tables.TRACES) == []
     assert len(texts(personal(tmp_path), tables.TRACES)) == 2
     assert set(platform.databases) == {TEAM_DB}
+
+
+# -- webhook routes ----------------------------------------------------------------------
+
+# A webhook route whose events are the owner's own business (reviews asked of them).
+OWN_ROUTE = "review-requested"
+# A team automation's route.
+TEAM_ROUTE = "ci-failure"
+
+
+def a_webhook_turn_starts(m, route: str) -> None:
+    """Hermes's start of a webhook delivery's turn: its author is the route (gateway/run_turn_runner.py)."""
+    m.on_turn_start(1, "Review the pull request.", author_id=f"webhook:{route}", author_name=route, author_is_bot=False)
+
+
+def test_a_route_the_owner_calls_their_own_is_the_owners_turn(home, tmp_path):
+    home.setenv("INFINO_PERSONAL_PROFILE", "on")
+    home.setenv("INFINO_OWNER_ROUTES", OWN_ROUTE)
+    remembered_at_the_terminal(tmp_path)
+    m, p = make_manager(tmp_path, platform="webhook", agent_identity="bot", session_id="hook-1")
+    with webhook_delivery(OWN_ROUTE, "delivery-1"):
+        a_webhook_turn_starts(m, OWN_ROUTE)
+        assert "Acme" in p.prefetch("Acme deal")
+        assert call(m, "infino_personal_search", query="Acme")["ok"] is True
+        assert call(m, "infino_remember", content="Reviews Dana's pull requests first", scope="personal")["ok"] is True
+    # The owner's own turn: USER.md stays the owner's.
+    assert not (config.state_dir(tmp_path) / OTHERS_MARK).exists()
+
+
+@pytest.mark.parametrize("personal_profile, listed", [("on", TEAM_ROUTE), ("off", OWN_ROUTE)])
+def test_any_other_route_keeps_out_the_owners_personal_memory(home, tmp_path, personal_profile, listed):
+    # A route not listed, or any route on a shared profile: its events are anyone's.
+    home.setenv("INFINO_PERSONAL_PROFILE", personal_profile)
+    home.setenv("INFINO_OWNER_ROUTES", listed)
+    remembered_at_the_terminal(tmp_path)
+    m, p = make_manager(tmp_path, platform="webhook", agent_identity="bot", session_id="hook-1")
+    with webhook_delivery(OWN_ROUTE, "delivery-1"):
+        a_webhook_turn_starts(m, OWN_ROUTE)
+        assert "Acme" not in p.prefetch("Acme deal")
+        assert call(m, "infino_personal_search", query="Acme")["ok"] is False
+        # Kept as the route's note, as in any group chat: never as personal memory.
+        call(m, "infino_remember", content="Bob is job hunting", scope="personal")
+    assert [r["content"] for r in personal_rows(tmp_path)] == [PRIVATE_PLAN]

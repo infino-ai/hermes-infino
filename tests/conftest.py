@@ -18,7 +18,7 @@ from .helpers import REMOTE_CONFIG_STUB, TEAM_DB, TEST_SYNC_DELAY_S, fake_embed
 # Every setting the plugin reads from the environment.
 INFINO_ENV = ("INFINO_API_KEY", "INFINO_TEAM_DATABASE", "INFINO_URL", "INFINO_PERSONAL_DATABASE",
               "INFINO_AUTHOR", "INFINO_MCP_SERVER", "INFINO_NODE", "INFINO_CLIENT",
-              "INFINO_PERSONAL_PROFILE", "INFINO_PERSONAL_JOBS")
+              "INFINO_PERSONAL_PROFILE", "INFINO_PERSONAL_JOBS", "INFINO_OWNER_ROUTES")
 
 
 @pytest.fixture(autouse=True)

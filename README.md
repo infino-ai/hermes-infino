@@ -194,6 +194,8 @@ flowchart LR
 
 Hermes tells the plugin which chat a message came from. Any chat that isn't a direct message counts as a group, including one whose type Hermes can't tell, and nobody writes to the owner's personal memory from a group. With Hermes's proposed channel memory ([#144822](https://github.com/NousResearch/hermes-agent/pull/144822)), its setting for each chat decides instead.
 
+**Webhooks.** A webhook route on Hermes's webhook platform (a GitHub event, an email, an alert) works like a group chat of its own. What the agent saves during one delivery is kept for that route and recalled in its later deliveries. It isn't recalled in other chats or routes, and never goes into anyone's personal memory, since a webhook's content comes from outside. On a profile marked personal, list the routes whose events are your own business in `INFINO_OWNER_ROUTES`, such as `review-requested,my-alerts`. Their turns are then yours, with your personal memory, like a turn at the terminal.
+
 **The Infino tools search the whole team database.** Recall keeps each chat's notes to that chat, but an agent can use the tools to read another chat's notes and conversations.
 
 ## The Infino tools
@@ -260,6 +262,7 @@ The sign-in's URL and personal database go with its key. They apply only when th
 | `INFINO_TEAM_SKILLS` | `off` stops this profile loading the skills teammates publish (default on) |
 | `INFINO_PERSONAL_PROFILE` | `on` keeps this profile's conversations and traces out of the team database, and lets its gateway chats keep personal memory (default off). Any value other than `off`, `false`, `no` or `0` counts as `on`. |
 | `INFINO_PERSONAL_JOBS` | Scheduled jobs (names or ids, comma-separated) whose runs, and the chats their output is delivered to, stay out of the team database. On a profile other than the job's own, name the job, not its id. |
+| `INFINO_OWNER_ROUTES` | On a profile marked personal, the webhook routes (comma-separated) whose events are your own: their turns read and write your personal memory. Ignored on a shared profile. |
 
 ## Development
 

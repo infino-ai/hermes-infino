@@ -7,12 +7,17 @@ import hashlib
 import math
 import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Iterator
 
 import hermes_cli
 
 from agent.memory_manager import MemoryManager
+from gateway.config import PlatformConfig
+from gateway.platforms.webhook import WebhookAdapter
+from gateway.session_context import reset_session_vars, set_session_vars
 from hermes_cli.plugins import PluginManager
 
 from hermes_infino import chats, config, embed, traces
@@ -35,6 +40,21 @@ OTHER_GROUP = {**GROUP, "HERMES_SESSION_CHAT_ID": "-200"}
 DM = {**GROUP, "HERMES_SESSION_CHAT_ID": "111", "HERMES_SESSION_CHAT_TYPE": "dm", "HERMES_SESSION_USER_NAME": "owner"}
 
 SKILL_MD = "---\nname: release-checklist\ndescription: Steps before a release.\n---\n\n1. Freeze.\n"
+
+
+@contextmanager
+def webhook_delivery(route: str, delivery_id: str) -> Iterator[None]:
+    """The turn of one webhook delivery on `route`: its session bound from the
+    source Hermes's webhook adapter builds for it (`_admission_source`), the way
+    the gateway binds a turn (`set_session_vars`), and read back through Hermes's
+    own `get_session_env`."""
+    source = WebhookAdapter(PlatformConfig(enabled=True, extra={}))._admission_source(route, None, delivery_id)
+    set_session_vars(platform=source.platform.value, chat_id=source.chat_id or "", chat_type=source.chat_type or "",
+                     chat_name=source.chat_name or "", user_id=source.user_id or "", user_name=source.user_name or "")
+    try:
+        yield
+    finally:
+        reset_session_vars()
 
 
 def fake_embed(texts: list[str]) -> list[list[float]]:

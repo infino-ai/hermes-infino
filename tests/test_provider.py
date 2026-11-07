@@ -19,7 +19,7 @@ from hermes_infino.local import VECTORS
 from hermes_infino.provider import PERSONAL_SEARCH_TOOL, InfinoMemoryProvider
 
 from .helpers import (DM, GROUP, SKILL_MD, TEAM_DB, end_session, fake_embed, hook_ctx, in_session, local, local_rows,
-                      make_manager, personal_rows, wait_for)
+                      make_manager, personal_rows, wait_for, webhook_delivery)
 
 # What a provider declares before it starts, which is what Hermes routes by:
 # every tool, the personal search included (it is shown only where offered).
@@ -684,3 +684,17 @@ def test_only_a_sessions_end_waits_for_the_cloud(env, tmp_path, monkeypatch, ste
             p.on_session_switch("s2", parent_session_id="s1", reset=True)
     p.shutdown()
     assert flushed == ([True] if waits else [])
+
+
+# -- webhook turns -----------------------------------------------------------------
+
+def test_what_a_webhook_turn_saves_is_recalled_in_the_routes_next_delivery(home, tmp_path):
+    # Hermes gives each delivery its own chat: a note kept for that one would never be recalled.
+    m, p = make_manager(tmp_path, platform="webhook", session_id="hook-1")
+    with webhook_delivery("ci-failure", "delivery-1"):
+        assert call(m, "infino_remember", content="CI flakes come from the cache warm-up")["ok"]
+    p._drain()
+    with webhook_delivery("ci-failure", "delivery-2"):
+        assert "cache warm-up" in p.prefetch("why does CI flake")
+    with webhook_delivery("email-triage", "delivery-3"):  # another route's turns don't see it
+        assert "cache warm-up" not in p.prefetch("why does CI flake")

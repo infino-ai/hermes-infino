@@ -10,7 +10,11 @@ from gateway.slash_access import _DM_CHAT_TYPES
 
 from hermes_infino import chats
 
-from .helpers import DM, GROUP, in_session
+from .helpers import DM, GROUP, in_session, webhook_delivery
+
+# Two webhook routes, as `hermes webhook subscribe` names them.
+ROUTE = "ci-failure"
+OTHER_ROUTE = "email-triage"
 
 
 @pytest.mark.parametrize("args, key", [
@@ -93,3 +97,23 @@ def test_a_session_read_that_fails_is_empty(monkeypatch):
 
 def test_outside_a_group_only_the_teams_memory_is_visible():
     assert chats.NO_CHAT.visible == ("",)
+
+
+# -- webhook turns -----------------------------------------------------------------
+
+def test_a_webhook_turn_is_its_routes_chat_whatever_the_delivery():
+    # Hermes gives each delivery its own chat id; the notes a route's turns keep must outlive it.
+    with webhook_delivery(ROUTE, "delivery-1"):
+        first = chats.current()
+    with webhook_delivery(ROUTE, "delivery-2"):
+        second = chats.current()
+    with webhook_delivery(OTHER_ROUTE, "delivery-3"):
+        other = chats.current()
+    assert first == second == chats.Chat(key=f"webhook:{ROUTE}", group=True, owner_writes=False)
+    assert other == chats.Chat(key=f"webhook:{OTHER_ROUTE}", group=True, owner_writes=False)
+
+
+def test_a_route_the_owner_calls_their_own_is_no_group_chat():
+    with webhook_delivery(ROUTE, "delivery-1"):
+        assert chats.current(owner_routes=frozenset({ROUTE})) == chats.NO_CHAT
+        assert chats.current(owner_routes=frozenset({OTHER_ROUTE})).group
