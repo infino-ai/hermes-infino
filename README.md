@@ -1,6 +1,6 @@
-# Infinite recall for Hermes agents
+# Infinite recall for teams of agents
 
-hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that gives your agents a memory that lasts. It stores four things in Infino: memory, conversations, traces and skills. Before each turn it gives the agent the memories that matter for that turn, and the agent can search everything stored: the team's data with the Infino tools, and your personal data with `infino_personal_search`, in your own sessions.
+hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that gives your teams of agents a shared memory that lasts. It stores four things in Infino, an automated data layer for AI inference: memory, conversations, traces and skills. Before each turn it gives the agent the memories that matter for that turn, and the agent can search everything stored: the team's data with the Infino tools, and your personal data with `infino_personal_search`, in your own sessions.
 
 Without an account, everything stays on your machine, in databases run by Infino's open source engine.
 
