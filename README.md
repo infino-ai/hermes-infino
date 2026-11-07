@@ -1,10 +1,10 @@
-# Infinite recall for Hermes fleets
+# Infino for Hermes: A shared data layer for agent teams
 
-hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that gives teams of agents a durable, shared memory that scales. It keeps all agent data in Infino, an automated data layer for AI inference, storing memory, conversations, traces and skills. Before each agent turn, the plugin gives the agent the memories that matter for that turn, and the agent can search everything stored: the team's data in shared sessions and your personal data in your own sessions.
+hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that gives teams of agents a durable, shared data layer that scales. It keeps all agent data in Infino (an agent data automation platform) storing memory, conversations, traces and skills. Before each agent turn, the plugin gives the agent the memories that matter for that turn, and the agent can search everything stored: the team's data in shared sessions and your personal data in your own sessions.
 
 If you are not signed in to an Infino account, everything stays on your machine, in databases run by Infino's open source engine.
 
-When you [sign in](#signing-in) to Infino, your agent data is synced with Infino Cloud and team collaboration becomes available. Work goes to a team database, and everyone who signs in to the same team database shares it, so every agent on the team can search what the others did. Personal memory, and any work you mark as personal, goes to a personal database of your own that is kept private.
+When you [sign in](#signing-in) to Infino, your agent data is synced with Infino Cloud, where collaboration and data automation are available. Work goes to a team database, and everyone who signs in to the same team database shares it, so every agent on the team can search what the others did. Personal memory, and any work you mark as personal, goes to a personal database of your own that is kept private.
 
 ## What it stores in Infino
 
