@@ -16,7 +16,7 @@ The plugin keeps four tables.
 
 **`traces`** records every model call (model, provider, tokens, time) and every tool call (name, arguments, result, status, time). Secrets are masked the same way Hermes masks them for any memory plugin.
 
-**`skills`** holds the skills your agents share with `infino_publish_skill`. Once you sign in, every profile on the team can use them as read-only `infino:<name>` skills, from its next session. Members of a group chat can't publish, and secrets are masked first. A shared skill's name can have only letters, digits, `-` and `_`, the only names Hermes loads a plugin's skills under. Set `INFINO_TEAM_SKILLS=off` to keep a profile to its own skills.
+**`skills`** holds the skills your agents share with `infino_publish_skill`. Once you sign in, every profile on the team can use them as read-only `infino:<name>` skills, from its next session. Only the profile's owner publishes, from their own sessions or a chat on a profile marked personal. Group chat members, a shared profile's gateway users, hosted rooms, messages from other agents and jobs made in a gateway chat can't. Secrets are masked first. A shared skill's name can have only letters, digits, `-` and `_`, the only names Hermes loads a plugin's skills under. Set `INFINO_TEAM_SKILLS=off` to keep a profile to its own skills.
 
 A turn and its traces share a `session_id` and a `turn_id`, so you can join them. Every row has a `row_id`.
 
@@ -150,6 +150,8 @@ Personal memory lives in its own database. On your machine it's in `$HERMES_HOME
 
 Personal memory belongs to the profile's owner. A shared profile on a gateway answers whoever writes to it, so it keeps no personal memory. On a profile that serves only you, such as your own bot, set `INFINO_PERSONAL_PROFILE=on`. Its chats can then keep your personal memory, and its conversations and traces stay personal too.
 
+A scheduled job made in a gateway chat runs as that chat. It keeps no personal memory on a shared profile, and none on any profile if it was made in a group chat. Neither does a message another agent sends into your Bot Chat.
+
 ## Keeping work personal
 
 Conversations and traces go to the team database, so every agent can see what the others did. Some work is yours alone, such as a scheduled job that summarizes your email, or a profile for private errands. Mark it personal, and its conversations and traces go to your personal database instead, or stay on your machine if you don't have one.
@@ -174,6 +176,7 @@ When Hermes is in a group chat through the gateway, memory belongs to that chat:
 - What members ask the agent to remember is saved for that chat and credited to whoever said it. It never goes into anyone's personal memory.
 - Recall in the group shows that chat's notes and the team's memory, never anyone's personal memory or other chats' notes.
 - Recall anywhere else doesn't show that group's notes.
+- Notes Hermes's background review saves after a group's turn stay with that chat, and never go into anyone's personal memory. If several groups talked in the same half hour, those notes show in no chat's recall.
 
 ```mermaid
 flowchart LR
@@ -251,7 +254,7 @@ The sign-in's URL and personal database go with its key. They apply only when th
 | `INFINO_API_KEY` | The Infino API key for this person or bot |
 | `INFINO_TEAM_DATABASE` | The team's database |
 | `INFINO_PERSONAL_DATABASE` | Your own database. `login` creates one. Leave it unset for bots and shared profiles. If it names the team database, the plugin uses none. |
-| `INFINO_AUTHOR` | Who this profile's messages and memories are from, when Hermes doesn't say. In a chat, the sender is the author. |
+| `INFINO_AUTHOR` | Who this profile's messages and memories are from, when Hermes doesn't say (default: the profile's name, on every surface, never the machine's user id). In a chat, the sender is the author. |
 | `INFINO_MCP_SERVER` | The client's name under `mcp_servers` (default `infino`). Environment only, since it names the config block. |
 | `INFINO_URL` | The Infino Cloud URL (default `https://api.platform.infino.ws`) |
 | `INFINO_TEAM_SKILLS` | `off` stops this profile loading the skills teammates publish (default on) |

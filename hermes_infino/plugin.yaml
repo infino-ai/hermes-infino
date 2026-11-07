@@ -1,5 +1,5 @@
 name: infino
-version: 0.5.7
+version: 0.5.8
 description: "Infino as the backend for Hermes: memory, conversations, traces and skills in an Infino database on this machine, and in the team's Infino Cloud database once signed in (`hermes infino login`), read by the Infino client's MCP tools."
 author: "Infino"
 homepage: "https://github.com/infino-ai/hermes-infino"
