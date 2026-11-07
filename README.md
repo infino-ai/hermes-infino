@@ -159,9 +159,11 @@ Conversations and traces go to the team database, so every agent can see what th
 | `INFINO_PERSONAL_JOBS=email-digest,weekly-finances` | Every run of those scheduled jobs, named as `hermes cron list` shows them: every model call, tool call and subagent along the way, and the chat the output is delivered to |
 | `INFINO_PERSONAL_PROFILE=on` | Every conversation and trace of the profile |
 
+A subagent that Hermes runs as another profile keeps its traces personal on that profile, even for team work, since that profile can't tell whose work it is.
+
 A chat becomes personal once a personal job's output is in its history, and stays personal from then on. The output gets there when the job uses `attach_to_session`, `cron.mirror_delivery` or a continuable thread, or posts to a group chat with `deliver: room:<id>`.
 
-In a group chat, each member's turn runs on that member's own profile. List the job on every member's profile, or once for the whole team through [Remote Config](#running-a-fleet). A member's turn is personal only when their profile lists the job and the turn still includes the job's post.
+In a group chat, each member's turn runs on that member's own profile. List the job by its name on every member's profile, or once for the whole team through [Remote Config](#running-a-fleet): another profile sees only the job's name, never its id. If two of a profile's jobs share a name and either is listed, the output of both is personal. A member's turn is personal only when their profile lists the job and the turn still includes the job's post.
 
 These settings don't change memory. A memory is still the team's unless it's about one person.
 
@@ -187,7 +189,7 @@ flowchart LR
   R2 --> PM
 ```
 
-Hermes tells the plugin which chat a message came from. Any chat that isn't a direct message counts as a group, and nobody writes to the owner's personal memory from a group. With Hermes's proposed channel memory ([#144822](https://github.com/NousResearch/hermes-agent/pull/144822)), its setting for each chat decides instead.
+Hermes tells the plugin which chat a message came from. Any chat that isn't a direct message counts as a group, including one whose type Hermes can't tell, and nobody writes to the owner's personal memory from a group. With Hermes's proposed channel memory ([#144822](https://github.com/NousResearch/hermes-agent/pull/144822)), its setting for each chat decides instead.
 
 **The Infino tools search the whole team database.** Recall keeps each chat's notes to that chat, but an agent can use the tools to read another chat's notes and conversations.
 
@@ -254,7 +256,7 @@ The sign-in's URL and personal database go with its key. They apply only when th
 | `INFINO_URL` | The Infino Cloud URL (default `https://api.platform.infino.ws`) |
 | `INFINO_TEAM_SKILLS` | `off` stops this profile loading the skills teammates publish (default on) |
 | `INFINO_PERSONAL_PROFILE` | `on` keeps this profile's conversations and traces out of the team database, and lets its gateway chats keep personal memory (default off). Any value other than `off`, `false`, `no` or `0` counts as `on`. |
-| `INFINO_PERSONAL_JOBS` | Scheduled jobs (names or ids, comma-separated) whose runs, and the chats their output is delivered to, stay out of the team database |
+| `INFINO_PERSONAL_JOBS` | Scheduled jobs (names or ids, comma-separated) whose runs, and the chats their output is delivered to, stay out of the team database. On a profile other than the job's own, name the job, not its id. |
 
 ## Development
 

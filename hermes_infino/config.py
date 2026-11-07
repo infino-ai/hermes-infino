@@ -407,8 +407,8 @@ def config_schema() -> list[dict]:
         },
         {
             "key": "personal_jobs",
-            "description": "Scheduled jobs (ids or names, comma-separated) whose runs and delivered output are "
-                           "personal, never the team's",
+            "description": "Scheduled jobs (names, or this profile's job ids, comma-separated) whose runs and "
+                           "delivered output are personal, never the team's",
             "env_var": PERSONAL_JOBS_ENV,
         },
     ]

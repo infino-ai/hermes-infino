@@ -681,7 +681,7 @@ def test_settings_come_from_the_tools_config_block(home, platform, tmp_path):
     settings = config.load(tmp_path)
     assert settings.signed_in and settings.source == "config"
     assert (settings.api_key, settings.team_database) == ("test-key", TEAM_DB)
-    # The launcher is started with that block as its environment, so it does not read the config.
+    # Run as a script, the launcher reads the environment Hermes started it with, not the config.
     assert config.load(tmp_path, from_config=False).team_database == "a-different-team"
     make_manager(tmp_path)
     assert set(platform.databases[TEAM_DB]) == set(tables.ALL)
