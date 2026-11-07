@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import argparse
 import io
+import threading
 import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
 import pytest
 
 from hermes_infino import cli, config, tables
 
-from .helpers import PERSONAL_DB, TEAM_DB, make_manager, sign_in
+from .helpers import PERSONAL_DB, TEAM_DB, make_manager, sign_in, write_tools_setting
 
 # A port nothing listens on.
 DEAD_URL = "http://127.0.0.1:9"
@@ -289,6 +291,141 @@ def test_already_signed_in_says_how_to_sign_in_again(home, platform, tmp_path, c
     out = capsys.readouterr().out
     assert str(config.state_dir(tmp_path) / config.CREDENTIALS_FILE) in out
     assert "environment" in out and "mcp_servers.infino" in out
+
+
+def fail_to_make(client, name):
+    raise TimeoutError("timed out")
+
+
+def test_signing_in_again_as_told_keeps_a_free_accounts_only_key(home, platform, tmp_path, terminal, monkeypatch,
+                                                                 capsys):
+    # A free account whose personal database could not be made; the platform
+    # gives its key once, and no second free account to this network.
+    monkeypatch.setattr(cli.InfinoClient, "create_database", fail_to_make)
+    terminal("yes")
+    assert run("login", "--url", platform.url, "--team-database", TEAM_DB) == 0
+    told = capsys.readouterr()
+    assert run("login") == 0
+    told_again = capsys.readouterr().out
+    for said in (told.err, told_again):
+        # How to have a personal database without signing in again.
+        assert f"hermes config set {config.PERSONAL_DB_ENV}" in said
+    # How to sign in again keeping the key, followed to the letter.
+    assert "api_key" in told_again and "--api-key-file" in told_again
+    key_file = tmp_path / "saved.key"
+    key_file.write_text(config.read_credentials(tmp_path)["api_key"])
+    config.credentials_path(tmp_path).unlink()
+    platform.trial_status = cli.FREE_ACCOUNT_TAKEN
+    assert run("login", "--url", platform.url, "--api-key-file", str(key_file), "--team-database", TEAM_DB,
+               "--yes") == 0
+    assert config.read_credentials(tmp_path)["api_key"] == "trial-key-1"
+
+
+# -- a sign-in the config block or the environment would override ----------------
+
+@pytest.mark.parametrize("where", ["environment", "config"])
+def test_login_refuses_a_url_set_otherwise_where_it_takes_precedence(home, platform, tmp_path, no_terminal, key_file,
+                                                                    capsys, where):
+    # `hermes memory setup` wrote the default URL into .env; the person signs in to another platform.
+    if where == "config":
+        write_tools_setting(tmp_path, f"INFINO_URL: {DEAD_URL}")
+    else:
+        home.setenv("INFINO_URL", DEAD_URL)
+    assert login_with_key(platform, key_file) == 1
+    err = capsys.readouterr().err
+    assert "INFINO_URL" in err and DEAD_URL in err and where in err and "Nothing was created or sent" in err
+    assert config.read_credentials(tmp_path) == {} and platform.requests == []
+
+
+def test_login_refuses_a_team_database_set_otherwise_in_the_environment(home, platform, tmp_path, no_terminal,
+                                                                       key_file, capsys):
+    home.setenv("INFINO_TEAM_DATABASE", "ops")
+    assert login_with_key(platform, key_file) == 1  # --team-database TEAM_DB
+    err = capsys.readouterr().err
+    assert "INFINO_TEAM_DATABASE" in err and "'ops'" in err and "environment" in err
+    assert config.read_credentials(tmp_path) == {} and platform.databases == {}
+
+
+def test_login_makes_no_account_whose_key_another_key_would_replace(home, platform, tmp_path, terminal, capsys):
+    home.setenv("INFINO_API_KEY", "a-fleet-key")
+    terminal("yes")
+    assert run("login", "--url", platform.url, "--team-database", TEAM_DB) == 1
+    err = capsys.readouterr().err
+    assert "INFINO_API_KEY" in err and "a-fleet-key" not in err  # a key is never printed
+    assert platform.trials == 0 and config.read_credentials(tmp_path) == {}
+
+
+def test_login_with_the_same_settings_set_elsewhere_goes_on(home, platform, tmp_path, no_terminal, key_file):
+    home.setenv("INFINO_URL", platform.url + "/")
+    home.setenv("INFINO_API_KEY", "team-key")  # the key in the key file
+    assert login_with_key(platform, key_file, "--no-personal-database") == 0
+    assert config.read_credentials(tmp_path)["team_database"] == TEAM_DB
+
+
+def test_login_uses_the_personal_database_the_environment_names(home, platform, tmp_path, no_terminal, key_file,
+                                                               capsys):
+    home.setenv("INFINO_PERSONAL_DATABASE", PERSONAL_DB)
+    assert login_with_key(platform, key_file) == 0
+    assert f"your personal database '{PERSONAL_DB}'" in capsys.readouterr().out
+    assert set(platform.databases) == {TEAM_DB, PERSONAL_DB}
+
+
+@pytest.mark.parametrize("asked", [["--personal-database", "mine"], ["--no-personal-database"]])
+def test_login_refuses_a_personal_database_choice_the_environment_overrides(home, platform, tmp_path, no_terminal,
+                                                                           key_file, capsys, asked):
+    home.setenv("INFINO_PERSONAL_DATABASE", PERSONAL_DB)
+    assert login_with_key(platform, key_file, *asked) == 1
+    assert "INFINO_PERSONAL_DATABASE" in capsys.readouterr().err
+    assert config.read_credentials(tmp_path) == {} and platform.databases == {}
+
+
+# -- a platform answering with something else ------------------------------------
+
+class ProxyPage(BaseHTTPRequestHandler):
+    """A captive or corporate proxy: an HTML page, 200, for every request."""
+
+    def do_GET(self):
+        self._page()
+
+    def do_POST(self):
+        self._page()
+
+    def _page(self):
+        page = b"<html><body>Sign in to the network</body></html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(page)))
+        self.end_headers()
+        self.wfile.write(page)
+
+    def log_message(self, *args):  # quiet
+        pass
+
+
+class Hangup(BaseHTTPRequestHandler):
+    """A server that closes the connection without an answer."""
+
+    def handle(self):
+        pass
+
+
+@pytest.fixture(params=[(ProxyPage, "did not answer as the Infino platform does"),
+                        (Hangup, "could not reach the platform")])
+def not_the_platform(request):
+    """A URL where something else answers, and what `login` says of it."""
+    handler, said = request.param
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}", said
+    server.shutdown()
+
+
+def test_login_to_something_that_is_not_the_platform_says_so(home, tmp_path, no_terminal, key_file,
+                                                             not_the_platform, capsys):
+    url, said = not_the_platform
+    assert run("login", "--url", url, "--api-key-file", str(key_file), "--team-database", TEAM_DB, "--yes") == 1
+    assert said in capsys.readouterr().err
+    assert config.read_credentials(tmp_path) == {}
 
 
 def test_status_before_hermes_has_run_says_no_vectors_yet(home, capsys):

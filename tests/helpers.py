@@ -119,6 +119,12 @@ def sign_in(tmp_path, platform, team=TEAM_DB, **extra) -> config.Settings:
     return config.load(tmp_path)
 
 
+def write_tools_setting(home_dir: Path, line: str) -> None:
+    """A config whose tools block holds one setting, written as a person
+    writes YAML (a bare `off` is a boolean to Hermes's loader)."""
+    (home_dir / "config.yaml").write_text(f"mcp_servers:\n  infino:\n    command: hermes\n    env:\n      {line}\n")
+
+
 def requests_to(platform, route: str) -> int:
     """How many requests the platform got on a route (`append`, `hybrid_search`...)."""
     return sum(1 for path, _ in platform.requests if path.startswith(f"/v1/{route}"))

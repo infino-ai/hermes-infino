@@ -15,7 +15,7 @@ from cron.scheduler_delivery import bot_chat_message
 from hermes_infino import backend, config, privacy, tables
 from hermes_infino.local import PERSONAL_DB_DIR, LocalStore
 
-from .helpers import DM, PERSONAL_DB, TEAM_DB, hook_ctx, in_session, local, make_manager, wait_for
+from .helpers import DM, PERSONAL_DB, TEAM_DB, hook_ctx, in_session, local, make_manager, wait_for, write_tools_setting
 
 # A person's email digest (personal) and the team's weekly report (not).
 DIGEST = {"id": "a1b2c3", "name": "email-digest"}
@@ -132,6 +132,18 @@ def test_a_cron_session_names_its_job_when_hermes_has_no_record_of_the_run(home,
     hooks = hook_ctx()
     a_run(hooks, DIGEST_SESSION)  # no record bound: the session id still names the job
     assert wait_for(lambda: len(texts(personal(tmp_path), tables.TRACES)) == 2)
+    assert texts(local(tmp_path), tables.TRACES) == []
+
+
+def test_personal_jobs_listed_in_the_tools_block_as_a_yaml_list_are_personal(home, tmp_path):
+    # What `hermes config set mcp_servers.infino.env.INFINO_PERSONAL_JOBS '[...]'`
+    # stores, and what Remote Config can hold: a list, not a comma-separated text.
+    write_tools_setting(tmp_path, f"INFINO_PERSONAL_JOBS: [{DIGEST['name']}, weekly-finances]")
+    make_manager(tmp_path, platform="cron", agent_context="cron", session_id=DIGEST_SESSION)
+    hooks = hook_ctx()
+    with running(DIGEST):
+        a_run(hooks, DIGEST_SESSION)
+    assert wait_for(lambda: len(texts(local(tmp_path), tables.TRACES) + texts(personal(tmp_path), tables.TRACES)) == 2)
     assert texts(local(tmp_path), tables.TRACES) == []
 
 
@@ -359,6 +371,24 @@ def test_a_profile_that_is_not_personal_shares_as_before(home, tmp_path):
     p.sync_turn("What time is standup?", "Ten.", session_id="work")
     p._drain()
     assert len(texts(local(tmp_path), tables.CONVERSATIONS)) == 2
+
+
+@pytest.mark.parametrize("value, is_personal", [("on", True), ("Yes", True), ("y", True), ("enabled", True),
+                                                ("off", False), ("No", False), ("false", False), ("0", False),
+                                                ("", False)])
+def test_only_an_off_value_keeps_a_profile_from_being_personal(home, tmp_path, value, is_personal):
+    # A spelling the plugin does not know fails closed: the profile is personal.
+    home.setenv("INFINO_PERSONAL_PROFILE", value)
+    assert config.load(tmp_path).personal_profile is is_personal
+
+
+def test_a_personal_profile_setting_in_an_unknown_spelling_is_named_once(home, tmp_path, monkeypatch):
+    warned = []
+    monkeypatch.setattr(config.logger, "warning", lambda msg, *args: warned.append(msg % args))
+    home.setenv("INFINO_PERSONAL_PROFILE", "enabled")
+    config.load(tmp_path)
+    config.load(tmp_path)  # settings load on every turn: one warning says it
+    assert len(warned) == 1 and "'enabled'" in warned[0] and "INFINO_PERSONAL_PROFILE" in warned[0]
 
 
 # -- what reaches the cloud ----------------------------------------------------------

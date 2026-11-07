@@ -3,6 +3,7 @@ that must agree with the code."""
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import stat
@@ -12,12 +13,15 @@ from pathlib import Path
 import hermes_constants
 import pytest
 import yaml
+from hermes_cli import memory_setup
+from tools.mcp_tool_config import _load_mcp_config
+from tools.mcp_tool_transport import _stdio_launch
 
 from hermes_infino import config
 from hermes_infino.backend import Backend
 from hermes_infino.client import DEFAULT_URL
 
-from .helpers import TEAM_DB
+from .helpers import TEAM_DB, write_tools_setting
 
 REPO = Path(__file__).resolve().parent.parent
 PLUGIN_YAML = REPO / "hermes_infino" / "plugin.yaml"
@@ -26,12 +30,6 @@ PYPROJECT = REPO / "pyproject.toml"
 
 def write_config(home_dir: Path, doc: dict) -> None:
     (home_dir / "config.yaml").write_text(json.dumps(doc))  # JSON is YAML
-
-
-def write_tools_setting(home_dir: Path, line: str) -> None:
-    """A config whose tools block holds one setting, written as a person
-    writes YAML (a bare `off` is a boolean to Hermes's loader)."""
-    (home_dir / "config.yaml").write_text(f"mcp_servers:\n  infino:\n    command: hermes\n    env:\n      {line}\n")
 
 
 def test_nothing_set_is_local_mode_on_the_default_url(home, tmp_path):
@@ -215,6 +213,36 @@ def test_a_bare_yaml_on_in_the_tools_block_turns_a_setting_on(home, tmp_path):
     assert config.load(tmp_path).personal_profile
 
 
+@pytest.mark.parametrize("line, quoted", [
+    ("INFINO_PERSONAL_PROFILE: on", 'INFINO_PERSONAL_PROFILE: "on"'),
+    ("INFINO_TEAM_SKILLS: off", 'INFINO_TEAM_SKILLS: "off"'),
+    ("INFINO_TEAM_DATABASE: 2026", 'INFINO_TEAM_DATABASE: "2026"'),
+    ("INFINO_PERSONAL_JOBS: [email-digest, weekly-finances]", 'INFINO_PERSONAL_JOBS: "email-digest,weekly-finances"'),
+])
+def test_a_value_in_the_tools_block_that_is_not_text_is_named_with_how_to_quote_it(home, tmp_path, monkeypatch,
+                                                                                    line, quoted):
+    warned = []
+    monkeypatch.setattr(config.logger, "warning", lambda msg, *args: warned.append(msg % args))
+    write_tools_setting(tmp_path, line)
+    config.load(tmp_path)
+    config.load(tmp_path)  # settings load on every turn: one warning says it
+    assert len(warned) == 1 and quoted in warned[0]
+    # Why it matters: Hermes starts the tools with the block's values as they
+    # are, and a process's environment holds only text.
+    name = line.split(":")[0]
+    _, env, _ = _stdio_launch(_load_mcp_config()["infino"])
+    assert not isinstance(env[name], str)
+
+
+def test_a_quoted_value_reaches_the_tools_as_text_and_reads_as_the_setting(home, tmp_path, monkeypatch):
+    warned = []
+    monkeypatch.setattr(config.logger, "warning", lambda msg, *args: warned.append(msg % args))
+    write_tools_setting(tmp_path, 'INFINO_PERSONAL_PROFILE: "on"')
+    assert config.load(tmp_path).personal_profile and warned == []
+    _, env, _ = _stdio_launch(_load_mcp_config()["infino"])
+    assert env["INFINO_PERSONAL_PROFILE"] == "on"
+
+
 @pytest.mark.parametrize("where", ["sign-in", "environment"])
 def test_a_personal_database_that_is_the_team_database_is_none(home, tmp_path, monkeypatch, where):
     warned = []
@@ -255,4 +283,17 @@ def test_the_two_manifests_carry_one_version():
 
 def test_the_default_url_is_declared_where_people_read_it():
     assert DEFAULT_URL in PLUGIN_YAML.read_text()
-    assert [f["default"] for f in config.config_schema() if f["key"] == "url"] == [DEFAULT_URL]
+    [url] = [f for f in config.config_schema() if f["key"] == "url"]
+    assert DEFAULT_URL in url["description"]
+
+
+def test_memory_setup_writes_no_sign_in_setting_the_person_left_alone(home, monkeypatch):
+    """`hermes memory setup` writes a field's default into .env when the person
+    presses Enter, and .env takes precedence over a sign-in: a URL written
+    there sends a later sign-in's key to another platform."""
+    schema = config.config_schema()
+    monkeypatch.setattr(memory_setup.sys, "stdin", io.StringIO("\n" * len(schema)))
+    monkeypatch.setattr(memory_setup, "masked_secret_prompt", lambda _label: "")
+    env_writes: dict = {}
+    assert memory_setup._prompt_schema_fields("infino", schema, {}, env_writes)
+    assert not set(env_writes) & {"INFINO_API_KEY", "INFINO_TEAM_DATABASE", "INFINO_PERSONAL_DATABASE", "INFINO_URL"}
