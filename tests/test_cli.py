@@ -15,7 +15,7 @@ import pytest
 
 from hermes_infino import cli, config, tables
 
-from .helpers import PERSONAL_DB, TEAM_DB, make_manager, sign_in, write_tools_setting
+from .helpers import PERSONAL_DB, TEAM_DB, local, make_manager, personal_rows, sign_in, write_tools_setting
 
 # A port nothing listens on.
 DEAD_URL = "http://127.0.0.1:9"
@@ -109,6 +109,18 @@ def test_sync_pushes_and_reports(home, platform, tmp_path, capsys):
     assert run("sync") == 0
     assert "(1 rows pushed)" in capsys.readouterr().out
     assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["kept before sign-in"]
+
+
+def test_sync_moves_an_older_versions_personal_memory_before_it_pushes(home, platform, tmp_path):
+    sign_in(tmp_path, platform)
+    # A personal memory as an older version kept it: in the team's local table.
+    team = local(tmp_path)
+    team.ensure_tables(with_vectors=False)
+    team.append(tables.MEMORY, [{tables.ROW_ID: "p1", "content": "my salary", "scope": "personal"}])
+    assert run("sync") == 0
+    assert [r for r in platform.rows(TEAM_DB, tables.MEMORY)
+            if r[tables.ROW_ID] == "p1" or r["scope"] == "personal"] == []
+    assert [r["content"] for r in personal_rows(tmp_path)] == ["my salary"]
 
 
 def test_sync_reports_a_cloud_that_stops_accepting(home, platform, tmp_path, capsys):

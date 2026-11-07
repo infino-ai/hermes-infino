@@ -19,10 +19,17 @@ which runs on a background thread once the rows have settled
 or a sync that found another process syncing, schedules one more; a sync
 that failed is tried again by itself (SYNC_RETRY_FIRST_S, doubling up to
 SYNC_RETRY_MAX_S), so an idle gateway's rows do not wait for its next write.
+
+A session's end the process may not outlive waits for its rows to reach the
+cloud, bounded (`flush`, provider.shutdown says where). A process that exits
+before a background sync is due pushes what is left as it exits
+(`flush_at_exit`), unless it ends through os._exit, as Hermes's gateway and
+one-shot runs do: their teardowns wait instead.
 """
 
 from __future__ import annotations
 
+import atexit
 import logging
 import threading
 import time
@@ -40,8 +47,17 @@ logger = logging.getLogger(__name__)
 # How long after a write its sync runs: past the settle window, so the write
 # is pushed by the sync it scheduled.
 SYNC_DELAY_S = SETTLE_MS / 1000 + 0.5
-# The most a session's end waits for its rows to reach the cloud.
-FLUSH_TIMEOUT_S = 30.0
+# The most a session's end waits for its rows to reach the cloud, once they
+# have settled. Within Hermes's own bounds: a CLI's exit gets 30 s before its
+# watchdog ends the process (HERMES_EXIT_WATCHDOG_S), and a gateway agent's
+# teardown 30 s (its _CLEANUP_TIMEOUT_S); before this wait each drains the
+# agent's queued writes for up to 15 s.
+FLUSH_TIMEOUT_S = 10.0
+# Past the settle window, so the last write is in the sync that follows the wait.
+SETTLE_MARGIN_S = 0.1
+# The most a process's exit waits for the exit flush (flush_at_exit): the
+# settle window, then a sync, as a session's end waits.
+EXIT_FLUSH_WAIT_S = SETTLE_MS / 1000 + SETTLE_MARGIN_S + FLUSH_TIMEOUT_S
 # Seconds after a failed background sync that the next one runs, with no
 # write needed to start it; each failure in a row doubles the wait, up to
 # SYNC_RETRY_MAX_S, and a sync that succeeds starts it over.
@@ -91,8 +107,10 @@ class Backend:
         # retired (`for_settings`): the syncs asked of this one are its.
         self._successor: Optional[Backend] = None
         # The sync of the latest session end, which may still be waiting on the
-        # cloud after that session stopped waiting for it (`flush`).
+        # cloud after that session stopped waiting for it (`flush`), and when
+        # the session end that started it stops waiting.
         self._flushing: Optional[threading.Thread] = None
+        self._flush_deadline = 0.0
 
     @property
     def signed_in(self) -> bool:
@@ -321,7 +339,9 @@ class Backend:
 
     # -- sync ----------------------------------------------------------------
 
-    def schedule_sync(self, delay_s: float = SYNC_DELAY_S) -> None:
+    def schedule_sync(self, delay_s: Optional[float] = None) -> None:
+        """A sync in the background, after `delay_s` (SYNC_DELAY_S when not
+        given), or one more after the one pending or running."""
         with self._timer_lock:
             successor = self._successor
             if successor is None:
@@ -331,10 +351,13 @@ class Backend:
                     # The pending or running sync may have read its rows already: one more after it.
                     self._again = True
                     return
-                self._timer = threading.Timer(delay_s, self._sync_quietly)
+                self._timer = threading.Timer(SYNC_DELAY_S if delay_s is None else delay_s, self._sync_quietly)
                 self._timer.daemon = True
                 self._timer.start()
                 return
+        # Its syncs push this one's writes: a session's end or the process's
+        # exit through it waits for them to settle too.
+        successor._last_write = max(successor._last_write, self._last_write)
         successor.schedule_sync(delay_s)
 
     def _sync_quietly(self) -> None:
@@ -387,6 +410,7 @@ class Backend:
         row to where the settings now say."""
         with self._timer_lock:
             self._successor = successor
+            successor._last_write = max(successor._last_write, self._last_write)
             pending = [t for t in (self._timer, self._retry_timer) if t is not None]
             for timer in pending:
                 timer.cancel()
@@ -399,15 +423,18 @@ class Backend:
     def flush(self, wrote_at: float = 0.0) -> None:
         """At a session's end: wait for this process's rows to settle, then
         push them, so a one-shot session's work reaches the cloud before it
-        exits. Bounded; whatever is left goes with the next sync. A retired
-        backend's flush is its successor's, which waits for the rows written
-        through either (`wrote_at`: the last write made through one it
-        replaced).
+        exits. Bounded (FLUSH_TIMEOUT_S); whatever is left goes with the next
+        sync. A retired backend's flush is its successor's, which waits for
+        the rows written through either (`wrote_at`: the last write made
+        through one it replaced).
 
         One session end's sync at a time: while an earlier session end's sync
         still waits (another process's sync holding the profile's lock, a slow
         cloud), a session end waits for it, within the same bound, rather than
-        queueing another behind it."""
+        queueing another behind it. Once that sync has outlived its own bound,
+        a session end does not wait on it again: a gateway's stop ends its
+        cached agents one after another, within its own watchdog, and a cloud
+        that did not answer the first would hold up each."""
         with self._timer_lock:
             successor = self._successor
         wrote_at = max(wrote_at, self._last_write)
@@ -416,9 +443,12 @@ class Backend:
             return
         if self.mirror is None:
             return
-        settle = SETTLE_MS / 1000 - (time.monotonic() - wrote_at)
-        if settle > 0:
-            time.sleep(min(settle + 0.1, FLUSH_TIMEOUT_S))
+        with self._timer_lock:
+            stuck = self._flushing is not None and self._flushing.is_alive() and time.monotonic() > self._flush_deadline
+        if stuck:
+            self._leave_to_next_sync()
+            return
+        self._wait_to_settle(wrote_at)
         deadline = time.monotonic() + FLUSH_TIMEOUT_S
         while True:
             with self._timer_lock:
@@ -426,14 +456,38 @@ class Backend:
                 if earlier is None or not earlier.is_alive():
                     mine = self._flushing = threading.Thread(target=self._sync_at_end, name="infino-flush",
                                                              daemon=True)
+                    self._flush_deadline = deadline
                     mine.start()
                     break
             earlier.join(max(0.0, deadline - time.monotonic()))
             if earlier.is_alive():
-                logger.info("infino: an earlier session end's sync is still waiting on the cloud; this one's rows "
-                            "go with it or the next sync")
+                self._leave_to_next_sync()
                 return
         mine.join(max(0.0, deadline - time.monotonic()))
+
+    def _leave_to_next_sync(self) -> None:
+        """A session's end that does not wait on an earlier one's sync, still
+        waiting on the cloud: its rows go with that sync, or the one after."""
+        logger.info("infino: an earlier session end's sync is still waiting on the cloud; this one's rows go with it "
+                    "or the next sync")
+        self.schedule_sync()
+
+    @staticmethod
+    def _wait_to_settle(wrote_at: float) -> None:
+        """Wait until the last write (`wrote_at`, on the monotonic clock) is
+        past the settle window, so the sync that follows takes it."""
+        settle = SETTLE_MS / 1000 - (time.monotonic() - wrote_at)
+        if settle > 0:
+            time.sleep(min(settle + SETTLE_MARGIN_S, FLUSH_TIMEOUT_S))
+
+    def _push_before_exit(self) -> None:
+        """This backend's part of the process's exit flush (flush_at_exit), on
+        that flush's own thread: when a sync has anything to send, wait for
+        this process's rows to settle, then sync."""
+        if self.mirror is None or not self.mirror.unpushed():
+            return
+        self._wait_to_settle(self._last_write)
+        self._sync_at_end()
 
     def _sync_at_end(self) -> None:
         try:
@@ -499,6 +553,12 @@ class Backend:
 
 _backends: dict[tuple, Backend] = {}
 _backends_lock = threading.Lock()
+# Set as the process exits (flush_at_exit), for the exit flush's thread.
+_exiting = threading.Event()
+# The exit flush's thread, started with the first signed-in backend and
+# waiting: a Python that is exiting starts no new thread (3.12 and later
+# refuse one from an atexit handler).
+_exit_flusher: Optional[threading.Thread] = None
 
 
 def for_settings(settings: config.Settings) -> Backend:
@@ -513,7 +573,44 @@ def for_settings(settings: config.Settings) -> Backend:
         if backend is not None:
             return backend
         backend = _backends[key] = Backend(settings)
+        if backend.signed_in:
+            _watch_for_exit()
         replaced = [_backends.pop(k) for k in list(_backends) if k[0] == home and k != key]
     for old in replaced:
         old.retire(backend)
     return backend
+
+
+def _watch_for_exit() -> None:
+    """Start the exit flush's thread and register flush_at_exit, once per
+    process (the caller holds _backends_lock)."""
+    global _exit_flusher
+    if _exit_flusher is not None:
+        return
+    _exit_flusher = threading.Thread(target=_flush_when_exiting, name="infino-exit-flush", daemon=True)
+    _exit_flusher.start()
+    atexit.register(flush_at_exit)
+
+
+def _flush_when_exiting() -> None:
+    _exiting.wait()
+    with _backends_lock:
+        live = list(_backends.values())
+    for b in live:
+        try:
+            b._push_before_exit()
+        except Exception as e:  # never raise into the exit: the rows stay local, for the next start's sync
+            logger.warning("infino: could not push at exit (the rows stay local and go next time): %s", e)
+
+
+def flush_at_exit() -> None:
+    """As the process exits (atexit): push what the live backends hold that
+    the cloud does not, within EXIT_FLUSH_WAIT_S. These are rows a teardown
+    left to the background sync (one Hermes does not wait for: an evicted
+    agent, a scheduled job's cleanup) in a process that exits before that sync
+    is due. A process that ends through os._exit runs no atexit (Hermes's
+    gateway, a one-shot run): there the teardown itself waits
+    (provider.shutdown)."""
+    _exiting.set()
+    if _exit_flusher is not None:
+        _exit_flusher.join(EXIT_FLUSH_WAIT_S)

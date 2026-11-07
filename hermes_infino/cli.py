@@ -415,14 +415,14 @@ def _catch_up(settings: config.Settings) -> int:
     """Create the cloud tables, then push until nothing is left to push. A
     database whose tables cannot be made right (a personal database the key
     may not reach, say) holds up only its own rows: the other's are pushed,
-    and the end says what was not, and why."""
-    from . import tables
+    and the end says what was not, and why. Personal memory an older version
+    kept in the team's local table moves to the person's own first
+    (Backend.ensure_local), so none of it is pushed to the team."""
     from .backend import Backend
     from .mirror import SETTLE_MS
 
     b = Backend(settings)
-    b.local.ensure_tables(with_vectors=False)
-    b.personal.ensure_tables(with_vectors=False, only=tables.PERSONAL)
+    b.ensure_local()
     b.local.drop_vectors()
     b.personal.drop_vectors()
     try:

@@ -4,6 +4,16 @@ a fake platform, a profile home, and Hermes on Remote Config."""
 from __future__ import annotations
 
 import importlib.util
+import os
+import tempfile
+
+# Importing one of Hermes's entry-point modules (run_agent, gateway.run: the
+# teardowns the tests drive) points TMPDIR at <HERMES_HOME>/cache/scratch
+# unless a temp variable is set (hermes_bootstrap), and pytest's temp homes
+# would then sit inside the real Hermes home, which Hermes reads as part of
+# its default profile. Pinned to the system's temp root before any Hermes
+# import, as Hermes's own tests do, that hook leaves it alone.
+os.environ.setdefault("TMPDIR", tempfile.gettempdir())
 
 import pytest
 

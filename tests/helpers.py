@@ -25,6 +25,7 @@ from gateway.platforms.webhook import WebhookAdapter
 from gateway.session_context import reset_session_vars, set_session_vars
 from hermes_cli import plugins as hermes_plugins
 from hermes_cli.plugins import PluginManager
+from run_agent import AIAgent
 from tools.memory_tool_store import MemoryStore
 from tools.thread_context import propagate_context_to_thread
 
@@ -185,6 +186,19 @@ def in_session(monkeypatch, values: dict, binding="absent"):
         monkeypatch.setattr(chats, "_CHANNEL_MEMORY", None)
     else:
         monkeypatch.setattr(chats, "_CHANNEL_MEMORY", SimpleNamespace(get=lambda default=None: binding))
+
+
+def hermes_agent(mgr: MemoryManager, session_id: str = "s1") -> AIAgent:
+    """Hermes's agent holding `mgr`, as a CLI session, a gateway chat, a
+    scheduled job's run or a one-shot run holds its memory manager, for
+    Hermes's own teardown functions to end: its memory methods
+    (shutdown_memory_provider, commit_memory_session, release_clients, close)
+    are Hermes's; its model clients and tools are not built."""
+    agent = AIAgent.__new__(AIAgent)
+    agent._memory_manager = mgr
+    agent.session_id = session_id
+    agent._session_messages = []
+    return agent
 
 
 def end_session(provider) -> None:

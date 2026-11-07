@@ -22,10 +22,16 @@ ROWS = 7
 # A settle window no row in a test is old enough for.
 LONG_SETTLE_MS = 3_600_000
 ANOTHER_TEAM_DB = "team-other"
-# A database deleted since a forget for it was queued.
-GONE_DB = "deleted-since"
+# A personal database other than the one an older version pushed to.
+OTHER_PERSONAL_DB = "other-personal"
+# A table of the team's database dropped since a forget for it was queued.
+GONE_TABLE = "dropped-since"
 # A database the settings named when a forget for it was queued, and no longer do.
 EARLIER_DB = "named-by-earlier-settings"
+# What the cloud answers a delete in that database: the key may not reach it
+# (403), or it is not found, as the platform answers for another account's
+# database (404), or it is being purged (410).
+OUT_OF_REACH_STATUSES = (403, 404, 410)
 # How far ahead this machine's clock was before it was put right.
 CLOCK_AHEAD_MS = 3_600_000
 # Row ids in a queued forget whose line is far longer than another forget's.
@@ -54,6 +60,20 @@ def m(home, platform, tmp_path) -> Mirror:
 
 def conversation_rows(n: int) -> list[dict]:
     return [{"session_id": "s", "seq": i, "role": "user", "content": f"m{i}"} for i in range(n)]
+
+
+def commit_late(m: Mirror, table: str, row: dict) -> None:
+    """A row committed slowly: with the stamp it took before a sync's mark
+    passed it (its own `stored_ms`), not one stamped as it lands."""
+    schema = arrow_schema(table)
+    m.local._connect().open_table(table).append(
+        pa.Table.from_pylist([{f.name: row.get(f.name) for f in schema}], schema=schema))
+
+
+def note_late(m: Mirror, table: str, stored: int) -> None:
+    """The note local.py leaves for a slow commit, for the next sync."""
+    with open(m.dir / LATE_COMMITS_FILE, "a") as f:
+        f.write(json.dumps({"store": m.local.path.name, "table": table, "stored_ms": stored}) + "\n")
 
 
 def test_the_sources_are_the_teams_tables(m):
@@ -203,6 +223,35 @@ def test_an_older_versions_personal_mark_outlasts_a_time_without_a_personal_data
     back = make_mirror(tmp_path, sign_in(tmp_path, platform, personal_database=PERSONAL_DB))
     back.sync(wait=True)
     assert [r["content"] for r in platform.rows(PERSONAL_DB, tables.MEMORY)] == ["mine"]
+
+
+def test_an_older_versions_personal_mark_is_not_taken_for_another_personal_database(home, platform, tmp_path):
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform, personal_database=PERSONAL_DB))
+    early = {tables.ROW_ID: "early", "content": "pushed while the other one was named", "scope": "personal"}
+    late = {tables.ROW_ID: "late", "content": "pushed while this one was named", "scope": "personal"}
+    m.personal.append(tables.MEMORY, [dict(early)])
+    m.personal.append(tables.MEMORY, [dict(late)])
+    [row] = m.personal.query_sql("SELECT stored_ms FROM memory WHERE row_id = 'late'")
+    # An older version kept one personal mark whichever database it named: it pushed the
+    # early memory to the other personal database, then the late one to this one.
+    tables.ensure_all(m.client, OTHER_PERSONAL_DB, personal=True)
+    m.client.append(OTHER_PERSONAL_DB, tables.MEMORY, [dict(early)])
+    m.client.append(PERSONAL_DB, tables.MEMORY, [dict(late)])
+    (m.dir / mirror.STATE_FILE).write_text(
+        json.dumps({"marks": {mirror.PERSONAL_MEMORY: [row[tables.STORED], "late"]}}))
+    # The person names the other personal database now: the late memory never went there.
+    other = make_mirror(tmp_path, sign_in(tmp_path, platform, personal_database=OTHER_PERSONAL_DB))
+    other.sync(wait=True)
+    assert sorted(r[tables.ROW_ID] for r in platform.rows(OTHER_PERSONAL_DB, tables.MEMORY)) == ["early", "late"]
+
+
+def test_the_teams_memory_never_pushes_a_personal_memory(m, platform):
+    # Personal memory in the team's own table: an older version's, not moved out yet
+    # (Backend.ensure_local), or written there by an older version still running.
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "p1", "content": "my salary", "scope": "personal"},
+                                   {"content": "the deploy freeze starts December 20", "scope": "team"}])
+    m.sync(wait=True)
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["the deploy freeze starts December 20"]
 
 
 def test_marks_an_older_version_kept_by_table_carry_over(m, platform):
@@ -356,27 +405,44 @@ def test_a_slow_local_commit_is_pushed_after_all(m, platform):
     m.sync(wait=True)
     # A row committed after the mark had passed its stamp: the sync never saw it.
     [stored] = {r[tables.STORED] for r in m.local.query_sql("SELECT stored_ms FROM memory")}
-    late = {tables.ROW_ID: "0-late", "content": "committed slowly", tables.STORED: stored}
-    m.local._connect().open_table(tables.MEMORY).append(
-        pa.Table.from_pylist([{f.name: late.get(f.name) for f in arrow_schema(tables.MEMORY)}],
-                             schema=arrow_schema(tables.MEMORY)))
+    commit_late(m, tables.MEMORY, {tables.ROW_ID: "0-late", "content": "committed slowly", tables.STORED: stored})
     assert sum(m.sync(wait=True).values()) == 0
-    with open(m.dir / LATE_COMMITS_FILE, "a") as f:  # what local.py notes for a slow commit
-        f.write(json.dumps({"store": m.local.path.name, "table": tables.MEMORY, "stored_ms": stored}) + "\n")
+    note_late(m, tables.MEMORY, stored)
     m.sync(wait=True)
     assert sorted(r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)) == ["committed slowly", "pushed"]
+
+
+def test_an_unanswered_batch_is_not_sent_again_when_a_late_commit_moves_the_mark_back(m, platform, monkeypatch):
+    monkeypatch.setattr(mirror, "PUSH_BATCH", SMALL_BATCH)
+    m.local.append(tables.CONVERSATIONS, conversation_rows(1))
+    m.sync(wait=True)
+    [first] = m.local.rows_after(tables.CONVERSATIONS, None, 2 ** 62, 1)
+    m.local.append(tables.CONVERSATIONS, conversation_rows(SMALL_BATCH))
+    real = m.client.append
+
+    def times_out_after_storing(db, table, rows):
+        real(db, table, rows)
+        raise TimeoutError("the answer never came")
+
+    monkeypatch.setattr(m.client, "append", times_out_after_storing)
+    with pytest.raises(TimeoutError):
+        m.sync(wait=True)
+    monkeypatch.setattr(m.client, "append", real)
+    # A row committed slowly behind the first one moves the mark back before that unanswered batch.
+    commit_late(m, tables.CONVERSATIONS, {tables.ROW_ID: "0-late", "session_id": "s", "role": "user",
+                                          "content": "committed slowly", tables.STORED: first[tables.STORED]})
+    note_late(m, tables.CONVERSATIONS, first[tables.STORED])
+    m.sync(wait=True)
+    ids = [r[tables.ROW_ID] for r in platform.rows(TEAM_DB, tables.CONVERSATIONS)]
+    assert len(ids) == len(set(ids)) == SMALL_BATCH + 2
 
 
 def test_a_sync_killed_after_taking_the_late_commit_notes_keeps_them(m, platform, monkeypatch):
     m.local.append(tables.MEMORY, [{tables.ROW_ID: "a", "content": "pushed"}])
     m.sync(wait=True)
     [stored] = {r[tables.STORED] for r in m.local.query_sql("SELECT stored_ms FROM memory")}
-    late = {tables.ROW_ID: "0-late", "content": "committed slowly", tables.STORED: stored}
-    m.local._connect().open_table(tables.MEMORY).append(
-        pa.Table.from_pylist([{f.name: late.get(f.name) for f in arrow_schema(tables.MEMORY)}],
-                             schema=arrow_schema(tables.MEMORY)))
-    with open(m.dir / LATE_COMMITS_FILE, "a") as f:
-        f.write(json.dumps({"store": m.local.path.name, "table": tables.MEMORY, "stored_ms": stored}) + "\n")
+    commit_late(m, tables.MEMORY, {tables.ROW_ID: "0-late", "content": "committed slowly", tables.STORED: stored})
+    note_late(m, tables.MEMORY, stored)
     real = m.client.query_sql
 
     def killed(*args, **kwargs):
@@ -600,10 +666,10 @@ def test_a_forget_the_cloud_keeps_failing_holds_up_none_after_it(m, platform):
     assert platform.rows(TEAM_DB, tables.MEMORY) == []
 
 
-def test_a_forget_whose_database_is_gone_is_dropped_and_holds_up_none_after_it(m, platform):
+def test_a_forget_whose_table_is_gone_is_dropped_and_holds_up_none_after_it(m, platform):
     m.local.append(tables.MEMORY, [{tables.ROW_ID: "1", "content": "m"}])
     m.sync(wait=True)
-    m.forget(tables.MEMORY, GONE_DB, ["x"])  # the cloud answers 404: nothing is left there to delete
+    m.forget(GONE_TABLE, TEAM_DB, ["x"])  # the cloud answers 404: nothing is left there to delete
     m.forget(tables.MEMORY, TEAM_DB, ["1"])
     m.sync(wait=True)
     assert platform.rows(TEAM_DB, tables.MEMORY) == []
@@ -643,13 +709,14 @@ def test_a_damaged_line_in_the_forget_queue_stops_no_sync(m, platform):
     assert platform.rows(TEAM_DB, tables.MEMORY) == [] and m.last_error() == ""
 
 
-def test_a_forget_for_a_database_these_settings_do_not_name_fails_no_sync(m, platform, monkeypatch):
+@pytest.mark.parametrize("status", OUT_OF_REACH_STATUSES)
+def test_a_forget_for_a_database_these_settings_do_not_name_fails_no_sync(m, platform, monkeypatch, status):
     m.forget(tables.MEMORY, EARLIER_DB, ["x"])  # queued while the settings named it
     real = m.client.delete
 
     def out_of_reach(db, table, predicate):
         if db == EARLIER_DB:
-            raise InfinoError(403, "the API key may not address this database")
+            raise InfinoError(status, "the API key may not address this database")
         return real(db, table, predicate)
 
     monkeypatch.setattr(m.client, "delete", out_of_reach)

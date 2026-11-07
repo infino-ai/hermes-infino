@@ -296,9 +296,12 @@ class InfinoMemoryProvider(MemoryProvider):
         self._session_id = ""
         # Whether another agent wrote the running turn (on_turn_start).
         self._turn_by_agent = False
-        # Whether Hermes ended the session since its last turn (on_session_end):
-        # a shutdown that follows is the session's end, which waits for its rows
-        # to reach the cloud; any other shutdown is a soft release (shutdown).
+        # Whether Hermes ended the session since its last turn started
+        # (on_session_end): a shutdown that follows is the session's end; any
+        # other shutdown is a soft release (shutdown). A turn's start, or a
+        # switch to another session id, clears it; a turn's sync does not, since
+        # Hermes may run the last one after the end (its queued sync drained by
+        # shutdown_all).
         self._session_ended = False
         # session_id -> where the scheduled job its run belongs to was made (_job_origin).
         self._job_origins: dict[str, Optional[str]] = {}
@@ -723,6 +726,7 @@ class InfinoMemoryProvider(MemoryProvider):
         owner's, even in the owner's own Bot Chat, and reads, searches and
         writes no personal memory (_multi_party); the next turn the owner
         writes is the owner's again."""
+        self._session_ended = False  # a turn starts: the session goes on
         self._turn_by_agent = bool(kwargs.get("author_is_bot"))
         self._note_turn(self._chat(), self._turn_by_agent)
 
@@ -930,7 +934,6 @@ class InfinoMemoryProvider(MemoryProvider):
         messages: Optional[list[dict[str, Any]]] = None,
         turn_author: Optional[dict[str, Any]] = None,
     ) -> None:
-        self._session_ended = False  # a turn: the session goes on
         if not self._writes_enabled or not self._settings:
             return
         self._refresh_settings()
@@ -1186,9 +1189,10 @@ class InfinoMemoryProvider(MemoryProvider):
             writer.join(timeout=READY_WAIT_S)
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
-        """Hermes calls this inline (at compaction, /new) as well as at exit:
-        it only starts a sync. `shutdown`, when it follows (at exit), waits
-        for the rows to go."""
+        """Hermes calls this inline (at compaction, /new, a gateway's cache
+        eviction) as well as at a session's end: it only starts a sync.
+        `shutdown`, when it follows where the process may end right after,
+        waits for the rows to go."""
         self._session_ended = True
         if self._backend is not None:
             self._backend.schedule_sync()
@@ -1222,15 +1226,30 @@ class InfinoMemoryProvider(MemoryProvider):
             privacy.note_personal(child)
 
     def shutdown(self) -> None:
-        """Hermes shuts the provider down at a session's end (after
-        on_session_end: at exit, a one-shot run's end, a gateway session's
-        expiry) and at a soft release (a CLI agent rebuilt for /reasoning or a
-        route change, a gateway's cache eviction), with nothing to tell them
-        apart but that order. Both write what this process still holds to the
-        local database. Only a session's end waits for the rows to reach the
-        cloud, since a one-shot run exits right after; a soft release leaves
-        them to the background sync, so the person's next message never waits
-        on the cloud."""
+        """Hermes shuts the provider down after a session's end (on_session_end:
+        a CLI's exit, a one-shot run's end, a gateway's stop or a session's
+        expiry there, a gateway's cache eviction, a scheduled job's cleanup)
+        and at a soft release (a CLI agent rebuilt for /reasoning or a route
+        change, an api_server session closed or let go), with nothing to tell
+        them apart but that order and the thread it runs on. Each writes what
+        this process still holds to the local database, and waits for the rows
+        to reach the cloud (bounded: Backend.flush) only on a thread the
+        process waits for, where it may end right after:
+
+        - the main thread, after a session's end: a CLI's exit, and a one-shot
+          run's, which exits through os._exit, so no background sync is left
+          to run;
+        - Hermes's own worker threads: a gateway's stop ends its cached agents
+          and api_server sessions on them, then exits through os._exit too; a
+          session's expiry and a gateway /new run there as well, bounded by
+          Hermes.
+
+        Hermes runs the teardowns it does not wait for on daemon threads (a
+        cache eviction, under memory pressure too; an idle api_server session;
+        a scheduled job's cleanup), and those, like a soft release on the main
+        thread (the person's next message waits on it), never wait: their rows
+        go with the background sync, or as the process exits
+        (backend.flush_at_exit)."""
         # Trace rows a fork of a session (Hermes's background review, /btw)
         # added after the session's last turn ended have no turn end to wait for.
         if self._settings is not None:
@@ -1238,7 +1257,8 @@ class InfinoMemoryProvider(MemoryProvider):
         self._drain()
         if self._backend is None:
             return
-        if self._session_ended:
+        here = threading.current_thread()
+        if not here.daemon and (self._session_ended or here is not threading.main_thread()):
             self._backend.flush()
         else:
             self._backend.schedule_sync()
