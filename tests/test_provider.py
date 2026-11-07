@@ -8,13 +8,23 @@ import sys
 
 import pytest
 
+from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.turn_context import append_notes_to_multimodal_content, compose_multimodal_context_part
+
 from hermes_infino import backend, config, embed, privacy, provider as provider_mod, skills, tables
 from hermes_infino.local import VECTORS
-from hermes_infino.provider import InfinoMemoryProvider
+from hermes_infino.provider import PERSONAL_SEARCH_TOOL, InfinoMemoryProvider
 
-from .helpers import DM, GROUP, SKILL_MD, fake_embed, in_session, local, local_rows, make_manager, personal_rows, wait_for
+from .helpers import (DM, GROUP, SKILL_MD, fake_embed, hook_ctx, in_session, local, local_rows, make_manager,
+                      personal_rows, wait_for)
 
-TOOLS = ("infino_remember", "infino_forget", "infino_publish_skill")
+# What a provider declares before it starts, which is what Hermes routes by:
+# every tool, the personal search included (it is shown only where offered).
+TOOLS = ("infino_remember", "infino_forget", "infino_publish_skill", "infino_personal_search")
+# A scheduled job's run, as Hermes's scheduler names its session.
+CRON_SESSION = "cron_a1b2c3_20261105_070000"
+# What a recall put in front of the model: the provider's own block, a personal line in it.
+RECALLED = "## Relevant memory (Infino)\n- [personal] dentist on Tuesday"
 
 
 def call(mgr, tool: str, **args) -> dict:
@@ -305,6 +315,39 @@ def test_the_turn_starts_at_its_own_user_message(mgr, tmp_path):
     assert [r["content"] for r in turn_rows(tmp_path)][2:] == ["fix the build", "(also: run the linter)", "done"]
 
 
+def test_a_turn_corrected_while_it_ran_is_stored_from_its_start(mgr, tmp_path):
+    # A correction sent mid-turn is a user message of its own, and Hermes adds it
+    # to the turn's text it hands sync_turn (agent/turn_iteration_prep.py).
+    _, p = mgr
+    messages = [{"role": "user", "content": "fix bug"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c1", "function": {"name": "terminal", "arguments": "{\"cmd\": \"git status\"}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "on branch dev"},
+                {"role": "user", "content": "use main"},
+                {"role": "assistant", "content": "done"}]
+    p.sync_turn("fix bug\n\nUser correction during the turn: use main", "done", session_id="s1", messages=messages)
+    p._drain()
+    rows = turn_rows(tmp_path)
+    assert rows[0]["content"] == "fix bug"
+    assert [r["role"] for r in rows] == ["user", "assistant", "tool", "user", "assistant"]
+
+
+def test_an_image_turn_stores_none_of_its_recalled_memory(mgr, tmp_path):
+    # Hermes keeps a multimodal turn's recall as a text part of the user message
+    # (agent/turn_context.py), where a string turn keeps it out of the message.
+    _, p = mgr
+    parts = [{"type": "text", "text": "what is in this picture?"},
+             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
+    assert append_notes_to_multimodal_content(parts, compose_multimodal_context_part(RECALLED, ""))
+    messages = [{"role": "user", "content": parts}, {"role": "assistant", "content": "A cat."}]
+    p.sync_turn(_summarize_user_message_for_log(parts, sep="\n"), "A cat.", session_id="s1", messages=messages)
+    p._drain()
+    rows = turn_rows(tmp_path)
+    assert [r["role"] for r in rows] == ["user", "assistant"]
+    assert rows[0]["content"].startswith("what is in this picture?")
+    assert "dentist" not in rows[0]["content"] and "memory-context" not in rows[0]["content"]
+
+
 def test_a_personal_memory_call_is_logged_without_its_text(mgr, tmp_path):
     _, p = mgr
     messages = [{"role": "user", "content": "remember my dentist is Tuesday"},
@@ -365,6 +408,69 @@ def test_on_a_gateway_the_prompt_names_no_one(home, tmp_path):
     _, p = make_manager(tmp_path, platform="telegram", user_name="whoever-built-the-agent")
     block = p.system_prompt_block()
     assert "You are working with" not in block and "Several people may talk to you here" in block
+
+
+# -- the owner's own surfaces, and where several parties share a session -------------
+
+@pytest.mark.parametrize("platform", ["desktop", "acp"])
+def test_the_desktop_chat_and_an_editor_are_the_owners_own_sessions(home, tmp_path, platform):
+    # Hermes's Desktop chat panel runs as "desktop", an editor's session (ACP) as "acp".
+    home.setenv("INFINO_AUTHOR", "dana")
+    m, p = make_manager(tmp_path, platform=platform)
+    assert call(m, "infino_remember", content="my dentist is on Tuesday", scope="personal") == {
+        "ok": True, "scope": "personal"}
+    assert "[personal] my dentist is on Tuesday" in p.prefetch("dentist")
+    assert PERSONAL_SEARCH_TOOL in {s["name"] for s in p.get_tool_schemas()}
+    assert call(m, PERSONAL_SEARCH_TOOL, query="dentist")["ok"] is True
+    assert "You are working with dana." in p.system_prompt_block()
+    assert not (config.state_dir(tmp_path) / provider_mod.GATEWAY_MARK).exists()
+
+
+def test_a_scheduled_jobs_rows_are_its_owners(home, tmp_path):
+    home.setenv("INFINO_AUTHOR", "dana")
+    m, _ = make_manager(tmp_path, platform="cron", agent_context="cron", session_id=CRON_SESSION)
+    assert call(m, "infino_remember", content="the weekly report ran")["ok"]
+    [row] = local_rows(tmp_path, tables.MEMORY)
+    assert row["author"] == "dana"
+    # A job is the owner's own: it never marks the profile as answering a gateway.
+    assert not (config.state_dir(tmp_path) / provider_mod.GATEWAY_MARK).exists()
+
+
+def test_a_gateway_marks_the_profile_with_its_platform(home, tmp_path):
+    make_manager(tmp_path, platform="telegram")
+    make_manager(tmp_path, platform="slack", session_id="s2")
+    make_manager(tmp_path, platform="telegram", session_id="s3")
+    assert (config.state_dir(tmp_path) / provider_mod.GATEWAY_MARK).read_text().split() == ["telegram", "slack"]
+
+
+@pytest.mark.parametrize("platform", ["bot_room", "a2a"])
+def test_a_group_chat_room_or_another_profiles_turn_keeps_out_personal_memory(home, tmp_path, platform):
+    # A hosted Group Chat room ("bot_room") and a turn another profile forwards
+    # ("a2a") have several parties, even on a profile that is one person's.
+    home.setenv("INFINO_PERSONAL_PROFILE", "on")
+    m, p = make_manager(tmp_path, platform=platform)
+    p._backend.append(tables.MEMORY, [{"content": "dentist on Tuesday", "scope": "personal", "author": "dana"}])
+    assert "dentist" not in p.prefetch("dentist")
+    assert PERSONAL_SEARCH_TOOL not in {s["name"] for s in p.get_tool_schemas()}
+    assert call(m, PERSONAL_SEARCH_TOOL, query="dentist")["ok"] is False
+    assert call(m, "infino_remember", content="my bank PIN is 1234", scope="personal")["ok"] is False
+    p.on_memory_write("add", "user", "Prefers short answers")  # Hermes's USER.md, written in the room
+    p._drain()
+    assert [r["content"] for r in personal_rows(tmp_path)] == ["dentist on Tuesday"]
+    assert local_rows(tmp_path, tables.MEMORY) == []
+    assert "no personal memory is kept here" in p.system_prompt_block()
+
+
+def test_a_switched_sessions_traces_carry_the_owner(home, tmp_path):
+    home.setenv("INFINO_AUTHOR", "dana")
+    m, _ = make_manager(tmp_path, agent_identity="ops", session_id="s1")
+    hooks = hook_ctx()
+    m.on_session_switch("s1-branch", parent_session_id="s1", reset=False, reason="branch")
+    hooks["post_api_request"](session_id="s1-branch", turn_id="t1", model="m")
+    hooks["on_session_end"](session_id="s1-branch")
+    assert wait_for(lambda: len(local_rows(tmp_path, tables.TRACES)) == 1)
+    [row] = local_rows(tmp_path, tables.TRACES)
+    assert (row["author"], row["profile"]) == ("dana", "ops")
 
 
 # -- one profile answering several people over DMs ---------------------------------

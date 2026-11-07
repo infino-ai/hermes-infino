@@ -38,7 +38,13 @@ first.
                              delivered into, are personal the same way
 
 A variable that is set wins over the sign-in, so a deployment's `.env` is
-never overridden by a file on the machine.
+never overridden by a file on the machine. The sign-in's URL and personal
+database go with its key, so they apply only when the key in use is the
+sign-in's: another key, from the config block or the environment, is never
+sent to the sign-in's platform, and never writes into its personal database.
+
+A personal database that is the team database counts as none: personal rows
+would land in the team's tables, where everyone reads them.
 """
 
 from __future__ import annotations
@@ -84,6 +90,13 @@ ON_VALUES = ("on", "true", "yes", "1")
 JOBS_SEPARATOR = ","
 # A `${VAR}` reference Hermes left as written: its variable is not set.
 UNRESOLVED_REF = re.compile(r"^\$\{[^}]*\}$")
+# Hermes reads its config as YAML 1.1, where a bare on, off, yes, no, true or
+# false is a boolean: each reads as the setting it says.
+BOOLEAN_SETTINGS = {True: "on", False: "off"}
+# Where a setting came from, as `hermes infino status` names it.
+FROM_CONFIG = "config"
+FROM_ENVIRONMENT = "environment"
+FROM_SIGN_IN = "sign-in"
 
 # The plugin's state under the profile's home: the local database, the
 # sign-in, the queue of cloud writes not yet made, and the push's progress.
@@ -95,6 +108,10 @@ CREDENTIALS_MODE = 0o600
 # memory. Hermes keeps its home owner-only too, but not in a container
 # (unless HERMES_HOME_MODE says so), where a data directory is often shared.
 PRIVATE_DIR_MODE = 0o700
+
+# The (home, name) of each personal database already warned about for being
+# the team database: settings load on every turn, and one warning says it.
+_warned_personal_is_team: set[tuple[str, str]] = set()
 
 
 def make_private_dir(path: Path) -> None:
@@ -115,8 +132,14 @@ def state_dir(home_dir: Optional[Path] = None) -> Path:
 
 
 def _set(value) -> str:
-    """`value` as a setting, or "" when it is empty or an unresolved `${VAR}`."""
-    value = str(value or "").strip()
+    """`value` as a setting, or "" when it is missing, empty or an unresolved
+    `${VAR}`. A YAML boolean or number from the config block is the setting
+    it was written as (`off` is "off", `0` is "0"), never unset."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        value = BOOLEAN_SETTINGS[value]
+    value = str(value).strip()
     return "" if UNRESOLVED_REF.match(value) else value
 
 
@@ -149,10 +172,15 @@ def tools_env(server: str, home_dir: Path) -> dict:
     return env if isinstance(env, dict) else {}
 
 
+def credentials_path(home_dir: Optional[Path] = None) -> Path:
+    """Where the profile's sign-in is kept."""
+    return state_dir(home_dir) / CREDENTIALS_FILE
+
+
 def read_credentials(home_dir: Optional[Path] = None) -> dict:
     """The profile's sign-in, or {} when it has none (or it is unreadable)."""
     try:
-        data = json.loads((state_dir(home_dir) / CREDENTIALS_FILE).read_text())
+        data = json.loads(credentials_path(home_dir).read_text())
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -160,7 +188,7 @@ def read_credentials(home_dir: Optional[Path] = None) -> dict:
 
 def write_credentials(creds: dict, home_dir: Optional[Path] = None) -> Path:
     """Store the sign-in with owner-only permissions; returns its path."""
-    path = state_dir(home_dir) / CREDENTIALS_FILE
+    path = credentials_path(home_dir)
     make_private_dir(path.parent)
     tmp = path.with_suffix(".tmp")
     # A file left by a crash keeps its own mode through os.open: start a new one.
@@ -197,6 +225,16 @@ class Settings:
         return bool(self.api_key and self.team_database)
 
 
+def _warn_personal_is_team(home_dir: Path, name: str) -> None:
+    """Say once per profile that its personal database is the team's, so none is used."""
+    seen = (str(home_dir), name)
+    if seen in _warned_personal_is_team:
+        return
+    _warned_personal_is_team.add(seen)
+    logger.warning("infino: the personal database '%s' is the team database, so none is used: what is personal "
+                   "stays on this machine. Name another with %s, or sign in again.", name, PERSONAL_DB_ENV)
+
+
 def load(home_dir: Optional[Path] = None, *, from_config: bool = True) -> Settings:
     """This profile's settings. `from_config=False` skips the config block: the
     tools' launcher is started with that block as its environment already, and
@@ -207,19 +245,27 @@ def load(home_dir: Optional[Path] = None, *, from_config: bool = True) -> Settin
     block = tools_env(server, home_dir) if from_config else {}
 
     def pick(env_name: str, cred_key: str = "") -> tuple[str, str]:
-        for value, where in ((_set(block.get(env_name)), "config"), (_read(env_name), "environment"),
-                             (_set(creds.get(cred_key)) if cred_key else "", "sign-in")):
+        for value, where in ((_set(block.get(env_name)), FROM_CONFIG), (_read(env_name), FROM_ENVIRONMENT),
+                             (_set(creds.get(cred_key)) if cred_key else "", FROM_SIGN_IN)):
             if value:
                 return value, where
         return "", ""
 
     api_key, key_from = pick(KEY_ENV, "api_key")
     team_database, team_from = pick(TEAM_DB_ENV, "team_database")
+    # The sign-in's URL and personal database belong to its key. With another
+    # key (a fleet's), they would send that key to the sign-in's platform, or
+    # put that account's personal rows in the sign-in's database.
+    own_key = bool(api_key) and api_key == _set(creds.get("api_key"))
+    personal_database = pick(PERSONAL_DB_ENV, "personal_database" if own_key else "")[0]
+    if personal_database and personal_database == team_database:
+        _warn_personal_is_team(home_dir, personal_database)
+        personal_database = ""
     return Settings(
         api_key=api_key,
         team_database=team_database,
-        personal_database=pick(PERSONAL_DB_ENV, "personal_database")[0] or None,
-        url=pick(URL_ENV, "url")[0] or DEFAULT_URL,
+        personal_database=personal_database or None,
+        url=pick(URL_ENV, "url" if own_key else "")[0] or DEFAULT_URL,
         author=pick(AUTHOR_ENV)[0],
         mcp_server=server,
         home=home_dir,

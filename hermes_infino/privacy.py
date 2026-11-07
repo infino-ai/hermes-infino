@@ -7,10 +7,13 @@ personal memory carries the private text in its arguments - `infino_remember`
 with scope "personal", or Hermes's own `memory` tool on its `user` target
 (USER.md) - so the text is withheld from those rows: the call is kept, with
 WITHHELD in place of the text, and so is its result, which can echo the
-entries.
+entries. A call that reads the person's own database (`infino_personal_search`)
+is withheld the same way: what it asked, and all it answered.
 
 What a person says in a conversation is the conversation, and is kept as
-said; this covers the memory written from it.
+said; this covers the memory written from it. What memory recalled for a
+turn is not said by anyone: Hermes keeps a multimodal turn's recall in the
+user message itself, and a message's text leaves it out (`message_text`).
 
 Personal transcripts. A session's whole conversation and traces are
 personal, and go to the person's own database (or stay on this machine)
@@ -26,7 +29,12 @@ instead of the team's, when:
   (the backend sees that its earlier turns were kept personal);
 - a personal job's output was posted into a group chat (`deliver: room:<id>`):
   Hermes shows the post in a member's turn, labelled with the job's name. The
-  member's own profile has to list the job.
+  member's own profile has to list the job;
+- a personal job's output was noted into a local chat (`deliver: local:<chat>`,
+  under its "Cronjob Response" header) or handed to a profile's Bot Chat as a
+  turn (`deliver: bot-chat`). The receiving profile has to list the job;
+- the session read the person's own database (`infino_personal_search`): what
+  it read is in the session now, so the session is personal from then on.
 
 Everything else stays the team's, as before. Which job a run belongs to is
 Hermes's to say (`cron.execution_identity`); a job is named by its id or its
@@ -43,10 +51,12 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
-# What stands in for the text of a personal memory.
-WITHHELD = "[personal memory, kept out of the team's tables]"
-# The text fields of the memory tools' arguments.
-TEXT_FIELDS = ("content", "old_text", "new_text")
+# What stands in for personal text: a personal memory's, or a personal search's.
+WITHHELD = "[personal, kept out of the team's tables]"
+# The text fields of the memory tools' arguments, and of the personal search's.
+TEXT_FIELDS = ("content", "old_text", "new_text", "query")
+# The tools that read the person's own database: every call of one is personal.
+PERSONAL_READ_TOOLS = ("infino_personal_search",)
 
 # How Hermes labels a scheduled job's output when it mirrors it into a chat's
 # transcript: a user message whose first line is "[Cron delivery: <job>]", the
@@ -61,6 +71,25 @@ DELIVERY_SUFFIX = "]"
 # label too; that only ever makes the session personal, never the team's.
 ROOM_DELIVERY_PREFIX = 'Scheduled job "'
 ROOM_DELIVERY_MARK = '" (automated post, not the user):'
+# How Hermes notes a scheduled job's output into a local chat's history
+# (`deliver: local:<chat>`, cron/scheduler_delivery.py): its output wrapped
+# under a line "Cronjob Response: <job>", the job named by its name (or its id
+# when it has none), and the job's id on the next line, "(job_id: <id>)".
+# Without the wrapper (`cron.wrap_response: false`) nothing names the job.
+LOCAL_DELIVERY_PREFIX = "Cronjob Response: "
+LOCAL_DELIVERY_ID = re.compile(r"^\(job_id: (.+)\)$")
+# How Hermes hands a scheduled job's output to a profile's Bot Chat
+# (`deliver: bot-chat`) as an inbound turn: its first line is
+# `[Cronjob "<job>" output — scheduled job, not the user. Review it, ...]`,
+# the job named by its name, or its id when it has none.
+BOT_CHAT_DELIVERY_PREFIX = '[Cronjob "'
+BOT_CHAT_DELIVERY_MARK = '" output — scheduled job, not the user.'
+# How Hermes fences the memory it recalled for a turn (agent/memory_context.py).
+# A multimodal (list) user message carries the turn's injected context - the
+# fenced recall, then any plugin's context - as a text part of its own, kept
+# with the message (agent/turn_context.py); a string message keeps it in a
+# sidecar a provider is never handed.
+RECALL_FENCE = "<memory-context>"
 # A cron run's session id when Hermes's scheduler names it: cron_<job id>_<date>_<time>.
 CRON_SESSION = re.compile(r"^cron_(.+)_\d{8}_\d{6}$")
 # Hermes's record of the scheduled job the running code belongs to. Read only
@@ -82,7 +111,10 @@ def _args(arguments: Any) -> Any:
 
 
 def is_personal_call(tool_name: str, arguments: Any) -> bool:
-    """Whether a tool call writes, changes or deletes personal memory."""
+    """Whether a tool call writes, changes or deletes personal memory, or
+    reads the person's own database."""
+    if tool_name in PERSONAL_READ_TOOLS:
+        return True
     args = _args(arguments)
     if not isinstance(args, dict):
         return False
@@ -98,6 +130,8 @@ def withhold(tool_name: str, arguments: Any) -> Any:
     came in (JSON text or a dict); others unchanged."""
     if not is_personal_call(tool_name, arguments):
         return arguments
+    if not isinstance(_args(arguments), dict):  # nothing to tell apart: all of it
+        return WITHHELD
     args = dict(_args(arguments))
     for field_name in TEXT_FIELDS:
         if field_name in args:
@@ -108,10 +142,19 @@ def withhold(tool_name: str, arguments: Any) -> Any:
     return json.dumps(args) if isinstance(arguments, str) else args
 
 
+def _recalled(part: dict) -> bool:
+    """Whether a part of a message is the context Hermes added for the turn,
+    which starts with the recall's fence (RECALL_FENCE)."""
+    text = part.get("text")
+    return part.get("type") == "text" and isinstance(text, str) and text.startswith(RECALL_FENCE)
+
+
 def message_text(content: Any) -> str:
-    """A message's text: the string, or its text parts joined."""
+    """A message's text: the string, or its text parts joined, without the part
+    Hermes adds to a multimodal turn for its recall: that is what memory -
+    personal memory included - showed the model, not what anyone said."""
     if isinstance(content, list):
-        return "\n".join(p.get("text", "") for p in content if isinstance(p, dict))
+        return "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and not _recalled(p))
     return content if isinstance(content, str) else ""
 
 
@@ -152,21 +195,29 @@ def _job_ref(ref: str) -> tuple[str, str]:
 
 def delivered_jobs(messages: Iterable[dict]) -> list[str]:
     """The jobs (as their labels name them) whose output Hermes delivered into
-    these messages: mirrored into a chat, or posted into a group chat. A label
-    may begin any line: Hermes merges consecutive user messages, so a delivery
-    can share one with what the person wrote next, and a group chat member's
-    turn lists the room's new messages one per line."""
+    these messages: mirrored into a chat, posted into a group chat, noted into
+    a local chat (named by its name and by its id), or handed to a Bot Chat. A
+    label may begin any line: Hermes merges consecutive user messages, so a
+    delivery can share one with what the person wrote next, and a group chat
+    member's turn lists the room's new messages one per line."""
     found = []
     for m in messages or ():
         if not isinstance(m, dict) or m.get("role") != "user":
             continue
-        for line in message_text(m.get("content")).splitlines():
-            line = line.strip()
+        lines = [line.strip() for line in message_text(m.get("content")).splitlines()]
+        for i, line in enumerate(lines):
             if line.startswith(DELIVERY_PREFIX) and line.endswith(DELIVERY_SUFFIX):
                 found.append(line[len(DELIVERY_PREFIX):-len(DELIVERY_SUFFIX)].strip())
             elif line.startswith(ROOM_DELIVERY_PREFIX) and ROOM_DELIVERY_MARK in line:
                 found.append(line[len(ROOM_DELIVERY_PREFIX):line.index(ROOM_DELIVERY_MARK)].strip())
-    return found
+            elif line.startswith(BOT_CHAT_DELIVERY_PREFIX) and BOT_CHAT_DELIVERY_MARK in line:
+                found.append(line[len(BOT_CHAT_DELIVERY_PREFIX):line.index(BOT_CHAT_DELIVERY_MARK)].strip())
+            elif line.startswith(LOCAL_DELIVERY_PREFIX):
+                found.append(line[len(LOCAL_DELIVERY_PREFIX):].strip())
+                job_id = LOCAL_DELIVERY_ID.match(lines[i + 1]) if i + 1 < len(lines) else None
+                if job_id:
+                    found.append(job_id.group(1).strip())
+    return [label for label in found if label]
 
 
 @dataclass
@@ -193,11 +244,27 @@ def _session(session_id: str) -> _Session:
     return s
 
 
+def _touch(session_id: str) -> Optional[_Session]:
+    """A session's record, kept among the latest with the sessions that
+    started it (call with the lock held): a parent waiting on its subagent
+    makes no calls of its own, and its standing decides the subagent's. None
+    when the session has no record."""
+    s = _sessions.get(session_id)
+    session, seen = session_id, set()
+    while session in _sessions and session not in seen:
+        seen.add(session)
+        _sessions.move_to_end(session)
+        session = _sessions[session].parent
+    return s
+
+
 def note_cron_job(session_id: str) -> None:
     """Note the scheduled job a session runs, read in its own context (a
-    model or tool call of the run); once per session."""
+    model or tool call of the run); once per session. Every call keeps the
+    session's record among the latest, so a session still running is never
+    the one forgotten."""
     with _sessions_lock:
-        known = _sessions.get(session_id or "")
+        known = _touch(session_id or "")
         if known is not None and known.runs_job:
             return
     job = cron_job(session_id)

@@ -30,8 +30,8 @@ def test_outside_a_gateway_there_is_no_chat(monkeypatch):
     assert chats.current() == chats.NO_CHAT
 
 
-@pytest.mark.parametrize("platform", ["", "cli", "TUI", "local"])
-def test_this_machines_own_sessions_are_never_a_group(monkeypatch, platform):
+@pytest.mark.parametrize("platform", ["", "cli", "TUI", "local", "desktop", "acp", "cron"])
+def test_the_owners_own_sessions_are_never_a_group(monkeypatch, platform):
     in_session(monkeypatch, {**GROUP, "HERMES_SESSION_PLATFORM": platform})
     assert chats.current() == chats.NO_CHAT
 

@@ -282,9 +282,7 @@ class LocalStore:
         ready. `score` is the fused score (or the BM25 score), higher better."""
         db = self._connect()
         cols = [c for c in projection if c != "score"]
-        keyword = db.open_table(tables.MEMORY).bm25_search(
-            tables.MEMORY_TEXT_COLUMN, query, k * FUSION_DEPTH, "or", list(dict.fromkeys(cols + [tables.ROW_ID, "score"]))
-        ).to_pylist()
+        keyword = self.keyword_search(tables.MEMORY, tables.MEMORY_TEXT_COLUMN, query, k * FUSION_DEPTH, cols, db)
         model = embed.ready()
         if model is None or not self.has_vectors():
             return keyword[:k]
@@ -309,6 +307,14 @@ class LocalStore:
             for r in self.query_sql(f"SELECT {select} FROM {tables.MEMORY} WHERE {tables.ROW_ID} IN ({ids})"):
                 rows[r[tables.ROW_ID]] = r
         return [{**rows[i], "score": fused[i]} for i in best if i in rows]
+
+    def keyword_search(self, table: str, column: str, query: str, k: int, projection: list[str], db=None) -> list[dict]:
+        """The `k` best rows of `table` for `query` by BM25 over `column`,
+        with the columns of `projection` and their `row_id` and `score`
+        (higher better). `db` is a connection already open, if any."""
+        cols = [c for c in projection if c != "score"]
+        return (db or self._connect()).open_table(table).bm25_search(
+            column, query, k, "or", list(dict.fromkeys(cols + [tables.ROW_ID, "score"]))).to_pylist()
 
     def query_sql(self, sql: str) -> list[dict]:
         return self._connect().query_sql(sql).to_pylist()

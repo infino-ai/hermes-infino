@@ -1,6 +1,6 @@
 # Infinite recall for Hermes agents
 
-hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that gives your agents a memory that lasts. It stores four things in Infino: memory, conversations, traces and skills. Before each turn it gives the agent the memories that matter for that turn, and with the Infino tools the agent can search everything stored except what's personal.
+hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that gives your agents a memory that lasts. It stores four things in Infino: memory, conversations, traces and skills. Before each turn it gives the agent the memories that matter for that turn, and the agent can search everything stored: the team's data with the Infino tools, and your personal data with `infino_personal_search`, in your own sessions.
 
 Without an account, everything stays on your machine, in databases run by Infino's open source engine.
 
@@ -8,7 +8,7 @@ When you [sign in](#signing-in), everything is kept in Infino Cloud too. Work go
 
 ## What it stores
 
-The plugin keeps four tables in each database.
+The plugin keeps four tables.
 
 **`memory`** holds the entries in Hermes's `MEMORY.md` and `USER.md`, including edits you make by hand, plus whatever the agent saves with `infino_remember`. A shared profile on a gateway keeps no `USER.md` entries. `infino_forget` deletes a memory, even one a teammate's agent saved.
 
@@ -124,11 +124,11 @@ To use another Infino platform, such as staging, add `--url`:
 hermes infino login --url https://api.platform.staging.infino.ai --api-key-file KEY --team-database TEAM --yes
 ```
 
-`login` shows what it will upload and asks before it creates or sends anything. Only a person at a terminal can agree to create an account. With a key someone gave you, `--yes` agrees to the upload. The key is saved in `$HERMES_HOME/infino/credentials.json`, readable only by you.
+`login` shows what it will upload and asks before it creates or sends anything. Only a person at a terminal can agree to create an account. With a key someone gave you, `--yes` agrees to the upload. The key is saved in `$HERMES_HOME/infino/credentials.json`, readable only by you. To sign in again, remove that file first.
 
 Once you're signed in, the plugin uploads what your machine has kept so far, then each new memory, conversation, trace and skill as it happens. Your machine keeps its own copy.
 
-`login` also creates your personal database and prints its name. The name is the team's plus a random suffix, such as `hermes-team-personal-3f9a1c2e`, so it's never shared with anyone. To use it from another machine, sign in there with `--personal-database` and that name. To keep personal data on this machine only, add `--no-personal-database`. If the platform can't create the database, for example because a free plan has reached its database limit, you're still signed in, and personal data stays on your machine.
+`login` also creates your personal database and prints its name. The name is the team's plus a random suffix, such as `hermes-team-personal-3f9a1c2e`, so it's never shared with anyone. To use it from another machine, sign in there with `--personal-database` and that name. To keep personal data on this machine only, add `--no-personal-database`. Your personal database can't be the team database. If it can't be created, for example because your key may not create that database, you're still signed in, and personal data stays on your machine.
 
 A running Hermes picks up the sign-in within half a minute. The Infino tools switch to the cloud when Hermes restarts. Until then they search your machine's copy, which has everything too.
 
@@ -196,6 +196,8 @@ Hermes runs the Infino client as an MCP server, started with `hermes infino mcp`
 - **Not signed in:** `search`, `find`, `sql` and `read`, over the database on your machine.
 - **Signed in:** `ask`, `search`, `find`, `sql` and `join_keys`, over your team's database in the cloud. `ask` is Infino's retrieval agent: give it a question, and it returns the rows that answer it, with where they came from.
 
+The Infino tools search the team database. Your personal data is searched with `infino_personal_search`, a tool of the plugin's own: keyword search over your personal memory, conversations and traces. The agent has it in your own sessions, and on a profile marked personal, but never in a group chat or on a shared profile. Once a session uses it, that session's conversation and traces stay personal. A memory the session saves still follows the memory rule: it's the team's unless it's about one person.
+
 The API key reaches the client through its environment, never its command line. Hermes doesn't pass an MCP server's instructions to the model, so the plugin puts them in the system prompt.
 
 Hermes's tool search, on by default, shows the model only the name and first sentence of each MCP tool until the model asks for more. To give the model the Infino tools' full descriptions up front, turn it off:
@@ -224,7 +226,7 @@ mcp_servers:
 
 With Hermes's [Remote Config](https://github.com/NousResearch/hermes-agent/pull/122509) (Hermes 0.22.6 and later, turned on with `HERMES_CONFIG_BACKEND=remote`), these settings come from the config service instead of a file. An administrator sets the team database once, and every agent on the team starts with it. Remote Config won't store a key written out in full, so keep `INFINO_API_KEY` as a `${INFINO_API_KEY}` reference and put the key in each profile's `.env`. `hermes infino status` shows where the settings came from.
 
-A profile set up this way has no personal database unless you name one with `INFINO_PERSONAL_DATABASE`. Without one, its personal memory and personal work stay on that machine.
+A profile set up this way has no personal database unless you name one with `INFINO_PERSONAL_DATABASE`, even if it once ran `login`. Without one, its personal memory and personal work stay on that machine.
 
 ## Settings
 
@@ -236,11 +238,13 @@ Each setting comes from the first of these that has it:
 
 The config block comes first because Hermes starts the Infino tools with it as their environment, so the plugin and its tools always use the same team. A `${VAR}` reference to a variable that isn't set counts as not set.
 
+The sign-in's URL and personal database go with its key. They apply only when the key in use is the sign-in's, so another key, from the config block or `.env`, never goes to the sign-in's platform or writes to its personal database.
+
 | Variable | What it is |
 | --- | --- |
 | `INFINO_API_KEY` | The Infino API key for this person or bot |
 | `INFINO_TEAM_DATABASE` | The team's database |
-| `INFINO_PERSONAL_DATABASE` | Your own database. `login` creates one. Leave it unset for bots and shared profiles. |
+| `INFINO_PERSONAL_DATABASE` | Your own database. `login` creates one. Leave it unset for bots and shared profiles. If it names the team database, the plugin uses none. |
 | `INFINO_AUTHOR` | Who this profile's messages and memories are from, when Hermes doesn't say. In a chat, the sender is the author. |
 | `INFINO_MCP_SERVER` | The client's name under `mcp_servers` (default `infino`). Environment only, since it names the config block. |
 | `INFINO_URL` | The Infino Cloud URL (default `https://api.platform.infino.ws`) |

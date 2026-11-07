@@ -34,7 +34,11 @@ A person's own database, on this machine and in the cloud, has `PERSONAL`
 of them: their memory, and the conversations and traces kept personal.
 """
 
+import logging
+
 from .client import InfinoClient, InfinoError
+
+logger = logging.getLogger(__name__)
 
 MEMORY = "memory"
 CONVERSATIONS = "conversations"
@@ -122,9 +126,14 @@ SKILLS_SCHEMA = [
 ]
 SKILLS_INDEXES = {"fts": ["description", "content"]}
 
-# `memory` without the embedding column, for an account the platform gives no
-# embedding server (create_table answers 403). Recall is then keyword-only.
+# `memory` without the embedding column, where the platform cannot fill one:
+# a deployment with no embedding server (create_table answers 400), or an
+# account it gives none (403). Recall is then keyword-only.
 MEMORY_SCHEMA_KEYWORD_ONLY = [f for f in MEMORY_SCHEMA if f["name"] != EMBEDDING_COLUMN]
+# The statuses create_table refuses an embedding column with, its message
+# saying "embedding": no embedding server on the deployment, or a worker
+# built without embedding columns (400); none for this account (403).
+NO_EMBEDDING_STATUSES = (400, 403)
 
 TEAM_TABLES = {
     MEMORY: (MEMORY_SCHEMA, MEMORY_INDEXES),
@@ -156,7 +165,8 @@ class OutdatedTable(Exception):
 
 def ensure_all(client: InfinoClient, database: str, personal: bool = False) -> None:
     """Create the database and its tables unless they exist. Where the
-    account has no embedding server, `memory` is created keyword-only.
+    platform cannot fill an embedding column (no embedding server on the
+    deployment, or none for the account), `memory` is created keyword-only.
 
     A table that exists must have every column this version writes: a row
     pushed into a `memory` without its `chat` would read as the whole team's
@@ -170,8 +180,10 @@ def ensure_all(client: InfinoClient, database: str, personal: bool = False) -> N
         try:
             client.ensure_table(database, table, schema, indexes)
         except InfinoError as e:
-            if table != MEMORY or e.status != 403 or "embedding" not in e.message:
+            if table != MEMORY or e.status not in NO_EMBEDDING_STATUSES or "embedding" not in e.message:
                 raise
+            logger.warning("infino: %s.%s is made without its embedding column, so recall there is "
+                           "keyword-only: %s", database, MEMORY, e)
             client.ensure_table(database, MEMORY, MEMORY_SCHEMA_KEYWORD_ONLY, MEMORY_INDEXES)
         have = set(client.column_names(database, table))
         missing = [f for f in schema if f["type"] != "embedding" and f["name"] not in have]

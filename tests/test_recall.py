@@ -188,4 +188,4 @@ def test_personal_memory_shows_only_to_its_person(team_local, personal_local):
     ({}, (0, ""), False),
 ])
 def test_a_row_is_past_a_mark_in_commit_order(row, mark, past):
-    assert recall._past(row, mark) is past
+    assert recall.past(row, mark) is past

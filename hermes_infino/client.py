@@ -60,11 +60,8 @@ class InfinoClient:
     # -- databases and tables ------------------------------------------------
 
     def ensure_database(self, name: str) -> None:
-        """Create the database unless it already exists.
-
-        The list is read first: an account at its plan's database limit is
-        refused the create (403) even for a name it already has.
-        """
+        """Create the database unless it already exists. The list is read
+        first, so one that exists is used without asking to create it."""
         if name in self.list_databases():
             return
         try:

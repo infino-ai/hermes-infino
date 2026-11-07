@@ -86,7 +86,7 @@ def _visible(row: dict, chat: chats.Chat) -> bool:
     return str(row.get(tables.CHAT) or "") in chat.visible
 
 
-def _past(row: dict, mark: Mark) -> bool:
+def past(row: dict, mark: Mark) -> bool:
     """Whether a local row was stored after `mark` (so the cloud lacks it)."""
     if mark is None:
         return True
@@ -143,7 +143,7 @@ class Recaller:
         if cloud_rows is not None:
             seen = {str(r.get(tables.ROW_ID)) for r in cloud}
             mark = src.mark() if src.mark else None
-            local = [r for r in local if str(r.get(tables.ROW_ID)) not in seen and _past(r, mark)]
+            local = [r for r in local if str(r.get(tables.ROW_ID)) not in seen and past(r, mark)]
         return cloud + local
 
     def recall(self, query: str, chat: chats.Chat = chats.NO_CHAT,

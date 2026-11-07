@@ -22,14 +22,21 @@ ROWS = 7
 # A settle window no row in a test is old enough for.
 LONG_SETTLE_MS = 3_600_000
 ANOTHER_TEAM_DB = "team-other"
+# A database deleted since a forget for it was queued.
+GONE_DB = "deleted-since"
 
 
-def make_mirror(tmp_path, settings) -> Mirror:
+def local_mirror(tmp_path, settings) -> Mirror:
+    """A mirror over the profile's local tables, before any cloud table is made."""
     state = config.state_dir(tmp_path)
     team, personal = LocalStore.under(state), LocalStore.under(state, PERSONAL_DB_DIR)
     team.ensure_tables(with_vectors=False)
     personal.ensure_tables(with_vectors=False, only=tables.PERSONAL)
-    m = Mirror(settings, team, personal)
+    return Mirror(settings, team, personal)
+
+
+def make_mirror(tmp_path, settings) -> Mirror:
+    m = local_mirror(tmp_path, settings)
     m.ensure_cloud_tables()
     return m
 
@@ -70,6 +77,52 @@ def test_personal_transcripts_go_to_the_personal_database_only(home, platform, t
     assert platform.rows(TEAM_DB, tables.TRACES) == []
     assert [r["content"] for r in platform.rows(PERSONAL_DB, tables.CONVERSATIONS)] == ["private"]
     assert [r["result"] for r in platform.rows(PERSONAL_DB, tables.TRACES)] == ["private"]
+
+
+def test_a_personal_database_that_cannot_be_made_holds_up_only_its_own_rows(home, platform, tmp_path):
+    platform.refused_databases = {PERSONAL_DB}  # a key limited to other databases
+    m = local_mirror(tmp_path, sign_in(tmp_path, platform, personal_database=PERSONAL_DB))
+    tables.ensure_all(m.client, TEAM_DB)
+    m.client.append(TEAM_DB, tables.MEMORY, [{tables.ROW_ID: "old", "content": "forgotten"}])
+    m.forget(tables.MEMORY, TEAM_DB, ["old"])
+    m.forget(tables.MEMORY, PERSONAL_DB, ["mine-old"])
+    m.local.append(tables.CONVERSATIONS, conversation_rows(1))
+    m.personal.append(tables.MEMORY, [{"content": "mine", "scope": "personal"}])
+    with pytest.raises(InfinoError):
+        m.sync(wait=True)
+    # The team's rows and forgets go; the personal ones wait, and the sync says why.
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.CONVERSATIONS)] == ["m0"]
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    assert PERSONAL_DB not in platform.databases and "403" in m.last_error()
+    assert PERSONAL_DB in (m.dir / mirror.FORGET_FILE).read_text()
+    # Once the personal database can be made, its rows and forgets go too.
+    platform.refused_databases = set()
+    m._tables_failed_at = 0.0  # try again now, not after ENSURE_RETRY_S
+    m.sync(wait=True)
+    assert [r["content"] for r in platform.rows(PERSONAL_DB, tables.MEMORY)] == ["mine"]
+    assert m.last_error() == "" and (m.dir / mirror.FORGET_FILE).read_text() == ""
+
+
+def test_a_failed_push_is_raised_before_a_database_out_of_reach(home, platform, tmp_path):
+    # Raising the database out of reach would hide that the team's rows did not go either.
+    platform.refused_databases = {PERSONAL_DB}
+    m = local_mirror(tmp_path, sign_in(tmp_path, platform, personal_database=PERSONAL_DB))
+    m.local.append(tables.MEMORY, [{"content": "for the team"}])
+    platform.failed_appends = 1
+    with pytest.raises(InfinoError) as raised:
+        m.sync(wait=True)
+    assert raised.value.status == 500 and "HTTP 500" in m.last_error()
+    assert m.waiting()[PERSONAL_DB].status == 403
+    assert list(m.waiting()) == [PERSONAL_DB]
+
+
+def test_a_platform_with_no_embedding_server_gets_a_keyword_only_memory(home, platform, tmp_path):
+    platform.no_embedding_server = True
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform))
+    assert tables.EMBEDDING_COLUMN not in m.client.column_names(TEAM_DB, tables.MEMORY)
+    m.local.append(tables.MEMORY, [{"content": "found by keyword"}])
+    m.sync(wait=True)
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["found by keyword"]
 
 
 def test_without_a_personal_database_personal_transcripts_go_nowhere(m, platform):
@@ -406,6 +459,31 @@ def test_a_failed_forget_stays_queued(m, platform):
     assert "1" in (m.dir / mirror.FORGET_FILE).read_text()
     m.sync(wait=True)
     assert platform.rows(TEAM_DB, tables.MEMORY) == []
+
+
+def test_a_forget_the_cloud_keeps_failing_holds_up_none_after_it(m, platform):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "1", "content": "a"}, {tables.ROW_ID: "2", "content": "b"}])
+    m.sync(wait=True)
+    m.forget(tables.MEMORY, TEAM_DB, ["1"])
+    m.forget(tables.MEMORY, TEAM_DB, ["2"])
+    platform.failed_deletes = 1  # the first forget's delete fails
+    with pytest.raises(InfinoError):
+        m.sync(wait=True)
+    assert [r[tables.ROW_ID] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["1"]
+    queued = (m.dir / mirror.FORGET_FILE).read_text()
+    assert '"1"' in queued and '"2"' not in queued
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+
+
+def test_a_forget_whose_database_is_gone_is_dropped_and_holds_up_none_after_it(m, platform):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "1", "content": "m"}])
+    m.sync(wait=True)
+    m.forget(tables.MEMORY, GONE_DB, ["x"])  # the cloud answers 404: nothing is left there to delete
+    m.forget(tables.MEMORY, TEAM_DB, ["1"])
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    assert (m.dir / mirror.FORGET_FILE).read_text() == ""
 
 
 def test_a_forget_goes_to_the_database_it_names(home, platform, tmp_path):
