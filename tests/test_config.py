@@ -13,6 +13,8 @@ from pathlib import Path
 import hermes_constants
 import pytest
 import yaml
+from agent.secret_scope import (reset_multiplex_context, reset_secret_scope, set_multiplex_context,
+                                set_secret_scope)
 from hermes_cli import memory_setup
 from tools.mcp_tool_config import _load_mcp_config
 from tools.mcp_tool_transport import _stdio_launch
@@ -21,7 +23,7 @@ from hermes_infino import config
 from hermes_infino.backend import Backend
 from hermes_infino.client import DEFAULT_URL
 
-from .helpers import TEAM_DB, write_tools_setting
+from .helpers import PERSONAL_DB, TEAM_DB, sign_in, write_tools_setting
 
 REPO = Path(__file__).resolve().parent.parent
 PLUGIN_YAML = REPO / "hermes_infino" / "plugin.yaml"
@@ -95,6 +97,16 @@ def test_a_tools_block_without_env_reads_nothing(home, tmp_path):
     assert config.load(tmp_path).team_database == ""
 
 
+def test_a_fleet_name_in_the_tools_block_wins_for_the_plugin_and_its_tools(home, tmp_path):
+    write_tools_setting(tmp_path, f"INFINO_FLEET_TEAM_DATABASE: {TEAM_DB}")
+    home.setenv("INFINO_TEAM_DATABASE", "hermes-team")  # left in .env by an earlier setup
+    s = config.load(tmp_path)
+    assert (s.team_database, s.source) == (TEAM_DB, "config")
+    # The tools find it in their environment, where Hermes hands them the block.
+    home.setenv("INFINO_FLEET_TEAM_DATABASE", TEAM_DB)
+    assert config.load(tmp_path, from_config=False).team_database == TEAM_DB
+
+
 def test_the_tools_block_names_the_author_too(home, tmp_path):
     write_config(tmp_path, {"mcp_servers": {"infino": {"command": "x", "env": {"INFINO_AUTHOR": "deploy-bot"}}}})
     home.setenv("INFINO_AUTHOR", "someone-else")
@@ -158,6 +170,38 @@ def test_the_home_follows_hermes_context_local_profile(home, tmp_path):
     finally:
         hermes_constants._HERMES_HOME_OVERRIDE.reset(token)
     assert config.load().team_database == ""
+
+
+def served(profile_home: Path, secrets: dict, multiplexed: bool):
+    """Run `config.load` for `profile_home` as Hermes runs a turn it serves for
+    that profile: its secret scope bound (the profile's own .env), on a gateway
+    serving several profiles (`multiplexed`) or for the process's own profile."""
+    multiplex = set_multiplex_context(multiplexed)
+    scope = set_secret_scope(secrets, profile_home=str(profile_home))
+    try:
+        return config.load(profile_home)
+    finally:
+        reset_secret_scope(scope)
+        reset_multiplex_context(multiplex)
+
+
+def test_a_profile_a_gateway_serves_never_reads_the_launch_profiles_settings(home, platform, tmp_path):
+    # The launch profile (Alice's) .env, loaded into the process's environment.
+    for name, value in (("INFINO_API_KEY", "alice-key"), ("INFINO_TEAM_DATABASE", "alice-team"),
+                        ("INFINO_PERSONAL_DATABASE", "alice-personal"), ("INFINO_PERSONAL_PROFILE", "on")):
+        home.setenv(name, value)
+    bob = tmp_path / "bob"  # a shared profile the same gateway serves, signed in with its own key
+    bob.mkdir()
+    sign_in(bob, platform, personal_database=PERSONAL_DB)
+    s = served(bob, {}, multiplexed=True)
+    assert (s.api_key, s.team_database, s.personal_database, s.personal_profile) == ("k", TEAM_DB, PERSONAL_DB, False)
+    # Its own .env, through the scope, is read as ever.
+    assert served(bob, {"INFINO_TEAM_DATABASE": "bob-team"}, multiplexed=True).team_database == "bob-team"
+
+
+def test_the_launch_profiles_own_turn_still_reads_its_environment(home, tmp_path):
+    home.setenv("INFINO_TEAM_DATABASE", "alice-team")  # set for the process, not in a scope
+    assert served(tmp_path, {}, multiplexed=False).team_database == "alice-team"
 
 
 def test_team_skills_are_on_unless_turned_off(home, tmp_path):
@@ -263,6 +307,13 @@ def test_a_personal_database_that_is_the_team_database_is_none(home, tmp_path, m
 def test_every_setting_is_declared_to_hermes():
     declared = {e["name"] for e in yaml.safe_load(PLUGIN_YAML.read_text())["optional_env"]}
     assert declared == {f["env_var"] for f in config.config_schema()}
+
+
+def test_no_fleet_name_is_a_setting_hermes_writes_into_env():
+    # `hermes memory setup` and the plugin's installer write declared settings into .env.
+    declared = {e["name"] for e in yaml.safe_load(PLUGIN_YAML.read_text())["optional_env"]}
+    assert not declared & set(config.FLEET_NAMES.values())
+    assert not {f["env_var"] for f in config.config_schema()} & set(config.FLEET_NAMES.values())
 
 
 def test_the_key_is_the_only_secret():

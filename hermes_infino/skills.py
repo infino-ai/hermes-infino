@@ -6,9 +6,11 @@ Hermes registers a plugin's skill from a SKILL.md on disk, at plugin load
 version of each skill in the table is written under the profile's home
 (`cache/infino/team-skills/<team>/<name>/SKILL.md`, a folder per platform and
 team database) and registered from there; a skill gone from the table loses
-its copy. A skill published later loads in the next session. Hermes loads a
-plugin's skill only under a name of letters, digits, `-` and `_`, so no other
-name is published.
+its copy, unless another process's load (the gateway's and a CLI's share a
+profile) wrote that copy after this one asked: its answer is the newer one,
+and it registered the copy. A skill published later loads in the next
+session. Hermes loads a plugin's skill only under a name of letters, digits,
+`-` and `_`, so no other name is published.
 
 Every Hermes start waits on this, so the platform gets LOAD_TIMEOUT_S; when
 it does not answer, the copies written by the last load of the same team are
@@ -21,14 +23,16 @@ came from, and INFINO_TEAM_SKILLS=off keeps a profile to its own skills.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
 import re
 import shutil
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 from . import backend, config, tables
 
@@ -43,8 +47,13 @@ logger = logging.getLogger(__name__)
 CACHE_DIR = Path("cache") / "infino" / "team-skills"
 # Hex characters of the hash naming each team's folder under CACHE_DIR.
 TEAM_KEY_CHARS = 16
-# Beside each cached SKILL.md: its description and who published it.
+# Beside each cached SKILL.md: its description, who published it, and when a
+# load wrote it (nanoseconds, WRITTEN_KEY).
 ABOUT_FILE = "infino.json"
+WRITTEN_KEY = "written_ns"
+# Beside each team's folder of copies, the file a load locks while it removes
+# and writes copies, so that no load reads another's copy half written.
+LOCK_SUFFIX = ".lock"
 # Hermes's skill names: what `register_skill` accepts.
 SKILL_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 # Seconds the load waits on the platform before the session starts with the
@@ -102,6 +111,7 @@ def register_team_skills(ctx, settings: Optional[config.Settings] = None, home: 
     key = str(root.resolve())
     if time.monotonic() - _loaded_at.get(key, -REFRESH_S) < REFRESH_S:
         return _register_cached(ctx, root)
+    asked_ns = time.time_ns()  # a copy written after this is from an answer newer than this load's
     try:
         rows = backend.for_settings(settings).query(
             f"SELECT name, description, content, author, created_ms FROM {tables.SKILLS} "
@@ -111,23 +121,52 @@ def register_team_skills(ctx, settings: Optional[config.Settings] = None, home: 
         return _register_cached(ctx, root)
     _loaded_at[key] = time.monotonic()
     newest = latest(rows)
-    # A skill the table no longer has must not load from its copy next time.
-    for copy in root.iterdir() if root.is_dir() else []:
-        if copy.name not in newest:
-            shutil.rmtree(copy, ignore_errors=True)
-    registered = []
-    for name, row in sorted(newest.items()):
-        try:
-            path = root / name / "SKILL.md"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(str(row["content"]))
-            about = {"description": str(row.get("description") or ""), "author": str(row.get("author") or "")}
-            (path.parent / ABOUT_FILE).write_text(json.dumps(about))
-            ctx.register_skill(name, path, described(about["description"], about["author"]))
-            registered.append(name)
-        except Exception as e:
-            logger.info("infino: team skill %s not registered: %s", name, e)
+    registered: list[str] = []
+    try:
+        with _locked(root):
+            # A skill the table no longer has must not load from its copy next
+            # time; a copy another load wrote since this one asked stays: that
+            # load read a newer answer, and registered the copy.
+            for copy in root.iterdir() if root.is_dir() else []:
+                if copy.name not in newest and _written_ns(copy) < asked_ns:
+                    shutil.rmtree(copy, ignore_errors=True)
+            for name, row in sorted(newest.items()):
+                try:
+                    path = root / name / "SKILL.md"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(str(row["content"]))
+                    about = {"description": str(row.get("description") or ""),
+                             "author": str(row.get("author") or ""), WRITTEN_KEY: time.time_ns()}
+                    (path.parent / ABOUT_FILE).write_text(json.dumps(about))
+                    ctx.register_skill(name, path, described(about["description"], about["author"]))
+                    registered.append(name)
+                except Exception as e:
+                    logger.info("infino: team skill %s not registered: %s", name, e)
+    except OSError as e:  # the folder cannot be locked or read: the copies there stand
+        logger.info("infino: team skills' copies could not be updated: %s", e)
+        return registered or _register_cached(ctx, root)
     return registered
+
+
+@contextmanager
+def _locked(root: Path) -> Iterator[None]:
+    """Hold the lock beside `root` (LOCK_SUFFIX) while the block runs."""
+    root.parent.mkdir(parents=True, exist_ok=True)
+    with open(root.with_suffix(LOCK_SUFFIX), "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def _written_ns(copy: Path) -> int:
+    """When a load wrote `copy` (its ABOUT_FILE says); 0 when it does not say
+    (an earlier version wrote it, or it is not a copy)."""
+    try:
+        return int(json.loads((copy / ABOUT_FILE).read_text()).get(WRITTEN_KEY) or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0
 
 
 def _register_cached(ctx, root: Path) -> list[str]:

@@ -7,7 +7,9 @@ after each batch is accepted. A source is one local table and the one cloud
 database it goes to: each of the team's tables to the team's database, and
 each of the person's own tables (their memory, and the conversations and
 traces kept personal) to their personal database - or nowhere, when they
-have none: nothing personal ever goes to the team's database. The same sync is the push of everything kept
+have none: nothing personal ever goes to the team's database, not even a
+personal memory still in the team's own table (an older version's, before it
+moves out: Backend.ensure_local). The same sync is the push of everything kept
 before sign-up, live mirroring after it, and catching up after an outage, and
 it misses no row whichever process wrote it: a Hermes process that started
 before the sign-up keeps writing the local database, and the next sync from
@@ -38,11 +40,14 @@ timeout after the platform committed it, or a process killed mid-append). A
 note is written before each append, naming its source with every other one
 still unsure, and that source is cleared once a batch of it is accepted, so
 the next sync of each first asks the cloud which of its first batch's rows it
-has, and sends only the rest. (The platform's append is not idempotent by
-`row_id`; this check is how the plugin keeps from sending a batch twice.) The
-marks and notes are kept in STATE_FILE, written whole; one that is there but
-cannot be read (a power loss) has lost where the marks were, so every row
-stored by then is checked with the cloud the same way before it is sent.
+has, and sends only the rest. The note also re-checks the source up to the
+batch's last row (see below), so every row of that batch is asked about
+wherever the next sync's mark starts. (The platform's append is not
+idempotent by `row_id`; this check is how the plugin keeps from sending a
+batch twice.) The marks and notes are kept in STATE_FILE, written whole; one
+that is there but cannot be read (a power loss) has lost where the marks
+were, so every row stored by then is checked with the cloud the same way
+before it is sent.
 
 A row the cloud refuses outright (too large, malformed) is set aside in
 REFUSED_FILE and the source goes on; a source the cloud is failing on stops
@@ -65,10 +70,12 @@ memory saved again later is still kept. Each queued forget is applied on its
 own: one the cloud fails stays queued for the next sync without holding up
 the ones after it, and one whose database or table no longer exists is
 dropped, there being nothing left there to delete. One for a database these
-settings no longer name stays queued, for when they name it again, and fails
-no sync. The queue's lock is held only to read and rewrite the file, never
-across a request to the cloud; a line that cannot be read (cut short by a
-crash) is taken off, since it can never be applied.
+settings no longer name stays queued whatever the cloud answers, for when
+they name it again, and fails no sync: a database the key does not reach is
+"not found" too (the platform answers so for another account's). The queue's
+lock is held only to read and rewrite the file, never across a request to the
+cloud; a line that cannot be read (cut short by a crash) is taken off, since
+it can never be applied.
 
 One sync runs at a time per profile (a file lock); the others skip.
 """
@@ -85,7 +92,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
 
-from . import config, tables
+from . import config, recall, tables
 from .client import InfinoClient, InfinoError
 from .local import LATE_COMMITS_FILE, LocalStore, append_line
 
@@ -152,6 +159,12 @@ def _fit(rows: list[dict]) -> list[dict]:
         if size > PUSH_MAX_BYTES and i:
             return rows[:i]
     return rows
+
+
+def _raw_marks(state: dict) -> dict:
+    """The marks a state holds, as written."""
+    raw = state.get("marks", {})
+    return raw if isinstance(raw, dict) else {}
 
 
 def _forget_entry(line: str) -> Optional[dict]:
@@ -328,15 +341,19 @@ class Mirror:
     def marks(self) -> dict[str, tuple[int, str]]:
         """Every mark kept, by `<database>/<source>`. Marks an older version kept
         by table name alone were for the team database it had then, which is
-        taken to be today's, and its personal mark for today's personal
-        database: kept by its old name while there is none, for when there is."""
-        raw = self._state().get("marks", {})
-        raw = raw if isinstance(raw, dict) else {}
+        taken to be today's. Its personal mark was for whichever personal
+        database it pushed to, which may not be today's: with one named it is
+        a re-check, never a mark (`_rechecks`); while there is none it is kept
+        by its old name, for when there is."""
+        raw = _raw_marks(self._state())
         out = {k: (int(v[0]), str(v[1])) for k, v in raw.items() if v and k not in LEGACY_MARKS}
         for legacy in LEGACY_MARKS:
-            if raw.get(legacy):
-                named = legacy != PERSONAL_MEMORY or self.settings.personal_database
-                out.setdefault(self.mark_of(legacy) if named else legacy, (int(raw[legacy][0]), str(raw[legacy][1])))
+            if not raw.get(legacy):
+                continue
+            if legacy != PERSONAL_MEMORY:
+                out.setdefault(self.mark_of(legacy), (int(raw[legacy][0]), str(raw[legacy][1])))
+            elif not self.settings.personal_database:
+                out.setdefault(legacy, (int(raw[legacy][0]), str(raw[legacy][1])))
         return out
 
     def last_error(self) -> str:
@@ -379,11 +396,19 @@ class Mirror:
     def _rechecks(self, state: dict) -> dict[str, tuple[int, str]]:
         """The re-checks still to finish, per source: up to which mark its rows
         are sent only if the cloud lacks them. For a state that could not be
-        read, every source's, up to now: any row stored by then may be there."""
+        read, every source's, up to now: any row stored by then may be there.
+        An older version's personal mark (`marks`) is the personal memory's,
+        with a personal database named: the rows up to it went to whichever
+        personal database that version named, maybe not this one."""
         if state.get(DAMAGED):
             return {src.mark: (_now_ms(), "") for src in self.sources()}
         raw = state.get("recheck")
-        return {k: (int(v[0]), str(v[1])) for k, v in raw.items() if v} if isinstance(raw, dict) else {}
+        out = {k: (int(v[0]), str(v[1])) for k, v in raw.items() if v} if isinstance(raw, dict) else {}
+        legacy = _raw_marks(state).get(PERSONAL_MEMORY)
+        if legacy and self.settings.personal_database:
+            mark, upto = self.mark_of(PERSONAL_MEMORY), (int(legacy[0]), str(legacy[1]))
+            out[mark] = max(out.get(mark, upto), upto)
+        return out
 
     def recheck(self, source: str, upto: tuple[int, str]) -> None:
         """Have the syncs to come ask the cloud which of a source's rows up to
@@ -435,22 +460,29 @@ class Mirror:
                         if not rows:
                             break
                         first = (int(rows[0][tables.STORED]), str(rows[0][tables.ROW_ID]))
+                        last = (int(rows[-1][tables.STORED]), str(rows[-1][tables.ROW_ID]))
                         upto = recheck.get(src.mark)
-                        send = self._not_in_cloud(src, rows) if check or (upto and first <= upto) else rows
+                        kept = self._sendable(src, rows)
+                        send = self._not_in_cloud(src, kept) if kept and (check or (upto and first <= upto)) else kept
                         check = False
                         # The note names every source still unsure, not this one
                         # alone: a sync killed before the answer leaves them all.
+                        # And it re-checks this one up to the batch's last row: a
+                        # late commit's note can move the next sync's mark back
+                        # before the batch, whose rows are then each asked about,
+                        # not only those in that sync's first batch.
+                        recheck[src.mark] = max(upto or last, last)
                         self._save_state(marks, in_flight=sorted(unsure | {src.mark}), recheck=recheck)
                         self._push(src, send)
                         # Its unanswered batch was checked with this one, and this one went.
                         unsure.discard(src.mark)
                         # The mark moves after each accepted batch, so a failed
                         # append never sends the rows before it again.
-                        marks[src.mark] = (int(rows[-1][tables.STORED]), str(rows[-1][tables.ROW_ID]))
-                        if upto and marks[src.mark] >= upto:
-                            recheck.pop(src.mark, None)  # past every row that might be in the cloud
+                        marks[src.mark] = last
+                        if marks[src.mark] >= recheck[src.mark]:
+                            recheck.pop(src.mark)  # past every row that might be in the cloud
                         self._save_state(marks, in_flight=sorted(unsure), recheck=recheck)
-                        pushed[src.mark] += len(rows)
+                        pushed[src.mark] += len(kept)
                         if progress:
                             progress(src.mark, pushed[src.mark])
                 except Exception as e:
@@ -471,6 +503,16 @@ class Mirror:
                 raise failure
             self._save_state(marks, in_flight=sorted(unsure), recheck=recheck)
             return pushed
+
+    def _sendable(self, src: Source, rows: list[dict]) -> list[dict]:
+        """The rows of a batch its cloud database may have: never a personal
+        memory from the team's own table (an older version's, not moved out
+        yet: Backend.ensure_local, or one an older version still running
+        writes there), which goes to the person's database or nowhere. The
+        mark moves past it all the same."""
+        if src.store is not self.local or src.table != tables.MEMORY:
+            return rows
+        return [r for r in rows if r.get("scope") != recall.PERSONAL]
 
     def _push(self, src: Source, rows: list[dict]) -> None:
         """Append rows. A row the cloud refuses outright is set aside
@@ -556,6 +598,17 @@ class Mirror:
             src.database, f"SELECT {tables.ROW_ID} FROM {src.table} WHERE {tables.ROW_ID} IN ({ids})")}
         return [r for r in rows if str(r[tables.ROW_ID]) not in have]
 
+    def unpushed(self) -> bool:
+        """Whether a sync has anything to send: a local row past its source's
+        mark, or a queued forget."""
+        marks, now = self.marks(), _now_ms()
+        if any(src.store.count_after(src.table, marks.get(src.mark), now) for src in self.sources()):
+            return True
+        try:
+            return bool((self.dir / FORGET_FILE).read_text().strip())
+        except FileNotFoundError:
+            return False
+
     def unsynced_after(self, source: str) -> Optional[tuple[int, str]]:
         """The mark a source's local rows must be past to be missing from the
         cloud; `source` is a team table's name or one of PERSONAL_SOURCES."""
@@ -594,9 +647,10 @@ class Mirror:
         too, there being nothing left there to delete. One for a database in
         `waiting` (its tables are not right) stays queued, unasked. One for a
         database these settings do not name (they did when it was queued)
-        stays queued when the cloud fails it - the key may not reach that
-        database now - for when they name it again, and fails no sync. A line
-        that cannot be read is taken off: it can never be applied.
+        stays queued whatever the cloud answers - the key may not reach that
+        database now, and the platform answers "not found" for a database of
+        another account - for when they name it again, and fails no sync. A
+        line that cannot be read is taken off: it can never be applied.
 
         The lock is held only to read and to rewrite the file: a forget made
         meanwhile queues without waiting on the cloud, and stays queued."""
@@ -624,15 +678,14 @@ class Mirror:
                 try:
                     self._delete(entry)
                 except Exception as e:
-                    if isinstance(e, InfinoError) and e.status in GONE_STATUSES:
-                        logger.info("infino: a queued forget's %s.%s no longer exists; nothing is left there to "
-                                    "delete: %s", entry["database"], entry["table"], e)
-                    elif entry["database"] in named:
-                        failure = failure or e  # stays queued for the next sync
-                        continue
-                    else:
+                    if entry["database"] not in named:
                         elsewhere.setdefault(entry["database"], e)
                         continue
+                    if not (isinstance(e, InfinoError) and e.status in GONE_STATUSES):
+                        failure = failure or e  # stays queued for the next sync
+                        continue
+                    logger.info("infino: a queued forget's %s.%s no longer exists; nothing is left there to delete: "
+                                "%s", entry["database"], entry["table"], e)
                 applied.append(line)
             if elsewhere:
                 logger.info("infino: forgets queued for %s, which these settings do not name, stay queued until they "

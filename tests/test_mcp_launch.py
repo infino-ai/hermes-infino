@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import sys
 
 import pytest
 from hermes_cli.env_loader import load_hermes_dotenv
+from plugins.config_backends.remote.values import secret_literal_path
+from tools.mcp_tool_config import _build_safe_env, _load_mcp_config
 
 from hermes_infino import config, local, mcp_launch, tables
 
@@ -13,6 +16,30 @@ from .helpers import TEAM_DB, sign_in, write_tools_setting
 
 CLIENT_JS = "/opt/infino/client/dist/cli.js"
 NODE = "/opt/node/bin/node"
+# A profile's .env left by an earlier setup: the key, as Remote Config asks it
+# kept, and a team database from before the fleet's.
+LEFT_IN_ENV_FILE = {"INFINO_API_KEY": "test-key", "INFINO_TEAM_DATABASE": "hermes-team"}
+
+
+def fleet_entry(platform) -> dict:
+    """The Infino tools' entry as the README's "Running a fleet" writes it."""
+    return {"command": "hermes", "args": ["infino", "mcp"],
+            "env": {"INFINO_CLIENT": CLIENT_JS, "INFINO_NODE": NODE, "INFINO_FLEET_TEAM_DATABASE": TEAM_DB,
+                    "INFINO_FLEET_URL": platform.url, "INFINO_FLEET_API_KEY": "${INFINO_API_KEY}"}}
+
+
+def become_the_tools(monkeypatch, home_dir) -> None:
+    """Turn this process into the Infino tools as Hermes starts them: the
+    environment Hermes hands a stdio server (`_build_safe_env` over the entry's
+    `env`, read from the config Hermes reads), with the profile's .env loaded
+    over it, as `hermes infino mcp` loads it as it starts."""
+    started_with = _build_safe_env(_load_mcp_config()["infino"]["env"])
+    for name in list(os.environ):
+        if name not in started_with:
+            monkeypatch.delenv(name)
+    for name, value in started_with.items():
+        monkeypatch.setenv(name, str(value))
+    load_hermes_dotenv(hermes_home=home_dir)
 
 
 @pytest.fixture
@@ -66,6 +93,28 @@ def test_the_config_block_wins_over_the_profiles_env_file_for_the_tools_too(star
     argv = started["argv"]
     assert argv[argv.index("--db") + 1].endswith(f"/{TEAM_DB}")
     assert config.load(tmp_path).team_database == TEAM_DB
+
+
+def test_on_remote_config_the_tools_read_the_settings_the_plugin_reads(started, remote, home, platform, tmp_path,
+                                                                       monkeypatch):
+    """Hermes on Remote Config: the tools' entry comes from the config service,
+    and the tools, started without the service's settings, read none of it
+    themselves. They still search the team the plugin writes to."""
+    remote.upper = {"memory": {"provider": "infino"}, "mcp_servers": {"infino": fleet_entry(platform)}}
+    key_path = ("mcp_servers", "infino", "env", config.FLEET_NAMES[config.KEY_ENV])
+    assert secret_literal_path(key_path, "test-key") is not None  # the service takes the key as a reference only
+    assert secret_literal_path(key_path, "${INFINO_API_KEY}") is None
+    (tmp_path / ".env").write_text("".join(f"{k}={v}\n" for k, v in LEFT_IN_ENV_FILE.items()))
+    for name, value in LEFT_IN_ENV_FILE.items():  # Hermes loaded that .env as it started
+        home.setenv(name, value)
+    plugin = config.load(tmp_path)
+    assert (plugin.team_database, plugin.url) == (TEAM_DB, platform.url)
+    become_the_tools(monkeypatch, tmp_path)
+    assert "HERMES_CONFIG_BACKEND" not in os.environ  # the tools cannot read Remote Config
+    mcp_launch.launch(config, local)
+    argv = started["argv"]
+    assert argv[argv.index("--db") + 1] == f"{plugin.url}/{plugin.team_database}"
+    assert started["env"]["INFINO_API_KEY"] == plugin.api_key
 
 
 def test_signed_in_through_the_sign_in_file(started, platform, tmp_path):

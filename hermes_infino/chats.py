@@ -15,12 +15,25 @@ prefixes it. Whether the chat is a group is Hermes's to decide:
   the group (a sender the gateway would also admit in a DM);
 - without it, the chat type decides, as Hermes itself then does: anything but
   a DM is a group. A chat of no known type (blank) may be either, and is a
-  group, as Hermes's own access check settles it.
+  group, as Hermes's own access check settles it; but since it may be the
+  owner's own one-to-one chat (a relay sends a blank type), a personal memory
+  asked for there is refused rather than kept as the chat's, and a turn there
+  does not mark the profile as one others talked to for good (provider.py).
 
 The owner's own surfaces (OWNER_PLATFORMS) have no gateway chat: a session
 there is never a group. Hermes's hosted Group Chat rooms and turns another
 profile forwards (MULTI_PARTY_PLATFORMS) have none either, though several
 parties share them: the provider treats them as a group from their platform.
+
+A webhook delivery (Hermes's webhook adapter) is a turn with no person behind
+it: an event from GitHub, an email, an alert. Hermes gives each delivery a
+chat of its own, which no later turn shares, so a route's turns are keyed by
+the route instead: what one delivery's turn keeps is recalled in the route's
+later deliveries. Its payload is outside content (a stranger's pull request
+or email), so a route is a group for personal memory, unless the profile's
+owner calls the route their own (`owner_routes`: INFINO_OWNER_ROUTES, on a
+profile that is one person's): its turns are then the owner's. No members
+share a route, so a personal memory asked for in one is refused.
 """
 
 from __future__ import annotations
@@ -56,6 +69,18 @@ OWNER_PLATFORMS = frozenset({"", "local", "cli", "tui", "desktop", "acp", "cron"
 # forwards (A2A, "a2a"). A group for every personal decision, on a profile that
 # is one person's too.
 MULTI_PARTY_PLATFORMS = frozenset({"bot_room", "a2a"})
+# Hermes's webhook adapter, and how it names the route a delivery came in on:
+# the turn's user id is `webhook:<route>` (gateway/platforms/webhook.py,
+# `_admission_source`), while its chat id is the delivery's own.
+WEBHOOK_PLATFORM = "webhook"
+WEBHOOK_USER_PREFIX = "webhook:"
+# Joins the keys of several group chats a memory is kept for together: no
+# chat's key holds it, so no chat's recall shows such a memory.
+CHATS_JOIN = "|"
+# The chat a memory is kept for when nothing can say which chat it came from:
+# a key no chat has (a chat's key is "<platform>:<chat>"), so no chat's recall
+# shows it.
+UNATTRIBUTED = "unattributed"
 
 
 @dataclass(frozen=True)
@@ -63,11 +88,21 @@ class Chat:
     key: str = ""             # the chat's key ("" outside a group chat)
     group: bool = False       # a group chat: its memory is the chat's and the team's
     owner_writes: bool = True  # the sender may write the profile owner's own memory
+    untyped: bool = False     # a group only because Hermes gave the chat no type: it may be the owner's own
+    route: bool = False       # a webhook route's: its turns carry outside content, from no member
 
     @property
     def visible(self) -> tuple[str, ...]:
         """The `chat` values a recall here may show: the team's ("") and this chat's."""
         return ("", self.key) if self.group else ("",)
+
+    @property
+    def refuses_personal(self) -> bool:
+        """Whether a personal memory asked for here is refused rather than kept
+        as the chat's: no members share the chat to keep it for. A chat of no
+        known type may be the owner's own one-to-one chat; a route's turns are
+        a stranger's content."""
+        return self.untyped or self.route
 
 
 NO_CHAT = Chat()
@@ -91,11 +126,25 @@ def chat_key(platform: str, chat_id: str, thread_id: str = "", parent_chat_id: s
     return f"{platform}:{workspace}_{chat}" if workspace else f"{platform}:{chat}"
 
 
-def current() -> Chat:
-    """The chat of the turn running now (call it on the turn's own thread)."""
+def webhook_route() -> str:
+    """The webhook route the running turn came in on; "" for any other turn."""
+    if session("HERMES_SESSION_PLATFORM").lower() != WEBHOOK_PLATFORM:
+        return ""
+    user = session("HERMES_SESSION_USER_ID")
+    return user[len(WEBHOOK_USER_PREFIX):] if user.startswith(WEBHOOK_USER_PREFIX) else ""
+
+
+def current(owner_routes: frozenset[str] = frozenset()) -> Chat:
+    """The chat of the turn running now (call it on the turn's own thread).
+    `owner_routes`: the webhook routes whose turns are the owner's own."""
     platform = session("HERMES_SESSION_PLATFORM").lower()
     if platform in OWNER_PLATFORMS:
         return NO_CHAT
+    route = webhook_route()
+    if route:
+        if route in owner_routes:
+            return NO_CHAT
+        return Chat(key=chat_key(WEBHOOK_PLATFORM, route), group=True, owner_writes=False, route=True)
     key = chat_key(platform, session("HERMES_SESSION_CHAT_ID"), session("HERMES_SESSION_THREAD_ID"),
                    session("HERMES_SESSION_PARENT_CHAT_ID"), session("HERMES_SESSION_SCOPE_ID"))
     if not key:
@@ -112,7 +161,7 @@ def current() -> Chat:
         return NO_CHAT
     # Without channel memory Hermes cannot say whether the sender may write the
     # owner's memory from a group, so no one does from here.
-    return Chat(key=key, group=True, owner_writes=False)
+    return Chat(key=key, group=True, owner_writes=False, untyped=not chat_type)
 
 
 def _binding() -> Optional[object]:

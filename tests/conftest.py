@@ -4,6 +4,16 @@ a fake platform, a profile home, and Hermes on Remote Config."""
 from __future__ import annotations
 
 import importlib.util
+import os
+import tempfile
+
+# Importing one of Hermes's entry-point modules (run_agent, gateway.run: the
+# teardowns the tests drive) points TMPDIR at <HERMES_HOME>/cache/scratch
+# unless a temp variable is set (hermes_bootstrap), and pytest's temp homes
+# would then sit inside the real Hermes home, which Hermes reads as part of
+# its default profile. Pinned to the system's temp root before any Hermes
+# import, as Hermes's own tests do, that hook leaves it alone.
+os.environ.setdefault("TMPDIR", tempfile.gettempdir())
 
 import pytest
 
@@ -18,7 +28,8 @@ from .helpers import REMOTE_CONFIG_STUB, TEAM_DB, TEST_SYNC_DELAY_S, fake_embed
 # Every setting the plugin reads from the environment.
 INFINO_ENV = ("INFINO_API_KEY", "INFINO_TEAM_DATABASE", "INFINO_URL", "INFINO_PERSONAL_DATABASE",
               "INFINO_AUTHOR", "INFINO_MCP_SERVER", "INFINO_NODE", "INFINO_CLIENT",
-              "INFINO_PERSONAL_PROFILE", "INFINO_PERSONAL_JOBS")
+              "INFINO_PERSONAL_PROFILE", "INFINO_PERSONAL_JOBS", "INFINO_OWNER_ROUTES",
+              "INFINO_FLEET_API_KEY", "INFINO_FLEET_TEAM_DATABASE", "INFINO_FLEET_URL")
 
 
 @pytest.fixture(autouse=True)

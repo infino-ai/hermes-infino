@@ -48,19 +48,34 @@ name, the way Hermes's own `hermes cron` commands name one. Hermes labels a
 job's delivered output with its name: when several of the profile's jobs share
 that name, the output is personal if any of them is listed. A job of another
 profile is known here only by that name.
+
+Whose writes a session makes. Hermes tells a provider of its sessions' turns,
+but not of two writes that follow from them: its background review, a copy of
+the agent, saves to the memory files under the id of the session whose turn it
+follows, and its cron tool makes a scheduled job, keeping where it was made
+only when that chat can be delivered to. So the provider notes, per session,
+whose its latest turn was (`Writer`), and the tool hooks read it (traces.py):
+an entry a turn that was not the owner's own wrote stays that chat's
+(builtin.py), and a job made in such a turn never runs as the owner's
+(`note_others_job`).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sys
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from . import config
 from .recall import TEAM
+
+logger = logging.getLogger(__name__)
 
 try:  # Hermes's mark on the code a delegated child (`delegate_task`) runs.
     from agent.delegation_context import is_delegated_child_context as _is_delegated_child
@@ -120,9 +135,12 @@ CRON_IDENTITY_MODULE = "cron.execution_identity"
 # Sessions whose standing is remembered; a long-running gateway sees many, and
 # only the latest few are still running.
 MAX_SESSIONS = 1_024
+# Beside the plugin's databases: the scheduled jobs made in a turn that was not
+# the owner's own, one id a line (`note_others_job`).
+OTHERS_JOBS = "others_jobs"
 
 
-def _args(arguments: Any) -> Any:
+def json_value(arguments: Any) -> Any:
     """A tool call's arguments (or answer) as a dict when they are JSON text;
     otherwise as given."""
     if isinstance(arguments, str):
@@ -139,7 +157,7 @@ def is_personal_call(tool_name: str, arguments: Any) -> bool:
     or reads the person's own database."""
     if tool_name in PERSONAL_READ_TOOLS:
         return True
-    args = _args(arguments)
+    args = json_value(arguments)
     if tool_name in (REMEMBER_TOOL, FORGET_TOOL):
         return not _keeps_to_team(tool_name, args)
     if not isinstance(args, dict):
@@ -169,7 +187,7 @@ def read_personal(tool_name: str, result: Any) -> bool:
     read counts as read."""
     if tool_name not in PERSONAL_READ_TOOLS:
         return False
-    answer = _args(result)
+    answer = json_value(result)
     return not (isinstance(answer, dict) and answer.get("error"))
 
 
@@ -178,9 +196,9 @@ def withhold(tool_name: str, arguments: Any) -> Any:
     came in (JSON text or a dict); others unchanged."""
     if not is_personal_call(tool_name, arguments):
         return arguments
-    if not isinstance(_args(arguments), dict):  # nothing to tell apart: all of it
+    if not isinstance(json_value(arguments), dict):  # nothing to tell apart: all of it
         return WITHHELD
-    args = dict(_args(arguments))
+    args = dict(json_value(arguments))
     for field_name in TEXT_FIELDS:
         if field_name in args:
             args[field_name] = WITHHELD
@@ -275,6 +293,14 @@ def delivered_jobs(messages: Iterable[dict]) -> list[str]:
     return [label for label in found if label]
 
 
+@dataclass(frozen=True)
+class Writer:
+    """Whose a session's writes are, as the provider saw its latest turn."""
+    chat: str = ""               # the group chat a MEMORY.md entry it writes is kept for ("" for none)
+    owners_entries: bool = False  # a USER.md entry it writes may be the owner's personal memory
+    owners_jobs: bool = False     # a scheduled job it makes is the owner's own
+
+
 @dataclass
 class _Session:
     jobs: set = field(default_factory=set)  # (id, name): the job it runs, the jobs delivered into it
@@ -282,6 +308,8 @@ class _Session:
     parent: str = ""                        # the session that delegated to it
     personal: bool = False                  # its earlier turns were kept personal
     looked: bool = False                    # this machine's personal tables were asked about it
+    look_again: bool = False                # that look could not read them: they are asked again
+    writer: Optional[Writer] = None         # whose its writes are (note_writer)
 
 
 _sessions: OrderedDict[str, _Session] = OrderedDict()
@@ -354,12 +382,66 @@ def note_personal(session_id: str) -> None:
 
 
 def first_look(session_id: str) -> bool:
-    """True once per session (while it is remembered): whether this machine's
-    personal tables still have to be asked about it."""
+    """Whether this machine's personal tables still have to be asked about a
+    session: once per session (while it is remembered), and again after a look
+    that could not read them (`look_again`). Kept with the session, not with a
+    backend, so the backend a change of settings makes asks again too."""
     with _sessions_lock:
         s = _session(session_id or "")
-        looked, s.looked = s.looked, True
-        return not looked
+        owed = not s.looked or s.look_again
+        s.looked, s.look_again = True, False
+        return owed
+
+
+def look_again(session_id: str) -> None:
+    """A look at this machine's personal tables could not read them: the
+    session's next look asks them again (`first_look`)."""
+    with _sessions_lock:
+        _session(session_id or "").look_again = True
+
+
+# -- whose writes a session makes ---------------------------------------------------
+
+def note_writer(session_id: str, writer: Writer) -> None:
+    """Note whose a session's writes are, as its latest turn says."""
+    with _sessions_lock:
+        _session(session_id or "").writer = writer
+
+
+def writer_of(session_id: str) -> Optional[Writer]:
+    """Whose a session's writes are: as its provider noted (the background
+    review's are the session's whose turn it follows: it runs under that id),
+    or, for a subagent, the session's that started it. None when nothing here
+    noted it."""
+    session, seen = session_id or "", set()
+    with _sessions_lock:
+        while session in _sessions and session not in seen:
+            seen.add(session)
+            s = _sessions[session]
+            if s.writer is not None:
+                return s.writer
+            session = s.parent
+    return None
+
+
+def note_others_job(state_dir: Path, job_id: str) -> None:
+    """Note that a scheduled job was made in a turn that was not the owner's
+    own: its runs are not the owner's (`others_job`). Raises when the note
+    cannot be written."""
+    config.make_private_dir(Path(state_dir))
+    with open(Path(state_dir) / OTHERS_JOBS, "a") as f:
+        f.write(job_id + "\n")
+
+
+def others_job(state_dir: Path, job_id: str) -> bool:
+    """Whether a scheduled job was noted as made in a turn that was not the
+    owner's own; True when the note cannot be read."""
+    path = Path(state_dir) / OTHERS_JOBS
+    try:
+        return path.exists() and job_id in path.read_text().split()
+    except (OSError, UnicodeDecodeError) as e:
+        logger.info("infino: could not read which jobs were made for others (job %s taken as one): %s", job_id, e)
+        return True
 
 
 def transcript_personal(settings, session_id: str, messages: Optional[Iterable[dict]] = None) -> bool:

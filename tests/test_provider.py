@@ -3,23 +3,31 @@ and its lifecycle."""
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import sys
+import threading
 import time
 
 import pytest
 
+from agent import memory_provider
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.turn_context import append_notes_to_multimodal_content, compose_multimodal_context_part
+from cron.scheduler import _teardown_cron_agent
 from gateway.owner_identity import host_owner_subject
+from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
+from gateway.run import GatewayRunner
+from hermes_cli import cli_shutdown, oneshot
 
 from hermes_infino import backend, config, embed, mirror, privacy, provider as provider_mod, skills, tables
 from hermes_infino.local import VECTORS
-from hermes_infino.provider import PERSONAL_SEARCH_TOOL, InfinoMemoryProvider
+from hermes_infino.provider import CRON_PLATFORM, PERSONAL_SEARCH_TOOL, InfinoMemoryProvider
 
-from .helpers import (DM, GROUP, SKILL_MD, TEAM_DB, end_session, fake_embed, hook_ctx, in_session, local, local_rows,
-                      make_manager, personal_rows, wait_for)
+from .helpers import (DM, GROUP, SKILL_MD, TEAM_DB, WRITE_WAIT_S, agent_tool_call, end_session, fake_embed,
+                      hermes_agent, hermes_dispatch, hook_ctx, in_session, local, local_rows, make_manager,
+                      personal_rows, wait_for, webhook_delivery)
 
 # What a provider declares before it starts, which is what Hermes routes by:
 # every tool, the personal search included (it is shown only where offered).
@@ -38,6 +46,19 @@ DESKTOP_USER = "uid:1000"
 QUICK_FLUSH_S = 3.0
 # The most a soft release may take: well under a settle window and a sync.
 SOFT_RELEASE_S = 1.0
+# A background sync's delay no test waits out: the process (a one-shot run, a
+# gateway stopping) exits through os._exit before it runs.
+NO_BACKGROUND_SYNC_S = 3600.0
+# The most a test waits for one of Hermes's teardown threads to end.
+TEARDOWN_JOIN_S = 4 * QUICK_FLUSH_S
+# A cached gateway agent's key, and the api_server's bounds on its parked sessions.
+GATEWAY_KEY = "agent:main:telegram:dm:1"
+API_SESSIONS = 8
+API_IDLE_S = 3600.0
+# The job of a scheduled run's cleanup.
+CRON_JOB = "a1b2c3"
+# A turn, as Hermes hands it to its memory manager at the turn's end.
+LAST_TURN = ("run the tests", "2 fail")
 
 
 def call(mgr, tool: str, **args) -> dict:
@@ -140,6 +161,30 @@ def test_a_removed_builtin_memory_is_forgotten(mgr, tmp_path):
     p.on_memory_write("remove", "memory", "", None)  # nothing named: nothing to do
     p._drain()
     assert local_rows(tmp_path, tables.MEMORY) == []
+
+
+def test_a_chat_of_no_known_type_writes_none_of_the_owners_personal_memory_to_the_team(home, tmp_path, monkeypatch):
+    # A profile that is one person's, behind a relay: the owner's own DM may come with no chat type.
+    home.setenv("INFINO_PERSONAL_PROFILE", "on")
+    hermes_dispatch(monkeypatch)
+    in_session(monkeypatch, {**DM, "HERMES_SESSION_CHAT_TYPE": ""})
+    m, p = make_manager(tmp_path, platform="telegram", session_id="relay-1")
+    m.on_turn_start(1, "Remember my PIN, it's personal.")
+    assert call(m, "infino_remember", content="Dana's PIN is 4321", scope="personal") == {
+        "ok": False, "error": provider_mod.NO_PERSONAL_IN_GROUP}
+    # Hermes's own memory tool, as the agent calls it: it tells the provider.
+    added = agent_tool_call("relay-1", "memory", {"action": "add", "target": "user", "content": "PIN is 4321"}, m,
+                            platform="telegram")
+    assert added["success"]
+    p._drain()
+    assert not [r for r in local_rows(tmp_path, tables.MEMORY) + personal_rows(tmp_path) if "4321" in r["content"]]
+    # The profile is not marked as one others talked to for good, and the
+    # owner's next session still does not take the entry for theirs.
+    assert not (config.state_dir(tmp_path) / provider_mod.OTHERS_MARK).exists()
+    in_session(monkeypatch, {})
+    _, at_the_terminal = make_manager(tmp_path, session_id="cli")
+    at_the_terminal._drain()
+    assert not [r for r in personal_rows(tmp_path) if "4321" in r["content"]]
 
 
 def test_a_users_entry_without_a_name_is_kept_as_written(mgr, tmp_path):
@@ -668,7 +713,8 @@ def test_a_soft_release_never_waits_on_the_cloud(env, platform, tmp_path, monkey
 @pytest.mark.parametrize("steps, waits", [
     ((), False),                                  # a soft release: shutdown alone
     (("end",), True),                             # a session's end: on_session_end, then shutdown
-    (("end", "turn"), False),                     # /new or compaction ended a session, and turns went on
+    (("end", "sync"), True),                      # ... with the last turn's sync drained after the end
+    (("end", "turn"), False),                     # /new or compaction ended a session, and a turn started
     (("end", "switch"), False),                   # ... into a new session id
 ])
 def test_only_a_sessions_end_waits_for_the_cloud(env, tmp_path, monkeypatch, steps, waits):
@@ -678,9 +724,142 @@ def test_only_a_sessions_end_waits_for_the_cloud(env, tmp_path, monkeypatch, ste
     for step in steps:
         if step == "end":
             p.on_session_end([])
-        elif step == "turn":
+        elif step == "sync":
             p.sync_turn("q", "a", session_id="s1")
+        elif step == "turn":
+            p.on_turn_start(2, "q")
         else:
             p.on_session_switch("s2", parent_session_id="s1", reset=True)
     p.shutdown()
     assert flushed == ([True] if waits else [])
+
+
+def pushed_turn(platform) -> list[str]:
+    """What the team's cloud `conversations` holds, sorted: a turn's rows share
+    their stamp, so the cloud has them in `row_id` order."""
+    return sorted(r["content"] for r in platform.rows(TEAM_DB, tables.CONVERSATIONS))
+
+
+def test_a_one_shot_runs_end_pushes_the_last_turn_still_queued_at_its_end(env, platform, tmp_path, monkeypatch):
+    mgr, p = make_manager(tmp_path)
+    monkeypatch.setattr(backend, "SYNC_DELAY_S", NO_BACKGROUND_SYNC_S)
+    # Hermes's worker is still on the turn's sync when the run ends: on_session_end runs inline, and
+    # shutdown_all drains the sync after it (hermes_cli/oneshot.py, AIAgent.shutdown_memory_provider).
+    ended = threading.Event()
+    real_end, real_sync = p.on_session_end, p.sync_turn
+    monkeypatch.setattr(p, "on_session_end", lambda messages: (real_end(messages), ended.set()))
+    monkeypatch.setattr(p, "sync_turn",
+                        lambda *args, **kwargs: (ended.wait(WRITE_WAIT_S), real_sync(*args, **kwargs)))
+    mgr.sync_all(*LAST_TURN, session_id="s1")
+    oneshot._close_agent(hermes_agent(mgr), None)
+    assert pushed_turn(platform) == sorted(LAST_TURN)
+
+
+def cli_exit(agent) -> None:
+    """The CLI's exit (hermes_cli/cli_shutdown.py), on its main thread."""
+    cli_shutdown._shutdown_agent_memory_provider(agent)
+
+
+def gateway_cleanup(context: str):
+    """The gateway's end of a cached agent (gateway/run_shutdown.py), on its own
+    housekeeping workers: at its stop, and at a session's expiry."""
+    def end(agent) -> None:
+        runner = GatewayRunner.__new__(GatewayRunner)
+        try:
+            asyncio.run(runner._cleanup_agent_resources_off_loop(agent, context=context, session_key=GATEWAY_KEY))
+        finally:
+            runner._housekeeping_executor.shutdown(wait=True)
+    return end
+
+
+def api_server_close(agent) -> None:
+    """The api_server adapter's disconnect at the gateway's stop: its parked
+    sessions closed on a worker thread (gateway/platforms/api_server.py), the
+    gateway then exiting through os._exit."""
+    sessions = ApiServerMemorySessions(max_size=API_SESSIONS, idle_ttl_secs=API_IDLE_S)
+    sessions.checkin(agent)
+    asyncio.run(asyncio.to_thread(sessions.close_all))
+
+
+@pytest.mark.parametrize("surface, teardown", [
+    ("cli", cli_exit),
+    ("telegram", gateway_cleanup("shutdown idle-cache")),
+    ("telegram", gateway_cleanup("session expiry")),
+    ("api_server", api_server_close),
+], ids=["cli-exit", "gateway-stop", "gateway-session-expiry", "api-server-at-gateway-stop"])
+def test_a_teardown_hermes_waits_for_pushes_the_rows_before_it_returns(env, platform, tmp_path, monkeypatch,
+                                                                       surface, teardown):
+    mgr, _ = make_manager(tmp_path, platform=surface)
+    monkeypatch.setattr(backend, "SYNC_DELAY_S", NO_BACKGROUND_SYNC_S)
+    mgr.sync_all(*LAST_TURN, session_id="s1")  # the last turn, queued on Hermes's worker
+    teardown(hermes_agent(mgr))
+    assert pushed_turn(platform) == sorted(LAST_TURN)
+
+
+def gateway_pressure_eviction(agent, monkeypatch) -> None:
+    """The gateway's memory valve (gateway/run_agent_cache.py): the agents it
+    evicts released one after another on a daemon thread."""
+    runner = GatewayRunner.__new__(GatewayRunner)
+    valve = threading.Thread(target=runner._release_pressure_batch, args=([(GATEWAY_KEY, agent)],), daemon=True,
+                             name="agent-cache-pressure")
+    valve.start()
+    valve.join(TEARDOWN_JOIN_S)
+
+
+def api_server_idle_eviction(agent, monkeypatch) -> None:
+    """An api_server session parked past its idle time, shut down on a thread of
+    its own (gateway/platforms/api_server_memory_sessions.py)."""
+    spawned = []
+    real = memory_provider.spawn_context_thread
+
+    def recorded(*args, **kwargs):
+        spawned.append(real(*args, **kwargs))
+        return spawned[-1]
+
+    monkeypatch.setattr(memory_provider, "spawn_context_thread", recorded)
+    sessions = ApiServerMemorySessions(max_size=API_SESSIONS, idle_ttl_secs=API_IDLE_S)
+    sessions._shutdown_async(agent._memory_manager, None)
+    for thread in spawned:
+        thread.join(TEARDOWN_JOIN_S)
+
+
+def cron_cleanup(agent, monkeypatch) -> None:
+    """A scheduled job's run torn down after it ran (cron/scheduler.py), bounded
+    by the scheduler on a daemon thread."""
+    _teardown_cron_agent(agent, CRON_JOB, timeout_seconds=TEARDOWN_JOIN_S)
+
+
+@pytest.mark.parametrize("surface, context, session, teardown", [
+    ("telegram", "primary", "s1", gateway_pressure_eviction),
+    ("api_server", "primary", "s1", api_server_idle_eviction),
+    (CRON_PLATFORM, "cron", CRON_SESSION, cron_cleanup),
+], ids=["gateway-eviction-under-memory-pressure", "api-server-idle-eviction", "scheduled-job-cleanup"])
+def test_a_teardown_in_a_process_that_goes_on_never_waits_on_the_cloud(env, platform, tmp_path, monkeypatch,
+                                                                         surface, context, session, teardown):
+    monkeypatch.setattr(backend, "FLUSH_TIMEOUT_S", QUICK_FLUSH_S)
+    mgr, _ = make_manager(tmp_path, platform=surface, agent_context=context, session_id=session)
+    mgr.handle_tool_call("infino_remember", {"content": "written before the agent is let go"})
+    with open(config.state_dir(tmp_path) / mirror.LOCK_FILE, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)  # a sync held up by a slow cloud
+        started = time.monotonic()
+        teardown(hermes_agent(mgr, session), monkeypatch)
+        took = time.monotonic() - started
+        fcntl.flock(f, fcntl.LOCK_UN)
+    assert took < QUICK_FLUSH_S
+    # The background sync still takes the row.
+    assert wait_for(lambda: [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)]
+                    == ["written before the agent is let go"])
+
+
+# -- webhook turns -----------------------------------------------------------------
+
+def test_what_a_webhook_turn_saves_is_recalled_in_the_routes_next_delivery(home, tmp_path):
+    # Hermes gives each delivery its own chat: a note kept for that one would never be recalled.
+    m, p = make_manager(tmp_path, platform="webhook", session_id="hook-1")
+    with webhook_delivery("ci-failure", "delivery-1"):
+        assert call(m, "infino_remember", content="CI flakes come from the cache warm-up")["ok"]
+    p._drain()
+    with webhook_delivery("ci-failure", "delivery-2"):
+        assert "cache warm-up" in p.prefetch("why does CI flake")
+    with webhook_delivery("email-triage", "delivery-3"):  # another route's turns don't see it
+        assert "cache warm-up" not in p.prefetch("why does CI flake")

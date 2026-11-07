@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import fcntl
+import subprocess
+import sys
 import threading
 import time
 
@@ -34,6 +36,24 @@ QUICK_FLUSH_S = 0.2
 SESSION_ENDS = 3
 # A personal memory as an older version kept it: in the team's local table.
 OLD_PERSONAL_MEMORY = {tables.ROW_ID: "p1", "content": "my salary", "scope": recall.PERSONAL}
+# A process that writes a memory and exits without waiting on the cloud (where
+# Hermes does not wait for a teardown: an evicted agent, a scheduled job's
+# cleanup), its background sync not due yet. Arguments: the profile's home,
+# the sync's delay, the memory.
+EXITING_PROCESS = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "from hermes_infino import backend, config, tables\n"
+    "backend.SYNC_DELAY_S = float(sys.argv[2])\n"
+    "b = backend.for_settings(config.load(Path(sys.argv[1])))\n"
+    "b.ensure_local()\n"
+    "b.mirror.ensure_cloud_tables()\n"
+    "b.append(tables.MEMORY, [{'content': sys.argv[3]}])\n"
+)
+# A background sync's delay the exiting process never waits out.
+NO_BACKGROUND_SYNC_S = 3600.0
+# The most the exiting process may take: its start, the settle window, a sync.
+EXITING_PROCESS_S = 60.0
 
 
 @pytest.fixture
@@ -199,6 +219,14 @@ def test_a_session_end_through_a_replaced_backend_waits_for_its_rows_to_settle(h
     assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["written through the old one"]
 
 
+def test_a_process_exit_pushes_the_rows_its_writes_left(home, platform, tmp_path):
+    sign_in(tmp_path, platform)
+    done = subprocess.run([sys.executable, "-c", EXITING_PROCESS, str(tmp_path), str(NO_BACKGROUND_SYNC_S),
+                           "written just before the exit"], capture_output=True, text=True, timeout=EXITING_PROCESS_S)
+    assert done.returncode == 0, done.stderr
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["written just before the exit"]
+
+
 def test_session_ends_while_another_process_syncs_leave_one_sync_waiting(cloud_backend, platform, tmp_path,
                                                                          monkeypatch):
     monkeypatch.setattr(backend, "FLUSH_TIMEOUT_S", QUICK_FLUSH_S)
@@ -211,6 +239,23 @@ def test_session_ends_while_another_process_syncs_leave_one_sync_waiting(cloud_b
         waiting = [t for t in threading.enumerate() if t not in before and t.name == "infino-flush" and t.is_alive()]
         fcntl.flock(f, fcntl.LOCK_UN)
     assert len(waiting) == 1
+    assert wait_for(lambda: len(platform.rows(TEAM_DB, tables.MEMORY)) == 1)
+
+
+def test_session_ends_after_one_whose_sync_outlived_its_bound_do_not_wait_again(cloud_backend, platform, tmp_path,
+                                                                                 monkeypatch):
+    # A gateway's stop ends its cached agents one after another, within its own shutdown watchdog.
+    monkeypatch.setattr(backend, "FLUSH_TIMEOUT_S", QUICK_FLUSH_S)
+    cloud_backend.append(tables.MEMORY, [{"content": "written before the sessions end"}])
+    with open(config.state_dir(tmp_path) / mirror.LOCK_FILE, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)  # another process's sync, held up by a slow cloud
+        cloud_backend.flush()  # waits out its bound
+        started = time.monotonic()
+        for _ in range(SESSION_ENDS):
+            cloud_backend.flush()
+        took = time.monotonic() - started
+        fcntl.flock(f, fcntl.LOCK_UN)
+    assert took < QUICK_FLUSH_S
     assert wait_for(lambda: len(platform.rows(TEAM_DB, tables.MEMORY)) == 1)
 
 
@@ -234,6 +279,18 @@ def test_a_look_at_the_personal_tables_that_failed_keeps_the_turn_personal(local
     fail_the_first_look(local_backend.personal, monkeypatch)
     assert local_backend.transcript_personal("kept") is True  # could not tell: the safe side
     assert local_backend.transcript_personal("kept") is True  # read this time
+
+
+def test_a_look_that_failed_is_asked_again_by_the_backend_a_change_of_settings_makes(local_backend, home, tmp_path,
+                                                                                       monkeypatch):
+    local_backend.append(tables.CONVERSATIONS, [{"session_id": "kept", "seq": 0, "role": "user", "content": "mine"}],
+                         personal=True)
+    fail_the_first_look(local_backend.personal, monkeypatch)
+    assert local_backend.transcript_personal("kept") is True  # could not tell: the safe side
+    home.setenv("INFINO_PERSONAL_JOBS", "weekly-finances")  # the settings change: another backend takes over
+    replacement = backend.for_settings(config.load(tmp_path))
+    assert replacement is not local_backend
+    assert replacement.transcript_personal("kept") is True  # it asks, and finds the session's turns personal
 
 
 def test_a_session_whose_look_failed_is_asked_again_and_is_the_teams(local_backend, monkeypatch):

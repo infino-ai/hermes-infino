@@ -1,5 +1,5 @@
 name: infino
-version: 0.5.8
+version: 0.5.9
 description: "Infino as the backend for Hermes: memory, conversations, traces and skills in an Infino database on this machine, and in the team's Infino Cloud database once signed in (`hermes infino login`), read by the Infino client's MCP tools."
 author: "Infino"
 homepage: "https://github.com/infino-ai/hermes-infino"
@@ -41,9 +41,13 @@ optional_env:
   - name: INFINO_PERSONAL_JOBS
     description: "Scheduled jobs (names, or this profile's job ids, comma-separated) whose runs and delivered output are personal"
     password: false
+  - name: INFINO_OWNER_ROUTES
+    description: "On a personal profile: webhook routes (comma-separated) whose events are your own, so their turns read and write your personal memory"
+    password: false
 # The plugin hooks registered (traces.py); the memory provider's own methods are not hooks.
 hooks:
   - pre_llm_call
+  - pre_tool_call
   - post_api_request
   - post_tool_call
   - subagent_start
