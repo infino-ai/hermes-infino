@@ -4,7 +4,7 @@ hermes-infino is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) 
 
 If are not signed in to an Infino account, everything stays on your machine, in databases run by Infino's open source engine.
 
-When you [sign in](#signing-in) to Infino, everything is kept in Infino Cloud too and team collaboration becomes available. Work goes to a team database, and everyone who signs in to the same team database shares it, so every agent on the team can search what the others did. Personal memory, and any work you mark as personal, goes to a personal database of your own that is kept private.
+When you [sign in](#signing-in) to Infino, your agent data is synced with Infino Cloud and team collaboration becomes available. Work goes to a team database, and everyone who signs in to the same team database shares it, so every agent on the team can search what the others did. Personal memory, and any work you mark as personal, goes to a personal database of your own that is kept private.
 
 ## What it stores in Infino
 
