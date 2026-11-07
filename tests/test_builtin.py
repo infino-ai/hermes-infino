@@ -7,7 +7,7 @@ from __future__ import annotations
 from hermes_infino import builtin, chats, config, tables
 from hermes_infino.provider import GATEWAY_MARK
 
-from .helpers import (DM, GROUP, OTHER_GROUP, PERSONAL_DB, TEAM_DB, in_session, local_rows, make_manager,
+from .helpers import (DM, GROUP, OTHER_GROUP, PERSONAL_DB, TEAM_DB, end_session, in_session, local_rows, make_manager,
                       personal_rows, wait_for)
 
 # A credential shaped the way Hermes's redaction recognizes one.
@@ -58,7 +58,7 @@ def test_the_background_reviews_writes_reach_the_memory_table(env, platform, tmp
     write_file(tmp_path, "memory", ["deploys are on Tuesdays"])
     write_file(tmp_path, "user", ["prefers short answers"])
     turn(provider)
-    provider.shutdown()
+    end_session(provider)
     team = [r for r in platform.rows(TEAM_DB, tables.MEMORY)]
     assert [(r["content"], r["origin"], r["scope"]) for r in team] == [
         ("deploys are on Tuesdays", "builtin:memory", "team")]
@@ -70,10 +70,10 @@ def test_an_entry_the_review_removes_leaves_the_table_here_and_in_the_cloud(env,
     mgr, provider = make_manager(tmp_path)
     write_file(tmp_path, "memory", ["deploys are on Tuesdays", "use pnpm"])
     turn(provider, 1)
-    provider.shutdown()
+    end_session(provider)
     write_file(tmp_path, "memory", ["use pnpm"])
     turn(provider, 2)
-    provider.shutdown()
+    end_session(provider)
     assert contents(local_rows(tmp_path, tables.MEMORY)) == ["use pnpm"]
     assert contents(platform.rows(TEAM_DB, tables.MEMORY)) == ["use pnpm"]
 
@@ -86,7 +86,7 @@ def test_a_memory_tool_write_and_the_comparison_keep_one_row(env, platform, tmp_
     turn(provider)
     provider.on_memory_write("add", "memory", "use pnpm")
     turn(provider, 2)
-    provider.shutdown()
+    end_session(provider)
     assert contents(platform.rows(TEAM_DB, tables.MEMORY)) == ["use pnpm"]
 
 
@@ -97,7 +97,7 @@ def test_a_missing_or_unreadable_file_deletes_nothing(env, platform, tmp_path):
     (tmp_path / builtin.MEMORIES_DIR).mkdir(parents=True, exist_ok=True)
     (tmp_path / builtin.MEMORIES_DIR / "MEMORY.md").write_bytes(b"\xff\xfe not text")
     turn(provider, 2)
-    provider.shutdown()
+    end_session(provider)
     assert contents(platform.rows(TEAM_DB, tables.MEMORY)) == ["use pnpm"]
 
 
@@ -106,7 +106,7 @@ def test_a_secret_in_a_memory_file_never_leaves_this_machine(env, platform, tmp_
     write_file(tmp_path, "memory", [f"the deploy key is {SECRET}"])
     turn(provider)
     turn(provider, 2)  # compared again: the scrubbed row still holds the entry
-    provider.shutdown()
+    end_session(provider)
     [row] = platform.rows(TEAM_DB, tables.MEMORY)
     assert SECRET not in row["content"] and row["content"].startswith("the deploy key is")
 
@@ -115,7 +115,7 @@ def test_what_the_review_wrote_before_a_start_is_caught_up_at_the_start(env, pla
     write_file(tmp_path, "memory", ["written while no session ran"])
     mgr, provider = make_manager(tmp_path)
     provider._drain()
-    provider.shutdown()
+    end_session(provider)
     assert contents(platform.rows(TEAM_DB, tables.MEMORY)) == ["written while no session ran"]
 
 
@@ -128,7 +128,7 @@ def test_a_review_entry_found_during_a_group_turn_is_that_chats_and_not_its_send
     in_session(monkeypatch, GROUP)
     write_file(tmp_path, "memory", ["the build is flaky on Fridays"])
     turn(provider)
-    provider.shutdown()
+    end_session(provider)
     [row] = platform.rows(TEAM_DB, tables.MEMORY)
     assert (row["content"], row["chat"], row["author"], row["scope"]) == (
         "the build is flaky on Fridays", GROUP_CHAT, "owner-name", "team")
@@ -250,12 +250,12 @@ def test_a_shared_profiles_user_file_is_never_taken_for_the_owners_memory(env, p
     write_file(tmp_path, "user", ["works from Lisbon"])
     write_file(tmp_path, "memory", ["deploys are on Tuesdays"])
     turn(provider)
-    provider.shutdown()
+    end_session(provider)
     # The owner's own session on the same profile does not take it either.
     in_session(monkeypatch, {})
     _, at_the_terminal = make_manager(tmp_path, session_id="cli")
     turn(at_the_terminal, 2)
-    at_the_terminal.shutdown()
+    end_session(at_the_terminal)
     assert platform.rows(PERSONAL_DB, tables.MEMORY) == [] and personal_rows(tmp_path) == []
     assert contents(platform.rows(TEAM_DB, tables.MEMORY)) == ["deploys are on Tuesdays"]
 
@@ -268,7 +268,7 @@ def test_a_personal_profiles_dm_user_entry_is_its_owners(env, platform, tmp_path
     in_session(monkeypatch, DM)  # whoever sent the turn, the entry is the owner's
     write_file(tmp_path, "user", ["works from Lisbon"])
     turn(provider)
-    provider.shutdown()
+    end_session(provider)
     assert wait_for(lambda: len(platform.rows(PERSONAL_DB, tables.MEMORY)) == 1)
     [row] = platform.rows(PERSONAL_DB, tables.MEMORY)
     assert (row["content"], row["author"]) == ("About dana: works from Lisbon", "dana")

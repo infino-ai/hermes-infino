@@ -317,6 +317,10 @@ class InfinoMemoryProvider(MemoryProvider):
         self._session_id = ""
         # Whether another agent wrote the running turn (on_turn_start).
         self._turn_by_agent = False
+        # Whether Hermes ended the session since its last turn (on_session_end):
+        # a shutdown that follows is the session's end, which waits for its rows
+        # to reach the cloud; any other shutdown is a soft release (shutdown).
+        self._session_ended = False
         # session_id -> where the scheduled job its run belongs to was made (_job_origin).
         self._job_origins: dict[str, Optional[str]] = {}
         # session_id -> the next `seq` of its messages; a session this process
@@ -526,13 +530,23 @@ class InfinoMemoryProvider(MemoryProvider):
         return self._job_origins[self._session_id]
 
     def _read_job_origin(self) -> Optional[str]:
-        """_job_origin, read from Hermes's job store."""
-        job = privacy.cron_job(self._session_id)
+        """_job_origin, read from Hermes's job store. A run whose session id
+        names a job only by a name several jobs share may be any of them
+        (privacy.cron_job): the most guarded of their origins is the run's."""
+        found = privacy.cron_job(self._session_id)
+        origins = [self._origin_of(job_id) for job_id, _ in found] or [ORIGIN_GROUP]
+        if ORIGIN_GROUP in origins:
+            return ORIGIN_GROUP
+        return ORIGIN_DM if ORIGIN_DM in origins else None
+
+    def _origin_of(self, job_id: str) -> Optional[str]:
+        """Where one scheduled job was made (_job_origin), from Hermes's job
+        store; ORIGIN_GROUP for a job that cannot be read."""
         jobs = sys.modules.get(CRON_JOBS_MODULE)
         try:
-            record = jobs.get_job(job[0]) if job is not None and jobs is not None else None
+            record = jobs.get_job(job_id) if jobs is not None else None
         except Exception as e:  # unreadable: the run is taken as a group's
-            logger.info("infino: could not read the scheduled job of session %s: %s", self._session_id, e)
+            logger.info("infino: could not read scheduled job %s of session %s: %s", job_id, self._session_id, e)
             record = None
         if not isinstance(record, dict):
             return ORIGIN_GROUP
@@ -881,6 +895,7 @@ class InfinoMemoryProvider(MemoryProvider):
         messages: Optional[list[dict[str, Any]]] = None,
         turn_author: Optional[dict[str, Any]] = None,
     ) -> None:
+        self._session_ended = False  # a turn: the session goes on
         if not self._writes_enabled or not self._settings:
             return
         self._refresh_settings()
@@ -1133,7 +1148,9 @@ class InfinoMemoryProvider(MemoryProvider):
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         """Hermes calls this inline (at compaction, /new) as well as at exit:
-        it only starts a sync. `shutdown`, at exit, waits for the rows to go."""
+        it only starts a sync. `shutdown`, when it follows (at exit), waits
+        for the rows to go."""
+        self._session_ended = True
         if self._backend is not None:
             self._backend.schedule_sync()
 
@@ -1147,6 +1164,7 @@ class InfinoMemoryProvider(MemoryProvider):
         personal as the parent; `/resume` and `/new` (a reset) carry nothing
         of the session left, which Hermes names as their parent too."""
         previous, self._session_id = self._session_id, new_session_id
+        self._session_ended = False  # the session goes on, under this id
         if new_session_id == previous:  # compacted in place, or /undo: the same session
             return
         note_identity(new_session_id, self._author, self._profile)
@@ -1165,10 +1183,23 @@ class InfinoMemoryProvider(MemoryProvider):
             privacy.note_personal(child)
 
     def shutdown(self) -> None:
+        """Hermes shuts the provider down at a session's end (after
+        on_session_end: at exit, a one-shot run's end, a gateway session's
+        expiry) and at a soft release (a CLI agent rebuilt for /reasoning or a
+        route change, a gateway's cache eviction), with nothing to tell them
+        apart but that order. Both write what this process still holds to the
+        local database. Only a session's end waits for the rows to reach the
+        cloud, since a one-shot run exits right after; a soft release leaves
+        them to the background sync, so the person's next message never waits
+        on the cloud."""
         # Trace rows a fork of a session (Hermes's background review, /btw)
         # added after the session's last turn ended have no turn end to wait for.
         if self._settings is not None:
             write_buffered(self._settings.home)
         self._drain()
-        if self._backend is not None:
+        if self._backend is None:
+            return
+        if self._session_ended:
             self._backend.flush()
+        else:
+            self._backend.schedule_sync()

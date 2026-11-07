@@ -13,7 +13,7 @@ from agent.memory_manager import _redact_for_provider
 
 from hermes_infino import privacy, tables, traces
 
-from .helpers import GROUP, hook_ctx, in_session, local, local_rows, make_manager, wait_for
+from .helpers import GROUP, end_session, hook_ctx, in_session, local, local_rows, make_manager, wait_for
 
 # A credential shaped the way Hermes's redaction recognizes one.
 SECRET = "sk-ant-api03-" + "A1b2C3d4E5f6G7h8I9j0" * 4
@@ -287,7 +287,7 @@ def test_rows_a_fork_adds_after_the_turn_are_written_at_shutdown(home, tmp_path)
     # Hermes's background review: the session's id, after the turn ended, and no end of its own.
     hooks["post_api_request"](session_id="s1", turn_id="the-review", model="m")
     hooks["post_tool_call"](session_id="s1", turn_id="the-review", tool_name="memory")
-    provider.shutdown()
+    end_session(provider)
     assert len(local_rows(tmp_path, tables.TRACES)) == 3
 
 

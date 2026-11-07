@@ -3,8 +3,10 @@ and its lifecycle."""
 
 from __future__ import annotations
 
+import fcntl
 import json
 import sys
+import time
 
 import pytest
 
@@ -12,12 +14,12 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.turn_context import append_notes_to_multimodal_content, compose_multimodal_context_part
 from gateway.owner_identity import host_owner_subject
 
-from hermes_infino import backend, config, embed, privacy, provider as provider_mod, skills, tables
+from hermes_infino import backend, config, embed, mirror, privacy, provider as provider_mod, skills, tables
 from hermes_infino.local import VECTORS
 from hermes_infino.provider import PERSONAL_SEARCH_TOOL, InfinoMemoryProvider
 
-from .helpers import (DM, GROUP, SKILL_MD, fake_embed, hook_ctx, in_session, local, local_rows, make_manager,
-                      personal_rows, wait_for)
+from .helpers import (DM, GROUP, SKILL_MD, TEAM_DB, end_session, fake_embed, hook_ctx, in_session, local, local_rows,
+                      make_manager, personal_rows, wait_for)
 
 # What a provider declares before it starts, which is what Hermes routes by:
 # every tool, the personal search included (it is shown only where offered).
@@ -32,6 +34,10 @@ RECALLED = "## Relevant memory (Infino)\n- [personal] dentist on Tuesday"
 PEER_AGENT = {"author_id": "bot:spark/researcher", "author_name": "researcher", "author_is_bot": True}
 # How a Desktop session names this machine's own user to its provider (gateway/owner_identity.py).
 DESKTOP_USER = "uid:1000"
+# A session end's bound on waiting for the cloud, short enough for a test.
+QUICK_FLUSH_S = 3.0
+# The most a soft release may take: well under a settle window and a sync.
+SOFT_RELEASE_S = 1.0
 
 
 def call(mgr, tool: str, **args) -> dict:
@@ -227,7 +233,7 @@ def test_session_end_and_shutdown_in_local_mode(mgr, tmp_path):
     _, p = mgr
     p.on_memory_write("add", "memory", "kept")
     p.on_session_end([])
-    p.shutdown()
+    end_session(p)
     assert len(local_rows(tmp_path, tables.MEMORY)) == 1
 
 
@@ -406,7 +412,7 @@ def test_a_running_process_picks_up_a_sign_in(home, platform, tmp_path, monkeypa
     assert p._backend.signed_in
     assert wait_for(lambda: tables.MEMORY in platform.databases.get("team-test", {}))
     call(m, "infino_remember", content="written after the sign-in")
-    p.shutdown()
+    end_session(p)
     assert [r["content"] for r in platform.rows("team-test", tables.MEMORY)] == ["written after the sign-in"]
 
 
@@ -639,3 +645,42 @@ def test_a_start_without_the_model_still_starts(home, tmp_path):
     assert call(m, "infino_remember", content="the deploy freeze starts December 20")["ok"]
     embed.use(fake_embed)
     assert "deploy freeze" in p.prefetch("deploy freeze")
+
+
+# -- a soft release and a session's end ------------------------------------------
+
+def test_a_soft_release_never_waits_on_the_cloud(env, platform, tmp_path, monkeypatch):
+    monkeypatch.setattr(backend, "FLUSH_TIMEOUT_S", QUICK_FLUSH_S)
+    mgr, _ = make_manager(tmp_path)
+    mgr.handle_tool_call("infino_remember", {"content": "written before the agent is rebuilt"})
+    with open(config.state_dir(tmp_path) / mirror.LOCK_FILE, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)  # a sync held up by a slow cloud
+        started = time.monotonic()
+        mgr.release_soft()  # Hermes rebuilding the CLI's agent (/reasoning, a route change)
+        took = time.monotonic() - started
+        fcntl.flock(f, fcntl.LOCK_UN)
+    assert took < SOFT_RELEASE_S
+    # The background sync still takes the row.
+    assert wait_for(lambda: [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)]
+                    == ["written before the agent is rebuilt"])
+
+
+@pytest.mark.parametrize("steps, waits", [
+    ((), False),                                  # a soft release: shutdown alone
+    (("end",), True),                             # a session's end: on_session_end, then shutdown
+    (("end", "turn"), False),                     # /new or compaction ended a session, and turns went on
+    (("end", "switch"), False),                   # ... into a new session id
+])
+def test_only_a_sessions_end_waits_for_the_cloud(env, tmp_path, monkeypatch, steps, waits):
+    _, p = make_manager(tmp_path)
+    flushed = []
+    monkeypatch.setattr(p._backend, "flush", lambda *a, **k: flushed.append(True))
+    for step in steps:
+        if step == "end":
+            p.on_session_end([])
+        elif step == "turn":
+            p.sync_turn("q", "a", session_id="s1")
+        else:
+            p.on_session_switch("s2", parent_session_id="s1", reset=True)
+    p.shutdown()
+    assert flushed == ([True] if waits else [])

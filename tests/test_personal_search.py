@@ -15,7 +15,8 @@ from hermes_infino.client import InfinoClient
 from hermes_infino.provider import (MAX_PERSONAL_SEARCH_K, PERSONAL_RESULT_CELL_CHARS, PERSONAL_SEARCH_TOOL,
                                     InfinoMemoryProvider)
 
-from .helpers import DM, GROUP, PERSONAL_DB, hook_ctx, in_session, local_rows, make_manager, requests_to, wait_for
+from .helpers import (DM, GROUP, PERSONAL_DB, end_session, hook_ctx, in_session, local_rows, make_manager, requests_to,
+                      wait_for)
 from .test_personal import personal, texts
 
 PRIVATE = "Dr. Lee sent the test results"
@@ -455,7 +456,7 @@ def test_a_branch_of_a_session_kept_personal_before_a_restart_is_personal(home, 
     search(p, query="Dr. Lee")
     p.sync_turn("did my doctor write?", "No.", session_id="s1")
     p._drain()
-    p.shutdown()
+    end_session(p)
     backend._backends.clear()  # a new process: only the stored rows say s1 is personal
     privacy._sessions.clear()
     mgr, again = make_manager(tmp_path, session_id="s1")
@@ -508,7 +509,7 @@ def test_the_session_stays_personal_after_a_restart(home, tmp_path):
     search(p, query="Dr. Lee")
     p.sync_turn("did my doctor write?", "No.", session_id="s1")
     p._drain()
-    p.shutdown()
+    end_session(p)
     backend._backends.clear()  # a new process: nothing remembered about any session
     privacy._sessions.clear()
     _, again = make_manager(tmp_path, session_id="s1")

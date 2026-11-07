@@ -19,8 +19,8 @@ from tools.delegate_tool_routes import delegated_profile_scope
 from hermes_infino import backend, config, privacy, tables
 from hermes_infino.local import PERSONAL_DB_DIR, LocalStore
 
-from .helpers import (DM, PERSONAL_DB, SKILL_MD, TEAM_DB, hook_ctx, in_session, local, make_manager, personal_rows,
-                      wait_for, write_tools_setting)
+from .helpers import (DM, PERSONAL_DB, SKILL_MD, TEAM_DB, end_session, hook_ctx, in_session, local, make_manager,
+                      personal_rows, wait_for, write_tools_setting)
 
 # A person's email digest (personal) and the team's weekly report (not).
 DIGEST = {"id": "a1b2c3", "name": "email-digest"}
@@ -199,7 +199,7 @@ def test_the_chat_stays_personal_after_compaction_and_a_restart(chat, tmp_path):
     first = [{"role": "user", "content": DELIVERED}] + turn("Draft a reply to Dr. Lee.", "Drafted.")
     p.sync_turn("Draft a reply to Dr. Lee.", "Drafted.", session_id="dm-1", messages=first)
     p._drain()
-    p.shutdown()
+    end_session(p)
     # A new process; Hermes compacted the chat in place: the delivery is gone from its messages.
     restart()
     _, again = make_manager(tmp_path, platform="telegram", session_id="dm-1")
@@ -609,7 +609,7 @@ def test_personal_rows_never_reach_the_team_databases_sources_and_team_rows_stil
     p.sync_turn("Draft a reply to Dr. Lee.", "Drafted for Dr. Lee.", session_id="dm-1", messages=messages)
     p._drain()
     assert wait_for(lambda: len(texts(local(tmp_path), tables.TRACES) + texts(personal(tmp_path), tables.TRACES)) == 3)
-    p.shutdown()  # pushes what is left before it returns
+    end_session(p)  # pushes what is left before it returns
     assert not [t for t in team_source_texts(p) if PRIVATE in t]
     for table in (tables.CONVERSATIONS, tables.TRACES):
         assert not [t for t in cloud_texts(platform, TEAM_DB, table) if PRIVATE in t]
