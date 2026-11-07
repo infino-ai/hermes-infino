@@ -16,7 +16,7 @@ The plugin keeps four tables.
 
 **`traces`** records every model call (model, provider, tokens, time) and every tool call (name, arguments, result, status, time). Secrets are masked the same way Hermes masks them for any memory plugin.
 
-**`skills`** holds the skills your agents share with `infino_publish_skill`. Once you sign in, every profile on the team can use them as read-only `infino:<name>` skills, from its next session. Only the profile's owner publishes, from their own sessions or a chat on a profile marked personal. Group chat members, a shared profile's gateway users, hosted rooms, messages from other agents and jobs made in a gateway chat can't. Secrets are masked first. A shared skill's name can have only letters, digits, `-` and `_`, the only names Hermes loads a plugin's skills under. Set `INFINO_TEAM_SKILLS=off` to keep a profile to its own skills.
+**`skills`** holds the skills your agents share with `infino_publish_skill`. Once you sign in, every profile on the team can use them as read-only `infino:<name>` skills, from its next session. Only the profile's owner publishes: from their own sessions, and on a profile marked personal, from a direct message or a webhook route listed in `INFINO_OWNER_ROUTES`. A scheduled job publishes as the chat it was made in. Group chat members, a shared profile's gateway users, hosted rooms and messages from other agents can't. Secrets are masked first. A shared skill's name can have only letters, digits, `-` and `_`, the only names Hermes loads a plugin's skills under. Set `INFINO_TEAM_SKILLS=off` to keep a profile to its own skills.
 
 A turn and its traces share a `session_id` and a `turn_id`, so you can join them. Every row has a `row_id`.
 
@@ -124,13 +124,13 @@ To use another Infino platform, such as staging, add `--url`:
 hermes infino login --url https://api.platform.staging.infino.ai --api-key-file KEY --team-database TEAM --yes
 ```
 
-`login` shows what it will upload and asks before it creates or sends anything. Only a person at a terminal can agree to create an account. With a key someone gave you, `--yes` agrees to the upload. The key is saved in `$HERMES_HOME/infino/credentials.json`, readable only by you. A free account's key is given only once, so keep that file. To sign in again, save its `api_key` to a file first. Then remove `credentials.json` and run `hermes infino login` with `--api-key-file` and the saved key, and `--team-database` and your team's database.
+`login` shows what it will upload and asks before it creates or sends anything. Only a person at a terminal can agree to create an account. With a key someone gave you, `--yes` agrees to the upload. The key is saved in `$HERMES_HOME/infino/credentials.json`, readable only by you. A free account's key is given only once, so keep that file. To sign in again, save its `api_key` to a file first. Then remove `credentials.json` and run `hermes infino login` with `--api-key-file` and the saved key, `--team-database` and your team's database, and `--personal-database` and your personal database (or `--no-personal-database` if you have none), so your personal data stays in one database. Run `hermes infino login` while you're signed in and it prints that command.
 
-A URL, team database, personal database or key set in the config block or `.env` takes precedence over a sign-in (see [Settings](#settings)). `login` uses the team and personal database set there. If one of those settings differs from what `login` would use, `login` stops before it creates or sends anything and says where the setting is.
+A URL, team database, personal database or key set in the config block or `.env` takes precedence over a sign-in (see [Settings](#settings)). `login` uses the team and personal database set there. If one of those settings differs from what `login` would use, `login` stops before it creates or sends anything, and names the variable and where it's set. A personal database set to the team database counts as not set. A URL must start with `https://` or `http://`.
 
 Once you're signed in, the plugin uploads what your machine has kept so far, then each new memory, conversation, trace and skill as it happens. Your machine keeps its own copy.
 
-`login` also creates your personal database and prints its name, unless `INFINO_PERSONAL_DATABASE` already names one. The name is the team's plus a random suffix, such as `hermes-team-personal-3f9a1c2e`, so it's never shared with anyone. To use it from another machine, sign in there with `--personal-database` and that name. To keep personal data on this machine only, add `--no-personal-database`. Your personal database can't be the team database. If it can't be created, for example because your key may not create that database, you're still signed in, and personal data stays on your machine. To add one later without signing in again, run `hermes config set INFINO_PERSONAL_DATABASE <a name of your own>`. The next sync creates it.
+`login` also creates your personal database and prints its name. Its name is the team's plus a random suffix, such as `hermes-team-personal-3f9a1c2e`, so it's never shared with anyone. If `INFINO_PERSONAL_DATABASE` or `--personal-database` names one, `login` uses that one instead, and creates it if it doesn't exist. To use it from another machine, sign in there with `--personal-database` and that name. To keep personal data on this machine only, add `--no-personal-database`. Your personal database can't be the team database. If it can't be created, for example because your key may not create that database, you're still signed in, and personal data stays on your machine. To add one later without signing in again, run `hermes config set INFINO_PERSONAL_DATABASE <name>`, with a name that's yours alone. The next sync creates it, or uses it as it is if a database by that name already exists. A Hermes that's already running uses it after a restart.
 
 A running Hermes picks up the sign-in within half a minute. The Infino tools switch to the cloud when Hermes restarts. Until then they search your machine's copy, which has everything too.
 
@@ -228,12 +228,14 @@ mcp_servers:
     args: [infino, mcp]
     env:
       INFINO_CLIENT: /path/to/client/dist/cli.js
-      INFINO_TEAM_DATABASE: support-team
-      INFINO_API_KEY: ${INFINO_API_KEY}    # a reference; the key itself is in the profile's .env
+      INFINO_FLEET_TEAM_DATABASE: support-team
+      INFINO_FLEET_API_KEY: ${INFINO_API_KEY}    # a reference; the key itself is in the profile's .env
     connect_timeout: 120
 ```
 
-With Hermes's [Remote Config](https://github.com/NousResearch/hermes-agent/pull/122509) (Hermes 0.22.6 and later, turned on with `HERMES_CONFIG_BACKEND=remote`), these settings come from the config service instead of a file. An administrator sets the team database once, and every agent on the team starts with it. Remote Config won't store a key written out in full, so keep `INFINO_API_KEY` as a `${INFINO_API_KEY}` reference and put the key in each profile's `.env`. `hermes infino status` shows where the settings came from.
+In this block, write the key, team database and URL as `INFINO_FLEET_API_KEY`, `INFINO_FLEET_TEAM_DATABASE` and `INFINO_FLEET_URL`. Hermes starts the Infino tools with the block as their environment, and the tools then load the profile's `.env` over it, as every `hermes` command does. Nothing writes these names into `.env`, so the plugin and its tools both use the block's values, whatever else `.env` holds, with a config file or with Remote Config.
+
+With Hermes's [Remote Config](https://github.com/NousResearch/hermes-agent/pull/122509) (Hermes 0.22.6 and later, turned on with `HERMES_CONFIG_BACKEND=remote`), these settings come from the config service instead of a file. An administrator sets the team database once, and every agent on the team starts with it. Remote Config won't store a key written out in full, so keep `INFINO_FLEET_API_KEY` as a `${INFINO_API_KEY}` reference and put the key in each profile's `.env`. `hermes infino status` shows where the settings came from.
 
 Write every value in the `env` block as text. YAML reads a bare `on`, `off`, `yes`, `no`, `true` or `false` as a boolean, and reads numbers and lists as numbers and lists. Hermes passes them to the Infino tools as they are, and the tools won't start. So quote them, as in `INFINO_PERSONAL_PROFILE: "on"`, and write jobs as one string, as in `INFINO_PERSONAL_JOBS: "email-digest,weekly-finances"`. The plugin's log names any value that isn't text. `hermes config set` stores these values as booleans, numbers and lists too, so edit `config.yaml` instead, or put the setting in `.env`, for example with `hermes config set INFINO_PERSONAL_PROFILE on`.
 
@@ -244,10 +246,10 @@ A profile set up this way uses the personal database from its `login` only while
 Each setting comes from the first of these that has it:
 
 1. the `env` block of `mcp_servers.infino` in the profile's config (a file or Remote Config)
-2. the profile's environment (`.env`)
+2. the profile's own environment (`.env`). On a gateway that serves several profiles, or the desktop app serving another profile, each profile reads only its own `.env`, never that of the profile Hermes was started with.
 3. the sign-in saved by `hermes infino login`
 
-The config block comes first for the plugin and for the Infino tools alike, so both always use the same team, whatever `.env` says. A `${VAR}` reference to a variable that isn't set counts as not set.
+The key, team database and URL, under their `INFINO_FLEET_` names in the block, come first for the plugin and for the Infino tools alike, so both always use the same team, whatever `.env` says. Under their usual names in the block, the tools read them from `config.yaml` themselves. With Remote Config they can't: if `.env` sets the same name, the tools use the `.env` value while the plugin uses the block's. A `${VAR}` reference to a variable that isn't set counts as not set.
 
 The sign-in's URL and personal database go with its key. They apply only when the key in use is the sign-in's, so another key, from the config block or `.env`, never goes to the sign-in's platform or writes to its personal database.
 
@@ -255,7 +257,7 @@ The sign-in's URL and personal database go with its key. They apply only when th
 | --- | --- |
 | `INFINO_API_KEY` | The Infino API key for this person or bot |
 | `INFINO_TEAM_DATABASE` | The team's database |
-| `INFINO_PERSONAL_DATABASE` | Your own database. `login` creates one. Leave it unset for bots and shared profiles. If it names the team database, the plugin uses none. |
+| `INFINO_PERSONAL_DATABASE` | Your own database. `login` creates one. Leave it unset for bots and shared profiles. If it names the team database, it counts as not set. |
 | `INFINO_AUTHOR` | Who this profile's messages and memories are from, when Hermes doesn't say (default: the profile's name, on every surface, never the machine's user id). In a chat, the sender is the author. |
 | `INFINO_MCP_SERVER` | The client's name under `mcp_servers` (default `infino`). Environment only, since it names the config block. |
 | `INFINO_URL` | The Infino Cloud URL (default `https://api.platform.infino.ws`) |
@@ -263,6 +265,7 @@ The sign-in's URL and personal database go with its key. They apply only when th
 | `INFINO_PERSONAL_PROFILE` | `on` keeps this profile's conversations and traces out of the team database, and lets its gateway chats keep personal memory (default off). Any value other than `off`, `false`, `no` or `0` counts as `on`. |
 | `INFINO_PERSONAL_JOBS` | Scheduled jobs (names or ids, comma-separated) whose runs, and the chats their output is delivered to, stay out of the team database. On a profile other than the job's own, name the job, not its id. |
 | `INFINO_OWNER_ROUTES` | On a profile marked personal, the webhook routes (comma-separated) whose events are your own: their turns read and write your personal memory. Ignored on a shared profile. |
+| `INFINO_FLEET_API_KEY`, `INFINO_FLEET_TEAM_DATABASE`, `INFINO_FLEET_URL` | The key, team database and URL, written in the `env` block (see [Running a fleet](#running-a-fleet)). They come before every other setting of the same kind. |
 
 ## Development
 

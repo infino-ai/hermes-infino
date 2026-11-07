@@ -216,3 +216,28 @@ def test_a_skill_gone_from_the_teams_table_never_loads_from_its_copy(home, platf
     platform.close()
     skills._loaded_at.clear()
     assert skills.register_team_skills(Ctx(), settings, home=tmp_path) == ["deploy"]
+
+
+def test_a_copy_another_load_wrote_after_this_ones_query_is_kept(home, platform, tmp_path, monkeypatch):
+    settings = sign_in(tmp_path, platform)
+    publish(platform, {"name": "deploy", "content": "d", "created_ms": 1})
+    real_query = skills.backend.Backend.query
+    other = Ctx()
+    queries = []
+
+    def query(self, sql, timeout_s=None):
+        queries.append(sql)
+        rows = real_query(self, sql, timeout_s=timeout_s)  # this load's answer: deploy alone
+        if len(queries) == 1:
+            # Meanwhile a skill is published, and another process's load (the
+            # gateway's, say, with this profile's CLI) reads it, writes its
+            # copy and registers it.
+            publish(platform, {"name": "fresh", "content": "f", "created_ms": 2})
+            skills._loaded_at.clear()  # that process has no load of its own yet
+            assert skills.register_team_skills(other, settings, home=tmp_path) == ["deploy", "fresh"]
+        return rows
+
+    monkeypatch.setattr(skills.backend.Backend, "query", query)
+    assert skills.register_team_skills(Ctx(), settings, home=tmp_path) == ["deploy"]
+    # The copy the other process registered is still there for Hermes to load.
+    assert (skills.cache_root(settings, tmp_path) / "fresh" / "SKILL.md").read_text() == "f"

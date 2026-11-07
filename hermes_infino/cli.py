@@ -27,8 +27,9 @@ platform gives a new account's key only once.
 The config block and the environment take precedence over a sign-in
 (config.py). So `login` names the team and personal database they set, and
 refuses, before anything is created or sent, a URL, team database, personal
-database or key they set otherwise: the notice would name a place the rows
-never go.
+database or key they set otherwise, naming the variable and where it is set:
+the notice would name a place the rows never go. A personal database they set
+to the team database counts as unset, as it does everywhere.
 
 Hermes imports this module to build its command line for every command, so
 the engine and the model are imported only inside the commands that use them.
@@ -64,13 +65,18 @@ PERSONAL_PART = "-personal-"
 PERSONAL_RANDOM_BYTES = 4
 # The longest database name the platform takes.
 MAX_DATABASE_NAME = 128
-# The `login` option that sets each setting a sign-in holds.
-LOGIN_OPTIONS = {config.KEY_ENV: "--api-key-file", config.URL_ENV: "--url", config.TEAM_DB_ENV: "--team-database",
-                 config.PERSONAL_DB_ENV: "--personal-database"}
+# What a platform URL starts with (any case).
+URL_SCHEMES = ("https://", "http://")
+# What each setting a sign-in holds is, as a refusal names it.
+SETTING_NAMES = {config.URL_ENV: "the platform", config.TEAM_DB_ENV: "the team database",
+                 config.PERSONAL_DB_ENV: "the personal database"}
 # How to have a personal database without signing in again: name one, and the
-# sync makes it (tables.ensure_all).
-ADD_PERSONAL_DATABASE = (f"To have a personal database without signing in again, name one of your own: "
-                         f"`hermes config set {config.PERSONAL_DB_ENV} <name>`; the next sync makes it.")
+# sync makes it (tables.ensure_all), or takes one of that name as it is. A
+# running Hermes read its environment when it started.
+ADD_PERSONAL_DATABASE = (f"To have a personal database without signing in again, name one that is yours alone: "
+                         f"`hermes config set {config.PERSONAL_DB_ENV} <name>`. The next sync makes it (a database "
+                         f"of that name that exists already is used as it is), and a running Hermes uses it once it "
+                         f"restarts.")
 
 
 def register_cli(parser: argparse.ArgumentParser) -> None:
@@ -242,25 +248,28 @@ def _personal_database(client: InfinoClient, personal: Optional[str], team: str)
     return name
 
 
-def _overridden(signing_in: dict, server: str) -> str:
+def _overridden(outside: dict, signing_in: dict, server: str) -> str:
     """Why the sign-in would not be the settings in effect: the first of
-    `signing_in` ({variable: what the sign-in would hold}) that the config
-    block or the environment sets otherwise, which takes precedence over a
-    sign-in; "" when there is none. A personal database is None when none is
-    wanted, and a key "" when a new account is to make it."""
-    for name, (value, where) in config.overrides().items():
+    `signing_in` ({setting: what the sign-in would hold}) that `outside`
+    (config.overrides: set in the config block or the environment, which takes
+    precedence over a sign-in) holds otherwise; "" when there is none. A
+    personal database is None when none is wanted, "" for a new one, and a key
+    "" when a new account is to make it. The refusal names the variable and
+    where it is set: that is where it is changed."""
+    for name, (value, where, variable) in outside.items():
         wanted = signing_in[name]
         if wanted == value or (name == config.URL_ENV and wanted == value.rstrip("/")):
             continue
         place = (f"the `env` block of mcp_servers.{server} in the config" if where == config.FROM_CONFIG
                  else "this profile's environment (its .env)")
         if name == config.KEY_ENV:  # never printed: it is a secret
-            return (f"{name} is set in {place}, and a key set there is used instead of a sign-in's, so the key "
-                    "this sign-in would save would never be used. Remove it there, or sign in with that key "
-                    "(--api-key-file).")
-        option = "--no-personal-database" if wanted is None else LOGIN_OPTIONS[name]
-        return (f"{name} is '{value}' in {place}, which takes precedence over a sign-in, so rows would go to "
-                f"'{value}', not where {option} says. Change or remove it there, or leave out {option}.")
+            return (f"{variable} is set in {place}, and a key set there is used instead of a sign-in's, so the key "
+                    f"this sign-in would save would never be used. Remove {variable} there, or sign in with that "
+                    "key.")
+        instead = "none" if wanted is None else "a new one" if not wanted else f"'{wanted}'"
+        return (f"{variable} is '{value}' in {place}, and a value set there is used instead of a sign-in's, so "
+                f"{SETTING_NAMES[name]} would be '{value}', not {instead}. Change or remove {variable} there, or sign "
+                "in with that value.")
     return ""
 
 
@@ -283,12 +292,17 @@ def _login(args) -> int:
     if current.signed_in:
         print(f"Already signed in: {current.url} / {current.team_database}, from the {current.source}. "
               "`hermes infino status` shows how far the cloud is.")
-        if config.FROM_SIGN_IN in current.source:
-            # The file may hold the only copy of a free account's key.
+        if current.api_key == config.sign_in_key():
+            # The file may hold the only copy of a free account's key. Signing
+            # in again names everything this sign-in has, its personal
+            # database (or none) too: another would split personal memory in two.
             path = config.credentials_path()
+            personal = (f"--personal-database {current.personal_database}" if current.personal_database
+                        else "--no-personal-database")
             print(f"To sign in again, keep the key: it is the `api_key` in {path}, and the platform gives a free "
                   f"account's key only once. Save it to a file, remove {path}, and run `hermes infino login "
-                  f"--url {current.url} --api-key-file <that file> --team-database {current.team_database}`.")
+                  f"--url {current.url} --api-key-file <that file> --team-database {current.team_database} "
+                  f"{personal}`.")
         print(f"The `env` block of mcp_servers.{current.mcp_server} in the config, and the environment, take "
               "precedence over a sign-in: change a setting there to change it.")
         if not current.personal_database:
@@ -303,19 +317,25 @@ def _login(args) -> int:
             print(f"infino: cannot read the key file: {e}", file=sys.stderr)
             return 1
     url = (args.url or current.url or DEFAULT_URL).rstrip("/")
+    if not url.lower().startswith(URL_SCHEMES):
+        print(f"infino: the platform URL '{url}' does not start with https:// (or http://). Nothing was created or "
+              "sent.", file=sys.stderr)
+        return 1
     # The team and personal database the profile already names, so the
     # notice, the account and the rows all name the same ones.
     database = args.team_database or current.team_database or DEFAULT_DATABASE
-    personal = None if args.no_personal_database else (args.personal_database or current.personal_database or "")
-    overridden = _overridden({config.KEY_ENV: api_key, config.URL_ENV: url, config.TEAM_DB_ENV: database,
-                              config.PERSONAL_DB_ENV: personal}, current.mcp_server)
+    outside = config.overrides(team_database=database)
+    named = outside.get(config.PERSONAL_DB_ENV, ("",))[0]
+    personal = None if args.no_personal_database else (args.personal_database or named or "")
+    overridden = _overridden(outside, {config.KEY_ENV: api_key, config.URL_ENV: url, config.TEAM_DB_ENV: database,
+                                       config.PERSONAL_DB_ENV: personal}, current.mcp_server)
     if overridden:
         print(f"infino: {overridden} Nothing was created or sent.", file=sys.stderr)
         return 1
-    if personal and personal == database:
-        print(f"infino: '{database}' is the team database, so it cannot be your personal database: what is "
-              "personal would go into the team's tables. Name another, or leave out --personal-database and "
-              "one is made. Nothing was created or sent.", file=sys.stderr)
+    if personal and personal == database:  # from --personal-database: a set one is never the team's (overrides)
+        print(f"infino: '{database}' is the team database, so --personal-database cannot name it: what is personal "
+              "would go into the team's tables. Name another, or leave it out and one is made. Nothing was created "
+              "or sent.", file=sys.stderr)
         return 1
     counts = _local_counts()
     print(_upload_notice(url, database, counts, new_account, _personal_destination(personal)))

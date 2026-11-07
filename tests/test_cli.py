@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import io
+import re
+import shlex
 import threading
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +19,12 @@ from .helpers import PERSONAL_DB, TEAM_DB, make_manager, sign_in, write_tools_se
 
 # A port nothing listens on.
 DEAD_URL = "http://127.0.0.1:9"
+# A platform URL written without its scheme.
+NO_SCHEME_URL = "api.platform.infino.ws"
+# The command `login` prints for signing in again, between backticks.
+SIGN_IN_AGAIN = re.compile(r"`(hermes infino login [^`]*)`")
+# Where that command names the file the saved key is in.
+KEY_FILE_PLACE = "<that file>"
 # A row carrying this text is refused by the fake platform, when told to.
 REFUSED_TEXT = "refuse-this-row"
 # "Too large": a refusal that sets the row aside rather than stopping the sync.
@@ -321,6 +329,54 @@ def test_signing_in_again_as_told_keeps_a_free_accounts_only_key(home, platform,
     assert config.read_credentials(tmp_path)["api_key"] == "trial-key-1"
 
 
+def test_signing_in_again_as_told_keeps_the_personal_database(home, platform, tmp_path, terminal, capsys):
+    terminal("yes")
+    assert run("login", "--url", platform.url, "--team-database", TEAM_DB) == 0
+    personal = personal_database_of(tmp_path)
+    capsys.readouterr()
+    assert run("login") == 0
+    told = SIGN_IN_AGAIN.search(capsys.readouterr().out).group(1)
+    # Followed to the letter: the key saved to a file, the sign-in removed.
+    key_file = tmp_path / "saved.key"
+    key_file.write_text(config.read_credentials(tmp_path)["api_key"])
+    config.credentials_path(tmp_path).unlink()
+    assert run(*shlex.split(told.replace(KEY_FILE_PLACE, str(key_file)))[2:]) == 0
+    assert personal_database_of(tmp_path) == personal  # personal memory stays in one database
+    assert set(platform.databases) == {TEAM_DB, personal}
+
+
+def test_signing_in_again_is_not_offered_for_a_key_set_elsewhere(home, platform, tmp_path, capsys):
+    # The team is the sign-in's, the key the environment's: the sign-in's key is not the one in use.
+    sign_in(tmp_path, platform)
+    home.setenv("INFINO_API_KEY", "a-fleet-key")
+    assert run("login") == 0
+    assert SIGN_IN_AGAIN.search(capsys.readouterr().out) is None
+
+
+@pytest.mark.parametrize("asked, made", [([], "a new one"), (["--personal-database", "mine"], "mine"),
+                                         (["--no-personal-database"], "")])
+def test_a_personal_database_set_to_the_team_database_never_refuses_a_sign_in(home, platform, tmp_path, no_terminal,
+                                                                              key_file, asked, made):
+    # Set to the team database, a personal database counts as unset (config.load): it holds nothing up.
+    home.setenv("INFINO_PERSONAL_DATABASE", TEAM_DB)
+    assert login_with_key(platform, key_file, *asked) == 0
+    personal = personal_database_of(tmp_path)
+    if made == "a new one":
+        assert personal.startswith(TEAM_DB + cli.PERSONAL_PART)
+    else:
+        assert personal == made
+    # What `login` saved is the personal database in use.
+    assert config.load(tmp_path).personal_database == (personal or None)
+
+
+def test_login_to_a_url_without_its_scheme_says_so(home, tmp_path, no_terminal, key_file, capsys):
+    assert run("login", "--url", NO_SCHEME_URL, "--api-key-file", str(key_file), "--team-database", TEAM_DB,
+               "--yes") == 1
+    err = capsys.readouterr().err
+    assert NO_SCHEME_URL in err and "https://" in err and len(err.strip().splitlines()) == 1
+    assert config.read_credentials(tmp_path) == {}
+
+
 # -- a sign-in the config block or the environment would override ----------------
 
 @pytest.mark.parametrize("where", ["environment", "config"])
@@ -343,6 +399,15 @@ def test_login_refuses_a_team_database_set_otherwise_in_the_environment(home, pl
     assert login_with_key(platform, key_file) == 1  # --team-database TEAM_DB
     err = capsys.readouterr().err
     assert "INFINO_TEAM_DATABASE" in err and "'ops'" in err and "environment" in err
+    assert config.read_credentials(tmp_path) == {} and platform.databases == {}
+
+
+def test_a_refusal_names_the_variable_as_the_config_sets_it(home, platform, tmp_path, no_terminal, key_file,
+                                                            capsys):
+    write_tools_setting(tmp_path, "INFINO_FLEET_TEAM_DATABASE: ops")
+    assert login_with_key(platform, key_file) == 1  # --team-database TEAM_DB
+    err = capsys.readouterr().err
+    assert "INFINO_FLEET_TEAM_DATABASE is 'ops'" in err and "mcp_servers.infino" in err
     assert config.read_credentials(tmp_path) == {} and platform.databases == {}
 
 

@@ -21,9 +21,11 @@ signing in moves the agent's tools to the cloud at the next start with no
 config to edit. The key reaches the client in its environment
 (INFINO_API_KEY), never on its command line, where any process could read it.
 Hermes hands an MCP server only an allowlist of its environment plus the
-entry's `env`, so a deployment that signs in through config names
-INFINO_TEAM_DATABASE and `INFINO_API_KEY: ${INFINO_API_KEY}` in that block,
-which the plugin and this launcher both read from the config (config.py).
+entry's `env`, so a deployment that signs in through config names the team
+database and the key in that block, as INFINO_FLEET_TEAM_DATABASE and
+`INFINO_FLEET_API_KEY: ${INFINO_API_KEY}` (config.FLEET_NAMES): names the
+profile's `.env` never sets, so they reach this launcher as the block has them
+on every deployment, Remote Config included, and the plugin reads them too.
 
 Before the client starts, the local tables are created: the client opens the
 local database's tables once, at its start, and a first session's plugin may
@@ -93,11 +95,13 @@ def launch(config, local, *, from_config: bool = True) -> None:
 
     Hermes starts this process with the config's `env` block as its
     environment. As `hermes infino mcp`, it is Hermes's own command line, which
-    loads the profile's `.env` over that environment as it starts (and boots
-    the config backend): so the block is read from the config, as the plugin
-    reads it, or a `.env` left by an earlier setup would pick another team.
-    Run as a script (`from_config=False`), nothing loads `.env`, and the block
-    is read from the environment Hermes gave it."""
+    loads the profile's `.env` over that environment as it starts: the block's
+    fleet names (config.FLEET_NAMES), which `.env` never sets, still hold what
+    the block says, and its usual names are read from the config, as the
+    plugin reads them, where this process can read it (a file; it starts
+    without Remote Config's settings). Run as a script (`from_config=False`),
+    nothing loads `.env`, and the block is read from the environment Hermes
+    gave it."""
     settings = config.load(from_config=from_config)
     store = local.LocalStore.under(config.state_dir(settings.home))
     store.ensure_tables(with_vectors=not settings.signed_in)

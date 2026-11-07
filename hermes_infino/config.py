@@ -5,16 +5,24 @@
    Remote Config sets them the way it sets everything else. The key is a
    `${INFINO_API_KEY}` reference there (Remote Config refuses a secret
    written out), which the loader resolves from the profile's environment;
-2. the active profile's environment (`.env`) through Hermes's secret scope, so
-   each profile on a multiplexed gateway reads its own;
+2. the active profile's environment (`.env`), through Hermes's secret scope
+   alone: on a gateway serving several profiles each reads its own, and a name
+   its own does not set is unset, never the launch profile's (Hermes reads its
+   own `${VAR}` the same way);
 3. the profile's sign-in (`credentials.json`, written by `hermes infino login`).
 
-The config block comes first, for the plugin and for its tools alike (their
-launcher reads it the same way), so both always read the same team, whatever
-the profile's `.env` says. A `${VAR}` reference that resolves to nothing counts
-as unset. Hermes starts the tools with that block as their environment, which
-holds only text: a value YAML reads as something else (a bare `on`, a number,
-a list) is warned about, since the tools would not start with it.
+Hermes starts the tools with that block as their environment, and `hermes
+infino mcp` then loads the profile's `.env` over it, as every `hermes` command
+does. So the three settings the tools read (the key, team database and URL)
+have names of their own for the block, which `.env` never sets (FLEET_NAMES):
+written under those, a setting reaches the tools as the block has it, on
+every deployment, and the plugin reads it first too. Under its usual name the
+tools read it from the config themselves; on Remote Config they cannot (Hermes
+starts them without its settings), and `.env` setting the same name wins
+there. A `${VAR}` reference that resolves to nothing counts as unset. The
+block holds only text in the tools' environment: a value YAML reads as
+something else (a bare `on`, a number, a list) is warned about, since the
+tools would not start with it.
 
 Without a key and a team database the plugin runs on the local database
 alone. With both it is signed in: the cloud database is written too, and read
@@ -47,6 +55,9 @@ first.
                              owner's own: their events are the owner's
                              business, so they read and write the owner's
                              personal memory (chats.py)
+- INFINO_FLEET_API_KEY, INFINO_FLEET_TEAM_DATABASE, INFINO_FLEET_URL
+                             the key, team database and URL, written in the
+                             config block (FLEET_NAMES)
 
 A variable that is set wins over the sign-in, so a deployment's `.env` is
 never overridden by a file on the machine (and `login` refuses a sign-in one
@@ -55,8 +66,9 @@ key, so they apply only when the key in use is the sign-in's: another key,
 from the config block or the environment, is never sent to the sign-in's
 platform, and never writes into its personal database.
 
-A personal database that is the team database counts as none: personal rows
-would land in the team's tables, where everyone reads them.
+A personal database that is the team database counts as unset, wherever it is
+named (the next place's applies): personal rows would land in the team's
+tables, where everyone reads them.
 """
 
 from __future__ import annotations
@@ -98,6 +110,16 @@ DEFAULT_MCP_SERVER = "infino"
 # The settings a sign-in holds. The config block or the environment may set
 # each instead, and then that value is the one in effect.
 SIGN_IN_SETTINGS = (KEY_ENV, TEAM_DB_ENV, PERSONAL_DB_ENV, URL_ENV)
+# The settings the Infino tools read (mcp_launch.client_command), with the name
+# each has in the config block. Hermes starts the tools with the block as their
+# environment, and `hermes infino mcp` loads the profile's `.env` over it as it
+# starts, so a name `.env` sets too would reach the tools as `.env` has it.
+# Nothing writes these names into `.env` (`hermes memory setup` writes only the
+# declared settings). The plugin reads them first, from the environment (where
+# the tools find the block) then from the block, as the tools do: both read the
+# same.
+FLEET_NAMES = {KEY_ENV: "INFINO_FLEET_API_KEY", TEAM_DB_ENV: "INFINO_FLEET_TEAM_DATABASE",
+               URL_ENV: "INFINO_FLEET_URL"}
 # Values that turn a switch off (INFINO_TEAM_SKILLS, INFINO_PERSONAL_PROFILE).
 OFF_VALUES = ("off", "false", "no", "0")
 # Values that turn a switch on; any other spelling of INFINO_PERSONAL_PROFILE
@@ -165,10 +187,15 @@ def _set(value) -> str:
 
 
 def _read(name: str) -> str:
-    value = _get_secret(name) if _get_secret else None
-    if value is None:
-        value = os.environ.get(name)
-    return _set(value)
+    """`name` from the profile's environment. Inside Hermes that is its secret
+    scope's answer alone (agent/secret_scope.get_secret): for a profile served
+    beside others (by a gateway serving several, or a desktop serving another)
+    its own `.env`, where a name it does not set is unset, never the value the
+    process environment holds for the profile Hermes started with; otherwise
+    the process environment."""
+    if _get_secret is not None:
+        return _set(_get_secret(name))
+    return _set(os.environ.get(name))
 
 
 def tools_env(server: str, home_dir: Path) -> dict:
@@ -205,6 +232,11 @@ def read_credentials(home_dir: Optional[Path] = None) -> dict:
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def sign_in_key(home_dir: Optional[Path] = None) -> str:
+    """The key the profile's sign-in holds; "" without one."""
+    return _set(read_credentials(home_dir).get("api_key"))
 
 
 def write_credentials(creds: dict, home_dir: Optional[Path] = None) -> Path:
@@ -256,11 +288,18 @@ def _warn_once(seen: tuple[str, ...], message: str, *args) -> None:
     logger.warning(message, *args)
 
 
-def _warn_personal_is_team(home_dir: Path, name: str) -> None:
-    """Say once per profile that its personal database is the team's, so none is used."""
-    _warn_once(("personal is team", str(home_dir), name),
-               "infino: the personal database '%s' is the team database, so none is used: what is personal "
-               "stays on this machine. Name another with %s, or sign in again.", name, PERSONAL_DB_ENV)
+def _names_the_team(personal: str, team: str) -> bool:
+    """Whether `personal` is the team database: as a personal database, it
+    counts as unset (personal rows would land in the team's tables)."""
+    return bool(personal) and personal == team
+
+
+def _warn_personal_is_team(home_dir: Path, name: str, where: str) -> None:
+    """Say once per profile and place that the personal database named there
+    is the team's, so it is not used."""
+    _warn_once(("personal is team", str(home_dir), name, where),
+               "infino: %s names the team database '%s' as the personal database, so it is not used: personal "
+               "rows would land in the team's tables, where everyone reads them. Name another there.", where, name)
 
 
 def _warn_not_text(home_dir: Path, server: str, block: dict) -> None:
@@ -298,21 +337,31 @@ def _server() -> str:
     return _read(MCP_SERVER_ENV) or DEFAULT_MCP_SERVER
 
 
-def _outside_sign_in(name: str, block: dict) -> tuple[str, str]:
-    """`name`'s value from the config block, else the environment, with where
-    it came from; ("", "") when neither sets it."""
-    for value, where in ((_set(block.get(name)), FROM_CONFIG), (_read(name), FROM_ENVIRONMENT)):
+def _outside_sign_in(name: str, block: dict) -> tuple[str, str, str]:
+    """Setting `name` from the config block or the environment: (value, where
+    it came from, the variable it is set under); ("", "", "") when neither sets
+    it. A setting the tools read comes under its fleet name first
+    (FLEET_NAMES), then under its own: from the block, else the environment."""
+    fleet = FLEET_NAMES.get(name)
+    places = ((_read(fleet), FROM_ENVIRONMENT, fleet), (_set(block.get(fleet)), FROM_CONFIG, fleet)) if fleet else ()
+    for value, where, variable in (*places, (_set(block.get(name)), FROM_CONFIG, name),
+                                   (_read(name), FROM_ENVIRONMENT, name)):
         if value:
-            return value, where
-    return "", ""
+            return value, where, variable
+    return "", "", ""
 
 
-def overrides(home_dir: Optional[Path] = None) -> dict[str, tuple[str, str]]:
+def overrides(home_dir: Optional[Path] = None, *, team_database: str = "") -> dict[str, tuple[str, str, str]]:
     """The settings a sign-in holds that the config block or the environment
-    sets, each taking precedence over any sign-in: {variable: (value, where)}."""
+    sets, each taking precedence over any sign-in: {setting: (value, where,
+    the variable it is set under)}. `team_database` is the one a sign-in
+    would hold: a personal database that is the team database in effect
+    counts as unset, as `load` counts it."""
     home_dir = home_dir or home()
     block = tools_env(_server(), home_dir)
     found = {name: _outside_sign_in(name, block) for name in SIGN_IN_SETTINGS}
+    if _names_the_team(found[PERSONAL_DB_ENV][0], found[TEAM_DB_ENV][0] or team_database):
+        found[PERSONAL_DB_ENV] = ("", "", "")
     return {name: found[name] for name in SIGN_IN_SETTINGS if found[name][0]}
 
 
@@ -327,7 +376,7 @@ def load(home_dir: Optional[Path] = None, *, from_config: bool = True) -> Settin
     _warn_not_text(home_dir, server, block)
 
     def pick(env_name: str, cred_key: str = "") -> tuple[str, str]:
-        value, where = _outside_sign_in(env_name, block)
+        value, where, _ = _outside_sign_in(env_name, block)
         if value or not cred_key:
             return value, where
         value = _set(creds.get(cred_key))
@@ -339,10 +388,16 @@ def load(home_dir: Optional[Path] = None, *, from_config: bool = True) -> Settin
     # key (a fleet's), they would send that key to the sign-in's platform, or
     # put that account's personal rows in the sign-in's database.
     own_key = bool(api_key) and api_key == _set(creds.get("api_key"))
-    personal_database = pick(PERSONAL_DB_ENV, "personal_database" if own_key else "")[0]
-    if personal_database and personal_database == team_database:
-        _warn_personal_is_team(home_dir, personal_database)
-        personal_database = ""
+    # The first personal database named that is not the team database.
+    outside, _, variable = _outside_sign_in(PERSONAL_DB_ENV, block)
+    signed = _set(creds.get("personal_database")) if own_key else ""
+    personal_database = ""
+    for named, where in ((outside, variable), (signed, "the sign-in")):
+        if _names_the_team(named, team_database):
+            _warn_personal_is_team(home_dir, named, where)
+        elif named:
+            personal_database = named
+            break
     return Settings(
         api_key=api_key,
         team_database=team_database,
