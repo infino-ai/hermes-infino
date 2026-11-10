@@ -1,0 +1,65 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  pytest:
+    name: pytest (Hermes ${{ matrix.hermes }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # The Hermes releases the README says the plugin is tested on.
+        hermes: [v0.22.6, v0.22.7, v0.23.0]
+    steps:
+      - name: Check out the plugin
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: plugin
+
+      - name: Check out Hermes ${{ matrix.hermes }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ matrix.hermes }}
+          path: hermes
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          # The uv version Hermes pins in pm/lock.json.
+          version: "0.13.5"
+          enable-cache: true
+          cache-dependency-glob: |
+            hermes/uv.lock
+            hermes/pyproject.toml
+            plugin/pyproject.toml
+
+      - name: Install Hermes's locked environment
+        # Python 3.14 is the version Hermes pins in .python-version.
+        working-directory: hermes
+        run: uv sync --locked --python 3.14 --group dev
+
+      - name: Install the plugin's dependencies
+        run: uv pip install --python hermes/.venv -r plugin/pyproject.toml --extra test
+
+      - name: Run tests
+        # The README's development command, run from the plugin checkout
+        # with Hermes's environment and source tree on the path. The tests
+        # use a fake Infino Cloud, so no credentials are needed.
+        working-directory: plugin
+        run: |
+          source ../hermes/.venv/bin/activate
+          PYTHONPATH="$PWD:$GITHUB_WORKSPACE/hermes${PYTHONPATH:+:$PYTHONPATH}" python -m pytest tests
