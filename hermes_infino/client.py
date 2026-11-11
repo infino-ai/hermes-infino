@@ -146,8 +146,12 @@ class InfinoClient:
         vector_field: str,
         k: int,
         projection: Optional[list[str]] = None,
+        rerank: Optional[str] = None,
     ) -> list[dict]:
-        """BM25 and vector search fused; the server embeds `vector_text` for the vector leg."""
+        """BM25 and vector search fused; the server embeds `vector_text` for
+        the vector leg. With `rerank` (the question), the platform's triage
+        pass grades a wider pool of the search's rows for it and the best `k`
+        come back in the grader's order (see `_rerank`)."""
         body = {
             "table_name": table,
             "text_field": text_field,
@@ -157,6 +161,7 @@ class InfinoClient:
             "vector_text": text,
             "k": k,
             "projection": projection,
+            **_rerank(rerank, k),
         }
         return _rows(self._request("POST", f"/v1/hybrid_search/{_q(database)}", body=body, want_json=True))
 
@@ -169,7 +174,9 @@ class InfinoClient:
         field: str,
         k: int,
         projection: Optional[list[str]] = None,
+        rerank: Optional[str] = None,
     ) -> list[dict]:
+        """BM25 search; `rerank` as `hybrid_search` takes it."""
         body = {
             "table_name": table,
             "field_name": field,
@@ -177,6 +184,7 @@ class InfinoClient:
             "mode": "or",
             "k": k,
             "projection": projection,
+            **_rerank(rerank, k),
         }
         return _rows(self._request("POST", f"/v1/bm25_search/{_q(database)}", body=body, want_json=True))
 
@@ -251,8 +259,35 @@ def _retry_after(header: Optional[str]) -> float:
     return max(0.0, min(wait, MAX_RETRY_WAIT_S))
 
 
+def _rerank(question: Optional[str], k: int) -> dict:
+    """The `rerank` a search names to have its rows graded for `question` by
+    the platform's triage pass, the pass the ask loop ranks with: the search
+    fetches the deployment's triage pool, the grader scores each row for the
+    question, and the best `k` come back, best first. A deployment that runs
+    no triage pass refuses it (`RERANK_UNAVAILABLE_STATUSES`). Nothing to add
+    without a question."""
+    if not question:
+        return {}
+    return {"rerank": {"question": question, "k": k}}
+
+
+# The statuses a search with `rerank` answers on a deployment that cannot
+# grade: 501 from a gateway without the triage pass, 400 from a worker built
+# without it (its message says "rerank is not available").
+RERANK_UNAVAILABLE_STATUSES = (400, 501)
+RERANK_UNAVAILABLE_WORDS = "rerank is not available"
+
+
+def rerank_unavailable(error: "InfinoError") -> bool:
+    """Whether a search's refusal says the deployment cannot rerank at all,
+    rather than that this one request failed."""
+    return error.status == 501 or (error.status in RERANK_UNAVAILABLE_STATUSES
+                                   and RERANK_UNAVAILABLE_WORDS in error.message.lower())
+
+
 def _rows(out: Any) -> list[dict]:
-    """Search responses come back as `{"data": [...]}` when asked for JSON."""
+    """Search responses come back as `{"data": [...]}` when asked for JSON,
+    and as `{"rows": [...], "rerank": {...}}` with a `rerank`."""
     if isinstance(out, dict):
-        out = out.get("data", [])
+        out = out.get("rows", out.get("data", []))
     return list(out or [])

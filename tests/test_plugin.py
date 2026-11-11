@@ -23,7 +23,7 @@ from hermes_infino.client import InfinoClient
 from hermes_infino.local import arrow_schema, index_spec
 
 from .helpers import (DM, GROUP, OTHER_GROUP, PERSONAL_DB, SKILL_MD, TEAM_DB, end_session, hook_ctx, in_session, local,
-                      local_rows, make_manager, personal_rows, wait_for)
+                      current, local_rows, make_manager, personal_rows, superseded, wait_for)
 
 # Seconds that put a save after a forget's `stored_ms` bound.
 LATER_S = 0.01
@@ -154,8 +154,12 @@ def test_builtin_memory_writes_are_mirrored(env, platform, tmp_path):
     provider.on_memory_write("add", "memory", "use pnpm, not npm")
     provider.on_memory_write("replace", "memory", "use pnpm 9, not npm", {"previous_content": "use pnpm, not npm"})
     end_session(provider)
-    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["use pnpm 9, not npm"]
-    assert platform.rows(TEAM_DB, tables.MEMORY)[0]["origin"] == "builtin:memory"
+    rows = platform.rows(TEAM_DB, tables.MEMORY)
+    assert [r["content"] for r in current(rows)] == ["use pnpm 9, not npm"]
+    assert current(rows)[0]["origin"] == "builtin:memory"
+    # The replaced entry is kept, naming what replaced it.
+    assert [(r["content"], r[tables.SUPERSEDED_BY], r["origin"]) for r in superseded(rows)] == [
+        ("use pnpm, not npm", "use pnpm 9, not npm", "builtin:memory")]
 
 
 @pytest.mark.parametrize("context", ["subagent", "cron", "flush"])
@@ -245,7 +249,11 @@ def test_user_profile_memories_are_personal_and_name_the_person(env, platform, t
     provider.on_memory_write("add", "memory", "The staging deploy needs the VPN")
     end_session(provider)
     # USER.md is about the person: personal, kept here without a personal database.
-    assert [r["content"] for r in personal_rows(tmp_path)] == ["About priya: Prefers bullet points"]
+    mine = personal_rows(tmp_path)
+    assert [r["content"] for r in current(mine)] == ["About priya: Prefers bullet points"]
+    # The replaced entry stays the person's, kept superseded where it was.
+    assert [(r["content"], r["scope"], r[tables.SUPERSEDED_BY]) for r in superseded(mine)] == [
+        ("About priya: Prefers short answers", "personal", "About priya: Prefers bullet points")]
     # MEMORY.md is what the agent learns about the work: the team's.
     assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["The staging deploy needs the VPN"]
 

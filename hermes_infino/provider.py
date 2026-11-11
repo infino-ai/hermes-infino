@@ -796,6 +796,12 @@ class InfinoMemoryProvider(MemoryProvider):
         assert self._backend is not None
         return self._backend.forget_memory(content, scope, chat.visible, people, about_prefix, everywhere)
 
+    def _supersede(self, content: str, superseded_by: str, scope: Optional[str],
+                   chat: chats.Chat = chats.NO_CHAT, people: Optional[tuple[str, ...]] = None,
+                   about_prefix: str = "") -> int:
+        assert self._backend is not None
+        return self._backend.supersede_memory(content, superseded_by, scope, chat.visible, people, about_prefix)
+
     def _builtin_row(self, target: str, content: str, chat: chats.Chat) -> Optional[dict]:
         """The `memory` row of a built-in memory entry written in the running
         turn (Hermes's own memory tool); None when it is not kept.
@@ -836,17 +842,24 @@ class InfinoMemoryProvider(MemoryProvider):
         assert self._settings is not None
         chat = self._chat()
         previous = (metadata or {}).get("previous_content")
+        # The entry that replaces the previous one, as its row will hold it: the
+        # superseded copy names it, so a recall of the old shows what took its place.
+        row = self._builtin_row(target, content, chat) if action in ("add", "replace") and content else None
         if action in ("replace", "remove") and previous:
+            replaced_by = str(row["content"]) if action == "replace" and row is not None else ""
+            # Kept, not deleted: what Hermes compacts away stays recallable,
+            # marked superseded (backend.supersede_rows). Only infino_forget deletes.
             if chat.group and not chat.owner_writes:
                 # The entry may be about another member, who wrote it: any "About <name>: ".
-                self._run_write(self._forget, previous, TEAM, chat, None, ABOUT_ANYONE if target == "user" else "")
+                self._run_write(self._supersede, previous, replaced_by, TEAM, chat, None,
+                                ABOUT_ANYONE if target == "user" else "")
             elif target != "user" or self._keeps_personal(chat):
                 person = self._person()
                 about = ABOUT_PERSON.format(author=person) if target == "user" and person else ""
                 scope = PERSONAL if target == "user" else self._default_scope()
-                self._run_write(self._forget, about + previous, scope, chats.NO_CHAT, self._people())
+                self._run_write(self._supersede, about + previous, replaced_by, scope, chats.NO_CHAT,
+                                self._people())
         if action in ("add", "replace") and content:
-            row = self._builtin_row(target, content, chat)
             if row is not None:
                 self._run_write(self._add_builtin, row)
             if target == "user" and (row is None or row["scope"] != PERSONAL) and not chat.untyped:
@@ -874,8 +887,9 @@ class InfinoMemoryProvider(MemoryProvider):
     def _mirror_builtin(self, chat: chats.Chat = chats.NO_CHAT, by_agent: bool = False) -> None:
         """Keep the `memory` table in step with Hermes's built-in memory
         files, whoever wrote them (builtin.py): an entry no row holds is added
-        (_mirrored_row); a row whose entry left its file is deleted, here and
-        in the cloud. `chat` and `by_agent` are the running turn's.
+        (_mirrored_row); a row whose entry left its file is kept as a
+        superseded copy and the row itself deleted, here and in the cloud
+        (Backend.supersede_rows). `chat` and `by_agent` are the running turn's.
 
         Hermes's background review follows a turn and writes the files with no
         provider to tell; the tool hooks note who wrote each entry of a turn
@@ -923,7 +937,10 @@ class InfinoMemoryProvider(MemoryProvider):
                     if not self._backend.has_memory(row):
                         self._append(tables.MEMORY, [row])
                 if stale:
-                    self._backend.forget_rows(stale)
+                    # Kept as superseded copies, not deleted: the background
+                    # review's rewrites compact the file, and what they drop
+                    # stays recallable. Nothing says what replaced an entry here.
+                    self._backend.supersede_rows(stale)
 
     def sync_turn(
         self,

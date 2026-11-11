@@ -14,7 +14,7 @@ from hermes_infino import builtin, chats, config, provider as provider_mod, tabl
 from hermes_infino.provider import GATEWAY_MARK
 
 from .helpers import (DM, GROUP, OTHER_GROUP, PERSONAL_DB, TEAM_DB, agent_tool_call, end_session, hermes_dispatch,
-                      in_session, local_rows, make_manager, personal_rows, wait_for)
+                      current, in_session, local_rows, make_manager, personal_rows, superseded, wait_for)
 
 # A credential shaped the way Hermes's redaction recognizes one.
 SECRET = "sk-ant-api03-" + "A1b2C3d4E5f6G7h8I9j0" * 4
@@ -98,16 +98,23 @@ def test_the_background_reviews_writes_reach_the_memory_table(env, platform, tmp
         ("About dana: prefers short answers", "dana")]
 
 
-def test_an_entry_the_review_removes_leaves_the_table_here_and_in_the_cloud(env, platform, tmp_path):
+def test_an_entry_the_review_removes_is_kept_superseded_here_and_in_the_cloud(env, platform, tmp_path):
+    # Hermes's review compacting the file drops an entry; the table keeps it,
+    # marked superseded with nothing named as its replacement, beside its row's id.
     mgr, provider = make_manager(tmp_path)
     write_file(tmp_path, "memory", ["deploys are on Tuesdays", "use pnpm"])
     turn(provider, 1)
     end_session(provider)
+    [original] = [r for r in local_rows(tmp_path, tables.MEMORY) if r["content"] == "deploys are on Tuesdays"]
     write_file(tmp_path, "memory", ["use pnpm"])
     turn(provider, 2)
     end_session(provider)
-    assert contents(local_rows(tmp_path, tables.MEMORY)) == ["use pnpm"]
-    assert contents(platform.rows(TEAM_DB, tables.MEMORY)) == ["use pnpm"]
+    for rows in (local_rows(tmp_path, tables.MEMORY), platform.rows(TEAM_DB, tables.MEMORY)):
+        assert contents(current(rows)) == ["use pnpm"]
+        [kept] = superseded(rows)
+        assert kept["content"] == "deploys are on Tuesdays" and kept["origin"] == "builtin:memory"
+        assert kept[tables.SUPERSEDED_BY] == "" and kept[tables.PRIOR_ROW_ID] == original["row_id"]
+        assert kept["row_id"] != original["row_id"] and kept["created_ms"] == original["created_ms"]
 
 
 def test_a_memory_tool_write_and_the_comparison_keep_one_row(env, platform, tmp_path):
@@ -326,10 +333,12 @@ def test_a_comparison_that_cannot_read_the_note_adds_its_entries_next_time(home,
     write_file(tmp_path, "memory", ["deploys are on Tuesdays", "the VPN is needed for staging"])
     with writers_held_elsewhere(tmp_path, monkeypatch):
         turn(at_the_terminal, 2)
-    assert contents(local_rows(tmp_path, tables.MEMORY)) == ["deploys are on Tuesdays"]  # what left is gone
+    rows = local_rows(tmp_path, tables.MEMORY)
+    assert contents(current(rows)) == ["deploys are on Tuesdays"]  # what left is superseded
+    assert contents(superseded(rows)) == ["use pnpm"]
     turn(at_the_terminal, 3)
-    assert contents(local_rows(tmp_path, tables.MEMORY)) == ["deploys are on Tuesdays",
-                                                             "the VPN is needed for staging"]
+    assert contents(current(local_rows(tmp_path, tables.MEMORY))) == ["deploys are on Tuesdays",
+                                                                      "the VPN is needed for staging"]
 
 
 def test_a_note_of_writers_that_cannot_be_read_never_stops_the_comparison(home, tmp_path, monkeypatch):

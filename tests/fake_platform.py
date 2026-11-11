@@ -17,6 +17,7 @@ import json
 import re
 import sqlite3
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -30,6 +31,8 @@ NO_EMBEDDING_SERVER = ('schema field "embedding" of type "embedding" needs an em
 # ("over budget: ...") under the worker's "<operation> error: " (the platform's
 # worker/src/error.rs, classify_infino and ConnectionError::Engine).
 OVER_BUDGET = "append error: over budget: the connection's memory budget is spent"
+# Rows a reranked search reads before grading: the deployment's triage pool.
+RERANK_POOL = 1_000
 
 
 class FakePlatform:
@@ -41,6 +44,14 @@ class FakePlatform:
         self.failed_appends = 0        # next N appends answer 500 (not retried)
         self.trials = 0                # free accounts handed out
         self.hybrid_refused = False    # hybrid search answers 400 (no embedder)
+        # A search naming `rerank`: refused as a deployment without the triage
+        # pass refuses it (501) unless `rerank_supported`; then graded by
+        # `grade` (question, row) -> score, highest first, the best `k` kept.
+        self.rerank_supported = False
+        self.grade = None
+        self.rerank_statuses: list[int] = []  # the next reranked searches answer these statuses, in order
+        self.rerank_delay_s = 0.0      # a reranked search answers after this long
+        self.reranked: list[dict] = []  # each reranked search's body
         self.hybrid_statuses: list[int] = []  # the next hybrid searches answer these statuses, in order
         self.failed_deletes = 0        # next N deletes answer 500
         self.refused_marker = None     # an append carrying a row with this text answers refused_status
@@ -111,6 +122,8 @@ class FakePlatform:
                 length = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(length)) if length else {}
                 parts = parsed.path.strip("/").split("/")
+                if isinstance(body, dict) and body.get("rerank") is not None and fake.rerank_delay_s:
+                    time.sleep(fake.rerank_delay_s)  # outside the lock: other requests go on meanwhile
                 with fake._lock:
                     fake.requests.append((parsed.path, json.dumps(params)))
                     if self._refused_key():
@@ -198,6 +211,8 @@ class FakePlatform:
             matched = len(rows) - len(kept)
             tables[params["table"]] = kept
             return 200, {"matched": matched, "n_tombstoned": matched, "n_not_found": 0}, None
+        if op in ("hybrid_search", "bm25_search") and body.get("rerank") is not None:
+            return self._reranked(db, op, body)
         if op in ("hybrid_search", "bm25_search"):
             if op == "hybrid_search" and self.hybrid_refused:
                 return 400, {"error": "no embedding server"}, None
@@ -230,6 +245,33 @@ class FakePlatform:
                 return 200, {"data": [{"n": len(rows)}]}, None
             return 200, {"data": rows}, None
         return 404, {"error": f"no route {op}"}, None
+
+    def _reranked(self, db: str, op: str, body: dict):
+        """A search with `rerank`, as the platform answers it: refused where
+        there is no triage pass; otherwise the search's rows (the plain
+        search's, unscripted) graded for the question, best first, under
+        `rows` beside the pass's coverage."""
+        self.reranked.append(body)
+        if not self.rerank_supported:
+            return 501, {"error": "rerank is not available on this deployment: it runs no triage pass "
+                                  "(ask.triage); send the query without `rerank`"}, None
+        if self.rerank_statuses:
+            return self.rerank_statuses.pop(0), {"error": "scripted"}, None
+        plain = {k: v for k, v in body.items() if k != "rerank"}
+        plain["k"] = max(int(body.get("k") or 0), RERANK_POOL)
+        saved = (self.hybrid_refused, self.hybrid_statuses)
+        self.hybrid_refused, self.hybrid_statuses = False, []
+        try:
+            status, out, headers = self._route(["v1", op, db], {}, plain)
+        finally:
+            self.hybrid_refused, self.hybrid_statuses = saved
+        if status != 200:
+            return status, out, headers
+        question = body["rerank"]["question"]
+        grade = self.grade or (lambda q, r: float(r.get("score") or 0.0))
+        rows = sorted(out["data"], key=lambda r: -grade(question, r))
+        k = body["rerank"].get("k") or body.get("k") or len(rows)
+        return 200, {"rows": rows[:k], "rerank": {"graded": len(rows)}}, None
 
     def _where(self, db: str, table: str, rows: list[dict], predicate: str) -> list[dict]:
         """The rows a SQL predicate holds for, evaluated by SQLite over the

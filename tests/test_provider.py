@@ -27,7 +27,7 @@ from hermes_infino.provider import CRON_PLATFORM, PERSONAL_SEARCH_TOOL, InfinoMe
 
 from .helpers import (DM, GROUP, SKILL_MD, TEAM_DB, WRITE_WAIT_S, agent_tool_call, end_session, fake_embed,
                       hermes_agent, hermes_dispatch, hook_ctx, in_session, local, local_rows, make_manager,
-                      personal_rows, wait_for, webhook_delivery)
+                      current, personal_rows, superseded, wait_for, webhook_delivery)
 
 # What a provider declares before it starts, which is what Hermes routes by:
 # every tool, the personal search included (it is shown only where offered).
@@ -154,13 +154,16 @@ def test_a_forget_needs_the_exact_text(mgr, tmp_path):
     assert len(local_rows(tmp_path, tables.MEMORY)) == 1
 
 
-def test_a_removed_builtin_memory_is_forgotten(mgr, tmp_path):
+def test_a_removed_builtin_memory_is_kept_superseded(mgr, tmp_path):
     _, p = mgr
     p.on_memory_write("add", "memory", "the build uses make")
     p.on_memory_write("remove", "memory", "", {"previous_content": "the build uses make"})
     p.on_memory_write("remove", "memory", "", None)  # nothing named: nothing to do
     p._drain()
-    assert local_rows(tmp_path, tables.MEMORY) == []
+    rows = local_rows(tmp_path, tables.MEMORY)
+    assert current(rows) == []
+    # Removed, so nothing replaced it.
+    assert [(r["content"], r[tables.SUPERSEDED_BY]) for r in superseded(rows)] == [("the build uses make", "")]
 
 
 def test_a_chat_of_no_known_type_writes_none_of_the_owners_personal_memory_to_the_team(home, tmp_path, monkeypatch):
@@ -638,7 +641,13 @@ def test_a_group_forgets_an_entry_another_member_wrote(home, tmp_path, monkeypat
     in_session(monkeypatch, {**GROUP, "HERMES_SESSION_USER_NAME": "zed"})  # zed takes it back
     p.on_memory_write("remove", "user", "", {"previous_content": "Is on call this week"})
     p._drain()
-    assert [r["content"] for r in local_rows(tmp_path, tables.MEMORY)] == ["About mallory: Is not on call this week"]
+    rows = local_rows(tmp_path, tables.MEMORY)
+    assert [r["content"] for r in current(rows)] == ["About mallory: Is not on call this week"]
+    # Kept for the group it was written in, superseded: still never anyone's personal memory.
+    [kept] = superseded(rows)
+    assert kept["content"] == "About mallory: Is on call this week" and kept["scope"] == "team"
+    assert kept[tables.CHAT] == current(rows)[0][tables.CHAT] != ""
+    assert personal_rows(tmp_path) == []
 
 
 def test_a_resumed_session_stores_each_message_once(home, tmp_path):

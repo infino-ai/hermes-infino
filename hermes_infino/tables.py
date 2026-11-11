@@ -53,6 +53,13 @@ ROW_ID = "row_id"
 STORED = "stored_ms"
 # A memory's group chat (chats.py): kept for that chat and recalled only there.
 CHAT = "chat"
+# A memory Hermes replaced or removed is kept, not deleted (provider.py): a
+# copy of its row, stamped when it was superseded and with what (empty when
+# nothing names the replacement), pointing at the row it copies. A current
+# memory has no `superseded_ms`. Only `infino_forget` deletes a memory.
+SUPERSEDED = "superseded_ms"
+SUPERSEDED_BY = "superseded_by"
+PRIOR_ROW_ID = "prior_row_id"
 
 MEMORY_SCHEMA = [
     {"name": ROW_ID, "type": "utf8"},
@@ -65,6 +72,9 @@ MEMORY_SCHEMA = [
     {"name": "origin", "type": "utf8"},         # remember | builtin:memory | builtin:user
     {"name": CHAT, "type": "utf8"},             # the group chat it is kept for ("" or null: the team's or the person's)
     {"name": "created_ms", "type": "i64"},
+    {"name": SUPERSEDED, "type": "i64"},        # when Hermes replaced or removed it; null while current
+    {"name": SUPERSEDED_BY, "type": "utf8"},    # the entry that replaced it ("" when nothing names one)
+    {"name": PRIOR_ROW_ID, "type": "utf8"},     # the row this superseded copy was made from
     {"name": EMBEDDING_COLUMN, "type": "embedding", "source": [MEMORY_TEXT_COLUMN], "nullable": False},
 ]
 # No vector index is declared: the platform indexes an embedding column
@@ -157,6 +167,12 @@ def chat_predicate(visible: tuple[str, ...]) -> str:
     """Rows of the chats in `visible`, "" standing for no chat (null or empty)."""
     terms = [f"{CHAT} IS NULL OR {CHAT} = ''" if c == "" else f"{CHAT} = {sql_string(c)}" for c in visible]
     return "(" + " OR ".join(terms) + ")"
+
+
+def current_predicate() -> str:
+    """Memories still in force: not superseded (rows written before the
+    column existed read it as null, and are current)."""
+    return f"{SUPERSEDED} IS NULL"
 
 
 class OutdatedTable(Exception):

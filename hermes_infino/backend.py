@@ -259,25 +259,9 @@ class Backend:
         its match, bounded to rows stored by now (one saved later is kept).
         Returns how many rows were found."""
         now = int(time.time() * 1000)
-        text = tables.sql_string(content)
-        match = f"content = {text}"
-        if about_prefix:
-            match = (f"({match} OR (content LIKE {tables.sql_string(about_prefix + '%')} "
-                     f"AND ends_with(content, {tables.sql_string(': ' + content)})))")
-        # A chat's key is among a joined value's when the value, fenced by the
-        # joiner at both ends, holds the key fenced the same way.
-        joiner = tables.sql_string(CHATS_JOIN)
-        among = [f"strpos(concat({joiner}, {tables.CHAT}, {joiner}), "
-                 f"{tables.sql_string(CHATS_JOIN + key + CHATS_JOIN)}) > 0" for key in visible if key]
-        predicate = f"{match} AND ({' OR '.join([tables.chat_predicate(visible), *among])})"
-        if scope:
-            predicate += f" AND scope = {tables.sql_string(scope)}"
+        predicate, personal_predicate, reaches_personal = _memory_match(content, scope, visible, people,
+                                                                        about_prefix)
         team = self.local.delete(tables.MEMORY, predicate) if scope != recall.PERSONAL else []
-        # A group chat never reaches the person's own memory (`visible` holds a chat).
-        reaches_personal = scope in (None, recall.PERSONAL) and visible == ("",) and people != ()
-        personal_predicate = predicate
-        if people:
-            personal_predicate += f" AND author IN ({', '.join(tables.sql_string(p) for p in people)})"
         personal = self.personal.delete(tables.MEMORY, personal_predicate) if reaches_personal else []
         found = {str(r[tables.ROW_ID]) for r in team} | {str(r[tables.ROW_ID]) for r in personal}
         if self.mirror is None:
@@ -300,21 +284,76 @@ class Backend:
         self.schedule_sync()
         return len(found)
 
+    def supersede_memory(self, content: str, superseded_by: str, scope: Optional[str] = None,
+                         visible: tuple[str, ...] = ("",), people: Optional[tuple[str, ...]] = None,
+                         about_prefix: str = "") -> int:
+        """What Hermes's replace or remove of a built-in memory does to its
+        row: the current memories with exactly this text, matched as
+        `forget_memory` matches them on this machine, are kept as superseded
+        copies (`supersede_rows`), never deleted. Returns how many were found."""
+        predicate, personal_predicate, reaches_personal = _memory_match(content, scope, visible, people,
+                                                                        about_prefix)
+        current = tables.current_predicate()
+        rows: list[tuple[bool, dict]] = []
+        if scope != recall.PERSONAL:
+            rows += [(False, r) for r in self.local.query_sql(
+                f"SELECT * FROM {tables.MEMORY} WHERE ({predicate}) AND {current}")]
+        if reaches_personal:
+            rows += [(True, r) for r in self.personal.query_sql(
+                f"SELECT * FROM {tables.MEMORY} WHERE ({personal_predicate}) AND {current}")]
+        self.supersede_rows(rows, superseded_by)
+        return len(rows)
+
+    def supersede_rows(self, rows: list[tuple[bool, dict]], superseded_by: str = "") -> None:
+        """Keep memory rows that Hermes no longer holds: each is copied, with a
+        row id of its own, the time it was superseded, `superseded_by` (the
+        entry that replaced it, "" when nothing names one) and the id of the
+        row it copies, into the database it was in; then the row itself is
+        deleted by id, here and in the cloud, as `forget_rows` deletes it.
+
+        The copy is written before the delete, so a crash between them leaves
+        both and loses neither: the row, still current, is superseded again
+        next time, and a copy of it already kept is not made twice. `rows`
+        are (personal, row) pairs, as `builtin_rows` gives them; a row without
+        its other columns is read back first."""
+        if not rows:
+            return
+        now = int(time.time() * 1000)
+        for personal, store in ((False, self.local), (True, self.personal)):
+            mine = [r for p, r in rows if p == personal]
+            if not mine:
+                continue
+            ids = [str(r[tables.ROW_ID]) for r in mine]
+            listed = ", ".join(tables.sql_string(i) for i in ids)
+            whole = store.query_sql(f"SELECT * FROM {tables.MEMORY} WHERE {tables.ROW_ID} IN ({listed})")
+            kept = {str(r[tables.PRIOR_ROW_ID]) for r in store.query_sql(
+                f"SELECT {tables.PRIOR_ROW_ID} FROM {tables.MEMORY} WHERE {tables.PRIOR_ROW_ID} IN ({listed})")}
+            copies = [_superseded_copy(r, now, superseded_by) for r in whole if str(r[tables.ROW_ID]) not in kept]
+            if copies:
+                store.append(tables.MEMORY, copies)
+                self._last_write = time.monotonic()
+        self.forget_rows(rows)
+
     # -- Hermes's built-in memory files (builtin.py) --------------------------
 
     def builtin_rows(self, target: str) -> list[tuple[bool, dict]]:
-        """This machine's `memory` rows kept from one of Hermes's built-in
-        memory files, each with whether it is in the person's own database."""
+        """This machine's current `memory` rows kept from one of Hermes's
+        built-in memory files, each with whether it is in the person's own
+        database. A superseded copy is not one: its entry left the file on
+        purpose."""
         sql = (f"SELECT {tables.ROW_ID}, content FROM {tables.MEMORY} "
-               f"WHERE origin = {tables.sql_string('builtin:' + target)}")
+               f"WHERE origin = {tables.sql_string('builtin:' + target)} AND {tables.current_predicate()}")
         return ([(False, r) for r in self.local.query_sql(sql)]
                 + [(True, r) for r in self.personal.query_sql(sql)])
 
     def has_memory(self, row: dict) -> bool:
-        """Whether this machine already keeps a memory row like `row` (its text,
-        origin, chat and, for personal memory, author)."""
+        """Whether this machine already keeps a current memory row like `row`
+        (its text, origin, chat and, for personal memory, author). A
+        superseded copy of the same text does not count: an entry written
+        again is current again."""
         where = (f"content = {tables.sql_string(row['content'])} AND origin = {tables.sql_string(row['origin'])} "
-                 f"AND {tables.chat_predicate((str(row.get(tables.CHAT) or ''),))}")
+                 f"AND {tables.chat_predicate((str(row.get(tables.CHAT) or ''),))} "
+                 f"AND {tables.current_predicate()}")
         store = self.local
         if row.get("scope") == recall.PERSONAL:
             store = self.personal
@@ -614,3 +653,42 @@ def flush_at_exit() -> None:
     _exiting.set()
     if _exit_flusher is not None:
         _exit_flusher.join(EXIT_FLUSH_WAIT_S)
+
+
+def _memory_match(content: str, scope: Optional[str], visible: tuple[str, ...],
+                  people: Optional[tuple[str, ...]], about_prefix: str) -> tuple[str, str, bool]:
+    """The predicates of the memories with exactly this text that a chat in
+    `visible` may reach (see `Backend.forget_memory`): the team's table's, the
+    person's own table's, and whether the person's own is reached at all."""
+    match = f"content = {tables.sql_string(content)}"
+    if about_prefix:
+        match = (f"({match} OR (content LIKE {tables.sql_string(about_prefix + '%')} "
+                 f"AND ends_with(content, {tables.sql_string(': ' + content)})))")
+    # A chat's key is among a joined value's when the value, fenced by the
+    # joiner at both ends, holds the key fenced the same way.
+    joiner = tables.sql_string(CHATS_JOIN)
+    among = [f"strpos(concat({joiner}, {tables.CHAT}, {joiner}), "
+             f"{tables.sql_string(CHATS_JOIN + key + CHATS_JOIN)}) > 0" for key in visible if key]
+    predicate = f"{match} AND ({' OR '.join([tables.chat_predicate(visible), *among])})"
+    if scope:
+        predicate += f" AND scope = {tables.sql_string(scope)}"
+    # A group chat never reaches the person's own memory (`visible` holds a chat).
+    reaches_personal = scope in (None, recall.PERSONAL) and visible == ("",) and people != ()
+    personal_predicate = predicate
+    if people:
+        personal_predicate += f" AND author IN ({', '.join(tables.sql_string(p) for p in people)})"
+    return predicate, personal_predicate, reaches_personal
+
+
+# Columns a superseded copy does not carry over from the row it copies: its
+# own id and commit stamp are its own, and a search's score is not a column.
+_NOT_COPIED = (tables.ROW_ID, tables.STORED, tables.EMBEDDING_COLUMN, "score")
+
+
+def _superseded_copy(row: dict, superseded_ms: int, superseded_by: str) -> dict:
+    """A kept copy of a memory row Hermes no longer holds."""
+    copy = {k: v for k, v in row.items() if k not in _NOT_COPIED}
+    copy[tables.SUPERSEDED] = superseded_ms
+    copy[tables.SUPERSEDED_BY] = superseded_by
+    copy[tables.PRIOR_ROW_ID] = str(row[tables.ROW_ID])
+    return copy
