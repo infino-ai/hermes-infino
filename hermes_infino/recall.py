@@ -106,6 +106,9 @@ class Source:
     database: Optional[str] = None              # its cloud database, signed in
     mark: Optional[Callable[[], Mark]] = None   # () -> how far the cloud has its memory
     history_mark: Optional[Callable[[], Mark]] = None  # () -> how far the cloud has its history
+    # () -> whether its cloud database refused to make the history table: then
+    # this machine's history answers, and the cloud is not searched for it.
+    history_refused: Optional[Callable[[], bool]] = None
 
 
 def _visible(row: dict, chat: chats.Chat) -> bool:
@@ -274,9 +277,11 @@ class Recaller:
         # Each cloud is asked for each table at once: plainly, and graded for
         # the question. The graded answer is used when it comes in time; the
         # plain one, already there by then, when it does not.
-        asked = {(id(s), t): _pool.submit(self._cloud_rows, s, query, False, t) for s in clouded for t in KINDS}
+        kinds = {id(s): [t for t in KINDS if not (t == tables.HISTORY and s.history_refused and s.history_refused())]
+                 for s in clouded}
+        asked = {(id(s), t): _pool.submit(self._cloud_rows, s, query, False, t) for s in clouded for t in kinds[id(s)]}
         ranked = {(id(s), t): _pool.submit(self._cloud_rows, s, query, True, t)
-                  for s in clouded for t in KINDS if self._rank and s.database not in self._no_rerank}
+                  for s in clouded for t in kinds[id(s)] if self._rank and s.database not in self._no_rerank}
         rows: list[tuple[str, dict]] = []
         for table in KINDS:
             for src in sources:

@@ -12,6 +12,7 @@ import pytest
 from hermes_infino import builtin, config, tables
 from hermes_infino.client import InfinoClient
 from hermes_infino.local import PERSONAL_DB_DIR, LocalStore
+from hermes_infino.recall import Recaller
 
 from .helpers import (DM, GROUP, PERSONAL_DB, TEAM_DB, agent_tool_call, end_session, hermes_dispatch, in_session,
                       local_rows, make_manager)
@@ -248,4 +249,134 @@ def test_a_database_that_refuses_the_history_table_still_syncs_everything_else(e
     assert contents(platform.rows(TEAM_DB, tables.MEMORY)) == ["standup is at eleven"]  # memory synced
     assert tables.HISTORY not in platform.databases[TEAM_DB]
     assert by(local_rows(tmp_path, tables.HISTORY)) == [("standup is at ten", "standup is at eleven")]  # kept here
+    platform.refused_tables = set()
+
+
+# -- review follow-ups ------------------------------------------------------------------
+
+def test_forgetting_a_memory_md_entry_leaves_a_user_md_entry_that_shares_its_end(home, tmp_path):
+    mgr, p = make_manager(tmp_path, session_id="cli")
+    write_file(tmp_path, "memory", ["About the release: ship Friday", "use pnpm"])
+    write_file(tmp_path, "user", ["ship Friday"])
+    turn(p, 1)
+    out = json.loads(mgr.handle_tool_call("infino_forget", {"content": "About the release: ship Friday"}))
+    assert out["ok"]
+    assert builtin.read_entries(tmp_path, "memory") == ["use pnpm"]
+    assert builtin.read_entries(tmp_path, "user") == ["ship Friday"]
+
+
+def test_a_team_forget_leaves_the_persons_own_file_alone(home, tmp_path):
+    mgr, p = make_manager(tmp_path, session_id="cli")
+    write_file(tmp_path, "memory", ["prefers tea"])
+    write_file(tmp_path, "user", ["prefers tea"])
+    turn(p, 1)
+    assert json.loads(mgr.handle_tool_call("infino_forget", {"content": "prefers tea", "scope": "team"}))["ok"]
+    assert builtin.read_entries(tmp_path, "memory") == []
+    assert builtin.read_entries(tmp_path, "user") == ["prefers tea"]
+
+
+def test_a_personal_forget_of_a_recalled_user_entry_takes_it_out_of_user_md(home, tmp_path):
+    home.setenv("INFINO_AUTHOR", "priya")
+    mgr, p = make_manager(tmp_path, session_id="cli")
+    write_file(tmp_path, "user", ["Prefers tea", "Works from Lisbon"])
+    turn(p, 1)
+    out = json.loads(mgr.handle_tool_call("infino_forget", {"content": "About priya: Prefers tea",
+                                                            "scope": "personal"}))
+    assert out["ok"]
+    assert builtin.read_entries(tmp_path, "user") == ["Works from Lisbon"]
+
+
+def test_a_batch_that_forgets_one_entry_and_adds_an_unrelated_one_keeps_no_history(home, tmp_path, monkeypatch):
+    hermes_dispatch(monkeypatch)
+    mgr, p = make_manager(tmp_path, session_id="cli")
+    agent_tool_call("cli", "memory", {"action": "add", "target": "memory", "content": "Dana's PIN is 4321"}, mgr)
+    agent_tool_call("cli", "memory", {"target": "memory", "operations": [
+        {"action": "remove", "old_text": "Dana's PIN"},
+        {"action": "add", "content": "the office moved to 99 Oak Ave"}]}, mgr)
+    p._drain()
+    assert contents(local_rows(tmp_path, tables.MEMORY)) == ["the office moved to 99 Oak Ave"]
+    assert history_rows(tmp_path) == []
+    assert "4321" not in p.prefetch("what is Dana's PIN")
+
+
+def test_forgetting_one_of_two_entries_a_consolidation_split_into_forgets_the_earlier_version(home, tmp_path,
+                                                                                               monkeypatch):
+    hermes_dispatch(monkeypatch)
+    mgr, p = make_manager(tmp_path, session_id="cli")
+    agent_tool_call("cli", "memory", {"action": "add", "target": "memory",
+                                      "content": "use pnpm 9 in the web repo and the docs repo"}, mgr)
+    agent_tool_call("cli", "memory", {"target": "memory", "operations": [
+        {"action": "remove", "old_text": "use pnpm 9 in the web repo and"},
+        {"action": "add", "content": "use pnpm 9 in the web repo"},
+        {"action": "add", "content": "use pnpm 9 in the docs repo"}]}, mgr)
+    p._drain()
+    assert by(history_rows(tmp_path)) == [("use pnpm 9 in the web repo and the docs repo",
+                                           "use pnpm 9 in the web repo | use pnpm 9 in the docs repo")]
+    assert json.loads(mgr.handle_tool_call("infino_forget", {"content": "use pnpm 9 in the docs repo"}))["ok"]
+    p._drain()
+    assert history_rows(tmp_path) == []
+    assert contents(local_rows(tmp_path, tables.MEMORY)) == ["use pnpm 9 in the web repo"]
+
+
+def test_a_text_that_comes_back_and_is_replaced_again_is_forgotten_with_its_newest_replacement(home, tmp_path):
+    mgr, p = make_manager(tmp_path)
+    p.on_memory_write("add", "memory", "Lives at 12 Elm St")
+    p.on_memory_write("replace", "memory", "Lives at 5 Pine Rd", {"previous_content": "Lives at 12 Elm St"})
+    p.on_memory_write("replace", "memory", "Lives at 12 Elm St", {"previous_content": "Lives at 5 Pine Rd"})
+    p.on_memory_write("replace", "memory", "Lives at 99 Oak Ave", {"previous_content": "Lives at 12 Elm St"})
+    p._drain()
+    assert json.loads(mgr.handle_tool_call("infino_forget", {"content": "Lives at 99 Oak Ave"}))["ok"]
+    p._drain()
+    text = json.dumps(local_rows(tmp_path, tables.MEMORY) + history_rows(tmp_path))
+    assert "Elm" not in text and "Oak" not in text and "Pine" not in text
+
+
+def test_a_comparison_while_a_replacement_is_in_flight_leaves_its_row_for_the_history(home, tmp_path):
+    # Another process of the profile compares the files after Hermes wrote the
+    # patch and before this one's provider kept the earlier entry.
+    _, p = make_manager(tmp_path, session_id="cli")
+    write_file(tmp_path, "memory", ["standup is at ten"])
+    turn(p, 1)
+    state = config.state_dir(tmp_path)
+    builtin.note_replacing(state, "call-1", {"target": "memory", "operations": [
+        {"action": "patch", "old_text": "ten", "content": "eleven"}]})
+    write_file(tmp_path, "memory", ["standup is at eleven"])
+    turn(p, 2)  # the other process's comparison
+    assert contents(local_rows(tmp_path, tables.MEMORY)) == ["standup is at eleven", "standup is at ten"]
+    p.on_memory_write("replace", "memory", "standup is at eleven",
+                      {"previous_content": "standup is at ten", "tool_call_id": "call-1"})
+    p._drain()
+    assert by(history_rows(tmp_path)) == [("standup is at ten", "standup is at eleven")]
+    assert builtin.replacing(state) == set()  # the note is done with
+    turn(p, 3)
+    assert contents(local_rows(tmp_path, tables.MEMORY)) == ["standup is at eleven"]
+
+
+def test_a_note_of_a_replacement_never_reported_holds_up_deletions_for_a_while_only(home, tmp_path, monkeypatch):
+    _, p = make_manager(tmp_path, session_id="cli")
+    write_file(tmp_path, "memory", ["standup is at ten"])
+    turn(p, 1)
+    builtin.note_replacing(config.state_dir(tmp_path), "call-1", {"target": "memory", "operations": [
+        {"action": "patch", "old_text": "ten", "content": "eleven"}]})
+    write_file(tmp_path, "memory", ["standup is at eleven"])
+    monkeypatch.setattr(builtin, "REPLACING_KEEP_MS", -1)  # the note is past its time
+    turn(p, 2)
+    assert contents(local_rows(tmp_path, tables.MEMORY)) == ["standup is at eleven"]
+
+
+def test_recall_does_not_search_a_history_table_its_database_refused(env, platform, tmp_path, monkeypatch):
+    platform.refused_tables = {tables.HISTORY}
+    _, p = make_manager(tmp_path)
+    p.on_memory_write("add", "memory", "standup is at ten")
+    p.on_memory_write("replace", "memory", "standup is at eleven", {"previous_content": "standup is at ten"})
+    end_session(p)
+    _, p2 = make_manager(tmp_path)
+    p2._backend.mirror.sync(wait=True)  # this process learns the table is refused
+    searched = []
+    real = Recaller._cloud_rows
+    monkeypatch.setattr(Recaller, "_cloud_rows", lambda self, src, q, rerank=False, table=tables.MEMORY: (
+        searched.append(table), real(self, src, q, rerank, table))[1])
+    block = p2.prefetch("when is standup")
+    assert tables.HISTORY not in searched
+    assert "standup is at ten" in block  # this machine's history answers
     platform.refused_tables = set()

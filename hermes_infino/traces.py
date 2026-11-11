@@ -263,6 +263,13 @@ def _personal(session_id: str) -> bool:
         return True
 
 
+def _committed(result: Any) -> bool:
+    """Whether a call of Hermes's memory tool wrote its file, as Hermes reads
+    its answer before telling the providers: a success not held for approval."""
+    answer = privacy.json_value(result)
+    return isinstance(answer, dict) and answer.get("success") is True and answer.get("staged") is not True
+
+
 def _note_entries(session_id: str, target: str, entries: list[str]) -> None:
     """Note whose the entries a call of Hermes's memory tool writes are
     (builtin.note_writers), in the profile scope this runs in: unless the
@@ -417,7 +424,14 @@ class TraceRecorder:
             return None
         # A batch that removes some entries and adds others: its removals are
         # earlier versions of what it adds (provider.on_memory_write).
-        builtin.note_consolidation(str(kw.get("tool_call_id") or ""), privacy.json_value(kw.get("args")))
+        call_id = str(kw.get("tool_call_id") or "")
+        builtin.note_consolidation(call_id, privacy.json_value(kw.get("args")))
+        try:
+            # Its replacements are in flight until the provider keeps them: no
+            # file comparison, in any process, deletes their rows first.
+            builtin.note_replacing(config.state_dir(config.home()), call_id, privacy.json_value(kw.get("args")))
+        except Exception as e:  # only an earlier version is at stake: the write goes on
+            logger.info("infino: could not note a memory replacement in flight: %s", e)
         try:
             _note_entries(str(kw.get("session_id") or ""), *builtin.call_entries(privacy.json_value(kw.get("args"))))
         except Exception as e:
@@ -442,6 +456,14 @@ class TraceRecorder:
         session = str(kw.get("session_id") or "")
         if tool == MEMORY_TOOL:
             builtin.end_consolidation(str(kw.get("tool_call_id") or ""))
+            if not _committed(kw.get("result")):
+                # Nothing was written for a provider to keep (a failure, or a
+                # write held for approval): no replacement is in flight.
+                try:
+                    builtin.done_replacing(config.state_dir(config.home()), str(kw.get("tool_call_id") or ""),
+                                           all_of_it=True)
+                except Exception as e:
+                    logger.info("infino: could not clear a memory replacement's note: %s", e)
         self._note_call(tool, session, kw)
         if session and privacy.read_personal(tool, kw.get("result")):
             # The session the agent runs, as Hermes names it for the call: Hermes may have moved

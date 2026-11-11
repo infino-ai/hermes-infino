@@ -227,13 +227,17 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _entry_forms(text: str) -> list[str]:
-    """`text` as a built-in memory file may hold it: as given, and, for a
-    USER.md entry recalled with the "About <name>: " prefix its row carries,
-    without that prefix."""
+def _user_entry_forms(text: str, names: tuple[str, ...]) -> list[str]:
+    """`text` as USER.md may hold it: as given, and, recalled with the
+    "About <name>: " prefix its row carries for one of `names` (the people
+    this profile writes USER.md rows under), without that prefix. Only that
+    prefix: "About the release: ship Friday" is a MEMORY.md entry of its own,
+    never a "ship Friday" entry in USER.md."""
     forms = [text]
-    if text.startswith(ABOUT_ANYONE) and ": " in text:
-        forms.append(text.split(": ", 1)[1])
+    for name in names:
+        prefix = ABOUT_PERSON.format(author=name)
+        if name and text.startswith(prefix) and len(text) > len(prefix):
+            forms.append(text[len(prefix):])
     return forms
 
 
@@ -861,21 +865,25 @@ class InfinoMemoryProvider(MemoryProvider):
         # The entry that replaces the previous one, as its row will hold it: the
         # superseded copy names it, so a recall of the old shows what took its place.
         row = self._builtin_row(target, content, chat) if action in ("add", "replace") and content else None
+        call_id = str((metadata or {}).get("tool_call_id") or "")
+        batch_added = builtin.consolidation_of(call_id) if action == "remove" else []
         if action in ("replace", "remove") and previous:
             # A replacement (a patch, as Hermes reports one) moves the old entry
             # to the history, naming what replaced it (backend.supersede_rows);
-            # so do the removals of a batch that adds the entries replacing
-            # them (a consolidation). Any other removal is how the agent
-            # forgets, and deletes the entry, as infino_forget does.
+            # so does a removal of a batch that adds an entry carrying it (a
+            # consolidation), naming the entries that carry it. Any other
+            # removal is how the agent forgets, and deletes the entry, as
+            # infino_forget does: a batch may forget one entry and add an
+            # unrelated one in the same call.
             write = self._forget
-            consolidated = (builtin.consolidation_of(str((metadata or {}).get("tool_call_id") or ""))
-                            if action == "remove" else [])
+            consolidated = builtin.carried_into(previous, batch_added)
             if action == "replace" and row is not None:
                 write = functools.partial(self._supersede, superseded_by=str(row["content"]),
                                           replacement_chat=str(row.get(tables.CHAT) or ""))
             elif consolidated:
                 added = [r for r in (self._builtin_row(target, _clip(scrub(e)), chat) for e in consolidated) if r]
-                write = functools.partial(self._supersede, superseded_by=" | ".join(r["content"] for r in added),
+                write = functools.partial(self._supersede,
+                                          superseded_by=backend.REPLACED_JOIN.join(r["content"] for r in added),
                                           replacement_chat=str(added[0].get(tables.CHAT) or "") if added else "")
             if chat.group and not chat.owner_writes:
                 # The entry may be about another member, who wrote it: any "About <name>: ".
@@ -894,6 +902,11 @@ class InfinoMemoryProvider(MemoryProvider):
                 # chat of no known type, which may be the owner's own, the entry
                 # alone is noted as not theirs (traces.py), not the whole file.
                 self._mark(OTHERS_MARK, USER_FILE)
+        if action == "replace" or batch_added:
+            # This operation's earlier entry is kept (or deleted) now: the file
+            # comparison of any process may delete the target's stale rows once
+            # every one of the call's is (builtin.note_replacing).
+            self._run_write(builtin.done_replacing, config.state_dir(self._settings.home), call_id)
 
     def _mirrored_row(self, target: str, entry: str, chat: chats.Chat) -> dict:
         """The `memory` row of an entry found by comparing a built-in memory
@@ -932,12 +945,20 @@ class InfinoMemoryProvider(MemoryProvider):
         note cannot be read (another process holding it too long, a disk
         error), no entry is added - the next comparison adds them - and rows
         whose entry left its file are still deleted; a note that is damaged is
-        begun again (builtin.writers)."""
+        begun again (builtin.writers). While a call of Hermes's memory tool
+        that replaces entries is in flight in any process of the profile
+        (builtin.note_replacing), a target's stale rows are left for the next
+        comparison, so that call's provider still finds what it keeps."""
         assert self._backend is not None and self._settings is not None
         home = self._home or config.home()
         owners_turn = not chat.group and not by_agent and self._platform not in chats.MULTI_PARTY_PLATFORMS
         with builtin.lock(config.state_dir(self._settings.home)):
             written = self._written_in(home)
+            try:
+                in_flight = builtin.replacing(config.state_dir(self._settings.home))
+            except Exception as e:  # unreadable now: no stale row is deleted this time
+                logger.info("infino: could not read which memory replacements are in flight: %s", e)
+                in_flight = set(builtin.FILES)
             for target in builtin.FILES:
                 if target == "user" and not (owners_turn and self._user_file_is_owners()):
                     continue
@@ -955,6 +976,12 @@ class InfinoMemoryProvider(MemoryProvider):
                     else:
                         entries[key] = frozenset(noted) | (entries.get(key) or frozenset())
                 missing, stale = builtin.compare(list(entries), self._backend.builtin_rows(target))
+                if stale and target in in_flight:
+                    # A replacement of this file's entries runs in some process,
+                    # whose provider has not kept the earlier entries yet: deleting
+                    # their rows now would leave it nothing to keep. The next
+                    # comparison deletes what is still stale then.
+                    stale = []
                 if written is None:  # who wrote them cannot be told now: added next time
                     missing = []
                 for entry in missing:
@@ -1175,10 +1202,18 @@ class InfinoMemoryProvider(MemoryProvider):
                 text = str(args["content"])
                 matched = self._forget(text, scope, chat, self._people(), "", everywhere=True)
                 # Out of Hermes's own files too, or the next comparison finds the
-                # entry again: the team's file always, the person's own only
-                # where this turn may reach it.
-                in_files = builtin.remove_from_files(_entry_forms(text), ("memory",) if chat.group else
-                                                     tuple(builtin.FILES))
+                # entry again: each file only where its rows are in the scope
+                # asked for (MEMORY.md's are the default scope's, USER.md's
+                # personal), and the person's own file only where this turn may
+                # reach it. Text is matched whole; USER.md's also without the
+                # "About <name>: " its rows carry for this profile's people.
+                wanted: dict[str, list[str]] = {}
+                if scope is None or scope == self._default_scope():
+                    wanted["memory"] = [text]
+                if not chat.group and scope in (None, PERSONAL):
+                    names = tuple(dict.fromkeys(n for n in (self._person(), self._owner(), self._author) if n))
+                    wanted["user"] = _user_entry_forms(text, names)
+                in_files = builtin.remove_from_files(wanted)
                 return json.dumps({"ok": True, "scope": scope or "any", "matched": matched + in_files})
             if tool_name == "infino_publish_skill":
                 if (chat.group and not chat.owner_writes) or not self._keeps_personal(chat):
