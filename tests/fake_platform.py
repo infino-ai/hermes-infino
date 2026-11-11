@@ -63,6 +63,7 @@ class FakePlatform:
         self.schema_patch_refused = False  # a schema patch (adding a column) answers 403
         self.database_limit = None     # a key that may make no more: creates past this count answer 403
         self.refused_databases: set[str] = set()  # creating one of these answers 403 (a key for other databases)
+        self.refused_tables: set[str] = set()  # creating a table of one of these names answers 403
         self.trial_status = None       # /v1/trial answers this status (501: no free accounts; 409: one per network)
         self.trial_without_key = False  # /v1/trial answers 200 with no api_key
         self.valid_keys = None         # a set: any other bearer key answers 401
@@ -171,6 +172,8 @@ class FakePlatform:
         if op == "create_table":
             if body["table_name"] in tables:
                 return 409, {"error": "exists"}, None
+            if body["table_name"] in self.refused_tables:
+                return 403, {"error": "this key may not create tables in the database"}, None
             if self.no_embedder and any(f["type"] == "embedding" for f in body["schema"]):
                 return 403, {"error": "embedding columns are not enabled for this account"}, None
             if self.no_embedding_server and any(f["type"] == "embedding" for f in body["schema"]):

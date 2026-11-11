@@ -1,6 +1,7 @@
-"""Memory Hermes replaces, removes or rewrites away is kept, superseded:
-copied with when and by what, the row itself gone from what is current.
-Only `infino_forget` deletes. Recall shows superseded memories marked."""
+"""Earlier versions of memories, kept in `memory_history`: a replacement (a
+patch, as Hermes reports one) and the removals of a batch that adds what
+replaces them go there; any other removal deletes. Forgetting is total.
+Recall shows earlier versions after every current memory."""
 
 from __future__ import annotations
 
@@ -8,94 +9,107 @@ import json
 
 import pytest
 
-from hermes_infino import tables
+from hermes_infino import builtin, config, tables
 from hermes_infino.client import InfinoClient
-from hermes_infino.local import LocalStore
+from hermes_infino.local import PERSONAL_DB_DIR, LocalStore
 
-from .helpers import PERSONAL_DB, TEAM_DB, current, end_session, local_rows, make_manager, superseded
+from .helpers import (DM, GROUP, PERSONAL_DB, TEAM_DB, agent_tool_call, end_session, hermes_dispatch, in_session,
+                      local_rows, make_manager)
 from .test_builtin import contents, turn, write_file
 
-# The memory table's columns before superseded memories were kept.
-OLD_MEMORY_SCHEMA = [f for f in tables.MEMORY_SCHEMA
-                     if f["name"] not in (tables.SUPERSEDED, tables.SUPERSEDED_BY, tables.PRIOR_ROW_ID)]
+
+def history_rows(tmp_path, personal: bool = False) -> list[dict]:
+    store = LocalStore.under(config.state_dir(tmp_path), PERSONAL_DB_DIR) if personal else None
+    if store is not None:
+        return store.query_sql(f"SELECT * FROM {tables.HISTORY} ORDER BY stored_ms")
+    return local_rows(tmp_path, tables.HISTORY)
 
 
 def by(rows: list[dict]) -> list[tuple[str, str]]:
-    """Each superseded copy's text and what replaced it, oldest first."""
-    return [(r["content"], r[tables.SUPERSEDED_BY]) for r in sorted(superseded(rows), key=lambda r: r["stored_ms"])]
+    """Each earlier version's text and what superseded it, oldest first."""
+    return [(r["content"], r[tables.SUPERSEDED_BY]) for r in sorted(rows, key=lambda r: r["stored_ms"])]
 
 
-def test_a_chain_of_replacements_keeps_every_earlier_entry_with_what_replaced_it(home, tmp_path):
+# -- what is kept -----------------------------------------------------------------
+
+def test_a_replacement_moves_the_old_entry_to_the_history(home, tmp_path):
     _, p = make_manager(tmp_path)
     p.on_memory_write("add", "memory", "deploys are on Monday")
     p.on_memory_write("replace", "memory", "deploys are on Tuesday", {"previous_content": "deploys are on Monday"})
     p.on_memory_write("replace", "memory", "deploys are on Thursday", {"previous_content": "deploys are on Tuesday"})
     p._drain()
-    rows = local_rows(tmp_path, tables.MEMORY)
-    assert contents(current(rows)) == ["deploys are on Thursday"]
-    assert by(rows) == [("deploys are on Monday", "deploys are on Tuesday"),
-                        ("deploys are on Tuesday", "deploys are on Thursday")]
-    assert all(r[tables.SUPERSEDED] >= r["created_ms"] for r in superseded(rows))
+    assert contents(local_rows(tmp_path, tables.MEMORY)) == ["deploys are on Thursday"]  # memory: current only
+    old = history_rows(tmp_path)
+    assert by(old) == [("deploys are on Monday", "deploys are on Tuesday"),
+                       ("deploys are on Tuesday", "deploys are on Thursday")]
+    assert all(r[tables.SUPERSEDED] >= r["created_ms"] and r[tables.PRIOR_ROW_ID] for r in old)
 
 
-def test_an_entry_written_again_is_current_again_beside_its_superseded_copy(home, tmp_path):
-    _, p = make_manager(tmp_path)
-    p.on_memory_write("add", "memory", "use pnpm")
-    p.on_memory_write("replace", "memory", "use pnpm 9", {"previous_content": "use pnpm"})
-    p.on_memory_write("add", "memory", "use pnpm")
+def test_a_patch_through_hermess_own_tool_is_kept(home, tmp_path, monkeypatch):
+    hermes_dispatch(monkeypatch)
+    mgr, p = make_manager(tmp_path, session_id="cli")
+    agent_tool_call("cli", "memory", {"action": "add", "target": "memory", "content": "standup is at ten"}, mgr)
+    agent_tool_call("cli", "memory", {"action": "patch", "target": "memory", "old_text": "ten", "new_text": "eleven"},
+                    mgr)
     p._drain()
-    rows = local_rows(tmp_path, tables.MEMORY)
-    assert contents(current(rows)) == ["use pnpm", "use pnpm 9"]
-    assert by(rows) == [("use pnpm", "use pnpm 9")]
+    assert contents(local_rows(tmp_path, tables.MEMORY)) == ["standup is at eleven"]
+    assert by(history_rows(tmp_path)) == [("standup is at ten", "standup is at eleven")]
 
 
-def test_a_removal_with_the_memory_tool_forgets_the_entry_and_keeps_no_copy(home, tmp_path):
-    # How the agent forgets when someone asks it to: recall never shows the entry again.
-    _, p = make_manager(tmp_path)
-    p.on_memory_write("add", "memory", "Dana's flight lands at 6")
-    p.on_memory_write("remove", "memory", "", {"previous_content": "Dana's flight lands at 6"})
+def test_a_batch_that_removes_and_adds_keeps_what_it_consolidated(home, tmp_path, monkeypatch):
+    hermes_dispatch(monkeypatch)  # the plugin's tool hook notes the batch before Hermes runs it
+    mgr, p = make_manager(tmp_path, session_id="cli")
+    agent_tool_call("cli", "memory", {"target": "memory", "operations": [
+        {"action": "add", "content": "use pnpm"}, {"action": "add", "content": "pnpm 9 in the web repo"}]}, mgr)
+    agent_tool_call("cli", "memory", {"target": "memory", "operations": [
+        {"action": "remove", "old_text": "use pnpm"}, {"action": "remove", "old_text": "pnpm 9 in the web repo"},
+        {"action": "add", "content": "use pnpm 9 in the web repo"}]}, mgr)
     p._drain()
-    assert local_rows(tmp_path, tables.MEMORY) == []
+    assert contents(local_rows(tmp_path, tables.MEMORY)) == ["use pnpm 9 in the web repo"]
+    assert sorted(by(history_rows(tmp_path))) == [("pnpm 9 in the web repo", "use pnpm 9 in the web repo"),
+                                                  ("use pnpm", "use pnpm 9 in the web repo")]
+
+
+def test_a_removal_on_its_own_forgets_and_keeps_nothing(home, tmp_path, monkeypatch):
+    hermes_dispatch(monkeypatch)
+    mgr, p = make_manager(tmp_path, session_id="cli")
+    agent_tool_call("cli", "memory", {"action": "add", "target": "memory", "content": "Dana's flight lands at 6"}, mgr)
+    agent_tool_call("cli", "memory", {"action": "remove", "target": "memory", "old_text": "Dana's flight"}, mgr)
+    p._drain()
+    assert local_rows(tmp_path, tables.MEMORY) == [] and history_rows(tmp_path) == []
     assert "flight" not in p.prefetch("when does Dana's flight land")
 
 
-def test_forgetting_an_entry_clears_its_text_from_the_copy_it_replaced(home, tmp_path):
-    _, p = make_manager(tmp_path)
-    p.on_memory_write("add", "memory", "the wiki is on Confluence")
-    p.on_memory_write("replace", "memory", "the wiki moved to notion.so/acme-secret",
-                      {"previous_content": "the wiki is on Confluence"})
-    p.on_memory_write("remove", "memory", "", {"previous_content": "the wiki moved to notion.so/acme-secret"})
-    p._drain()
-    rows = local_rows(tmp_path, tables.MEMORY)
-    assert current(rows) == []
-    assert by(rows) == [("the wiki is on Confluence", "")]  # kept, no longer naming what was forgotten
-    assert not [r for r in rows if "acme-secret" in json.dumps(r, default=str)]
-
-
-def test_a_dropped_entry_is_superseded_once_however_many_turns_follow(home, tmp_path):
+def test_what_leaves_the_file_otherwise_is_deleted_not_kept(home, tmp_path):
+    # An approved removal, a hand edit: a person's removal, reported to no provider.
     _, p = make_manager(tmp_path, session_id="cli")
     write_file(tmp_path, "memory", ["deploys are on Tuesdays", "use pnpm"])
     turn(p, 1)
     write_file(tmp_path, "memory", ["use pnpm"])
-    for n in range(2, 6):
-        turn(p, n)
-    rows = local_rows(tmp_path, tables.MEMORY)
-    assert contents(current(rows)) == ["use pnpm"]
-    assert by(rows) == [("deploys are on Tuesdays", "")]
-
-
-def test_an_entry_the_agent_replaced_is_not_superseded_again_by_the_file_comparison(home, tmp_path):
-    # The memory tool tells the provider, then the next comparison reads the file Hermes wrote.
-    _, p = make_manager(tmp_path, session_id="cli")
-    write_file(tmp_path, "memory", ["deploys are on Tuesdays"])
-    turn(p, 1)
-    p.on_memory_write("replace", "memory", "deploys are on Thursdays", {"previous_content": "deploys are on Tuesdays"})
-    write_file(tmp_path, "memory", ["deploys are on Thursdays"])
     turn(p, 2)
-    turn(p, 3)
-    rows = local_rows(tmp_path, tables.MEMORY)
-    assert contents(current(rows)) == ["deploys are on Thursdays"]
-    assert by(rows) == [("deploys are on Tuesdays", "deploys are on Thursdays")]
+    assert contents(local_rows(tmp_path, tables.MEMORY)) == ["use pnpm"]
+    assert history_rows(tmp_path) == []
+
+
+def test_a_text_replaced_again_is_kept_once(home, tmp_path):
+    _, p = make_manager(tmp_path)
+    p.on_memory_write("add", "memory", "use pnpm")
+    for n in range(3):
+        p.on_memory_write("replace", "memory", "use pnpm 9", {"previous_content": "use pnpm"})
+        p.on_memory_write("replace", "memory", "use pnpm", {"previous_content": "use pnpm 9"})
+    p._drain()
+    assert contents(local_rows(tmp_path, tables.MEMORY)) == ["use pnpm"]
+    assert sorted(by(history_rows(tmp_path))) == [("use pnpm", "use pnpm 9"), ("use pnpm 9", "use pnpm")]
+
+
+def test_every_earlier_version_is_kept(home, tmp_path):
+    _, p = make_manager(tmp_path)
+    p.on_memory_write("add", "memory", "release 1")
+    for n in range(2, 41):
+        p.on_memory_write("replace", "memory", f"release {n}", {"previous_content": f"release {n - 1}"})
+    p._drain()
+    assert contents(local_rows(tmp_path, tables.MEMORY)) == ["release 40"]
+    assert len(history_rows(tmp_path)) == 39
 
 
 def test_a_crash_between_the_copy_and_the_delete_loses_nothing_and_copies_once(home, tmp_path, monkeypatch):
@@ -106,132 +120,132 @@ def test_a_crash_between_the_copy_and_the_delete_loses_nothing_and_copies_once(h
     real = b.forget_rows
     monkeypatch.setattr(b, "forget_rows", lambda rows: (_ for _ in ()).throw(OSError("killed")))
     with pytest.raises(OSError):
-        b.supersede_memory("the build uses make", "")
-    rows = local_rows(tmp_path, tables.MEMORY)
-    assert contents(current(rows)) == ["the build uses make"] and len(superseded(rows)) == 1  # both kept
+        b.supersede_memory("the build uses make", "the build uses just")
+    assert contents(local_rows(tmp_path, tables.MEMORY)) == ["the build uses make"] and len(history_rows(tmp_path)) == 1
     monkeypatch.setattr(b, "forget_rows", real)
-    assert b.supersede_memory("the build uses make", "") == 1
-    rows = local_rows(tmp_path, tables.MEMORY)
-    assert current(rows) == [] and by(rows) == [("the build uses make", "")]
+    assert b.supersede_memory("the build uses make", "the build uses just") == 1
+    assert local_rows(tmp_path, tables.MEMORY) == []
+    assert by(history_rows(tmp_path)) == [("the build uses make", "the build uses just")]
 
 
-def test_infino_forget_deletes_the_memory_and_every_superseded_copy_here_and_in_the_cloud(env, platform, tmp_path):
-    m, p = make_manager(tmp_path)
-    p.on_memory_write("add", "memory", "the deploy key is in vault")
-    p.on_memory_write("replace", "memory", "the deploy key is in 1Password",
-                      {"previous_content": "the deploy key is in vault"})
-    p.on_memory_write("replace", "memory", "the deploy key is in vault",
-                      {"previous_content": "the deploy key is in 1Password"})
-    end_session(p)
-    assert len(platform.rows(TEAM_DB, tables.MEMORY)) == 3  # vault current, vault and 1Password superseded
-    m2, p2 = make_manager(tmp_path)
-    out = json.loads(m2.handle_tool_call("infino_forget", {"content": "the deploy key is in vault"}))
-    assert out["ok"] and out["matched"] == 2
-    end_session(p2)
-    for rows in (local_rows(tmp_path, tables.MEMORY), platform.rows(TEAM_DB, tables.MEMORY)):
-        assert not [r for r in rows if "vault" in str(r["content"]) + str(r.get(tables.SUPERSEDED_BY) or "")]
-        assert by(rows) == [("the deploy key is in 1Password", "")]
+# -- privacy ----------------------------------------------------------------------
 
-
-def test_infino_forget_clears_the_name_from_a_copy_another_machine_pushed(env, platform, tmp_path):
-    _, p = make_manager(tmp_path)
+def test_a_groups_replacement_never_names_its_text_on_a_team_wide_row(home, tmp_path, monkeypatch):
+    _, p = make_manager(tmp_path, platform="telegram")
+    in_session(monkeypatch, DM)
     p.on_memory_write("add", "memory", "standup is at ten")
-    end_session(p)
-    # A teammate's machine kept a copy that names the text being forgotten.
-    platform.databases[TEAM_DB][tables.MEMORY].append({
-        "row_id": "theirs", "stored_ms": 1, "content": "standup is at nine", "scope": "team", "origin": "builtin:memory",
-        "chat": "", tables.SUPERSEDED: 1, tables.SUPERSEDED_BY: "standup is at ten", tables.PRIOR_ROW_ID: "x"})
-    m2, p2 = make_manager(tmp_path)
-    out = json.loads(m2.handle_tool_call("infino_forget", {"content": "standup is at ten"}))
-    assert out["ok"]
-    end_session(p2)
-    rows = platform.rows(TEAM_DB, tables.MEMORY)
-    assert not [r for r in rows if "at ten" in str(r["content"]) + str(r.get(tables.SUPERSEDED_BY) or "")]
-    assert by(rows) == [("standup is at nine", "")]
-    assert not [r for r in rows if r["row_id"] == "theirs"]
-
-
-def test_an_entry_the_review_keeps_rewording_back_is_kept_once(home, tmp_path):
-    _, p = make_manager(tmp_path, session_id="cli")
-    for n in range(1, 7):  # the entry leaves and comes back, turn after turn
-        write_file(tmp_path, "memory", ["use pnpm"] if n % 2 else ["use pnpm, not npm"])
-        turn(p, n)
-    rows = local_rows(tmp_path, tables.MEMORY)
-    assert contents(current(rows)) == ["use pnpm, not npm"]
-    assert sorted(by(rows)) == [("use pnpm", ""), ("use pnpm, not npm", "")]
-
-
-def test_superseded_copies_are_kept_however_many_there_are(home, tmp_path):
-    _, p = make_manager(tmp_path)
-    p.on_memory_write("add", "memory", "release 1")
-    for n in range(2, 41):
-        p.on_memory_write("replace", "memory", f"release {n}", {"previous_content": f"release {n - 1}"})
     p._drain()
-    rows = local_rows(tmp_path, tables.MEMORY)
-    assert contents(current(rows)) == ["release 40"]
-    assert len(superseded(rows)) == 39  # every earlier version, none dropped
+    in_session(monkeypatch, GROUP)  # a member replaces the team-wide entry with the group's own note
+    p.on_memory_write("replace", "memory", "standup moves to the Acme war room",
+                      {"previous_content": "standup is at ten"})
+    p._drain()
+    [old] = history_rows(tmp_path)
+    assert old["content"] == "standup is at ten" and not old[tables.CHAT]
+    assert old[tables.SUPERSEDED_BY] == ""  # the group's text stays with the group's row
 
 
-def test_a_persons_superseded_entry_goes_to_their_own_database_never_the_teams(env, platform, tmp_path):
+def test_a_persons_earlier_entry_goes_to_their_own_database_never_the_teams(env, platform, tmp_path):
     env.setenv("INFINO_PERSONAL_DATABASE", PERSONAL_DB)
     env.setenv("INFINO_AUTHOR", "priya")
     _, p = make_manager(tmp_path)
     p.on_memory_write("add", "user", "Prefers short answers")
     p.on_memory_write("replace", "user", "Prefers bullet points", {"previous_content": "Prefers short answers"})
     end_session(p)
-    assert not [r for r in platform.rows(TEAM_DB, tables.MEMORY) if "Prefers" in r["content"]]
-    mine = platform.rows(PERSONAL_DB, tables.MEMORY)
-    assert contents(current(mine)) == ["About priya: Prefers bullet points"]
-    assert by(mine) == [("About priya: Prefers short answers", "About priya: Prefers bullet points")]
-    assert all(r["scope"] == "personal" and r["author"] == "priya" for r in mine)
+    assert not [r for r in platform.rows(TEAM_DB, tables.HISTORY) if "Prefers" in r["content"]]
+    assert by(platform.rows(PERSONAL_DB, tables.HISTORY)) == [
+        ("About priya: Prefers short answers", "About priya: Prefers bullet points")]
 
 
-def test_the_cloud_gets_the_copy_and_loses_the_current_row(env, platform, tmp_path):
+# -- forgetting is total --------------------------------------------------------------
+
+def test_forgetting_a_memory_forgets_every_earlier_version_of_it(env, platform, tmp_path):
+    m, p = make_manager(tmp_path)
+    p.on_memory_write("add", "user", "Lives at 12 Elm St")
+    p.on_memory_write("replace", "user", "Lives at 99 Oak Ave", {"previous_content": "Lives at 12 Elm St"})
+    p.on_memory_write("add", "memory", "the office is at 1 Main St")
+    end_session(p)
+    m2, p2 = make_manager(tmp_path)
+    out = json.loads(m2.handle_tool_call("infino_forget", {"content": "Lives at 99 Oak Ave"}))
+    assert out["ok"] and out["matched"] >= 2
+    end_session(p2)
+    everywhere = (local_rows(tmp_path, tables.MEMORY) + local_rows(tmp_path, tables.HISTORY)
+                  + history_rows(tmp_path, personal=True)
+                  + LocalStore.under(config.state_dir(tmp_path), PERSONAL_DB_DIR).query_sql("SELECT * FROM memory")
+                  + platform.rows(TEAM_DB, tables.MEMORY) + platform.rows(TEAM_DB, tables.HISTORY))
+    text = json.dumps(everywhere, default=str)
+    assert "Elm" not in text and "Oak" not in text
+    assert "1 Main St" in text  # nothing else
+
+
+def test_infino_forget_follows_the_chain_in_the_cloud_whichever_machine_pushed_it(env, platform, tmp_path):
     _, p = make_manager(tmp_path)
     p.on_memory_write("add", "memory", "standup is at ten")
     end_session(p)
-    [original] = platform.rows(TEAM_DB, tables.MEMORY)
-    _, p2 = make_manager(tmp_path)
-    p2.on_memory_write("replace", "memory", "standup is at eleven", {"previous_content": "standup is at ten"})
+    # A teammate's machine kept two earlier versions: nine, superseded by nine-thirty, superseded by ten.
+    tables.ensure_optional(InfinoClient("k", platform.url), TEAM_DB, tables.HISTORY)
+    platform.databases[TEAM_DB][tables.HISTORY] += [
+        {"row_id": "t1", "stored_ms": 1, "content": "standup is at nine", "scope": "team", "chat": "",
+         tables.SUPERSEDED: 1, tables.SUPERSEDED_BY: "standup is at nine-thirty", tables.PRIOR_ROW_ID: "x"},
+        {"row_id": "t2", "stored_ms": 2, "content": "standup is at nine-thirty", "scope": "team", "chat": "",
+         tables.SUPERSEDED: 2, tables.SUPERSEDED_BY: "standup is at ten", tables.PRIOR_ROW_ID: "y"}]
+    m2, p2 = make_manager(tmp_path)
+    assert json.loads(m2.handle_tool_call("infino_forget", {"content": "standup is at ten"}))["ok"]
     end_session(p2)
-    rows = platform.rows(TEAM_DB, tables.MEMORY)
-    assert contents(current(rows)) == ["standup is at eleven"]
-    [kept] = superseded(rows)
-    assert kept[tables.PRIOR_ROW_ID] == original["row_id"] and kept["row_id"] != original["row_id"]
-    assert kept[tables.SUPERSEDED_BY] == "standup is at eleven"
+    assert platform.rows(TEAM_DB, tables.MEMORY) == [] and platform.rows(TEAM_DB, tables.HISTORY) == []
 
 
-def test_recall_through_the_provider_shows_a_superseded_memory_marked(home, tmp_path):
-    m, p = make_manager(tmp_path)
-    p.on_memory_write("add", "memory", "the release train leaves on Friday")
-    p.on_memory_write("replace", "memory", "the release train leaves on Wednesday",
-                      {"previous_content": "the release train leaves on Friday"})
-    p._drain()
-    block = p.prefetch("when does the release train leave")
-    assert "- [team] the release train leaves on Wednesday" in block
-    assert "the release train leaves on Friday [superseded " in block
-    assert "replaced by: the release train leaves on Wednesday]" in block
-    # Current before superseded, with no grader to say otherwise.
-    assert block.index("on Wednesday\n") < block.index("on Friday [superseded")
+def test_infino_forget_takes_the_entry_out_of_hermess_file(home, tmp_path):
+    mgr, p = make_manager(tmp_path, session_id="cli")
+    write_file(tmp_path, "memory", ["the deploy key is in vault", "use pnpm"])
+    turn(p, 1)
+    out = json.loads(mgr.handle_tool_call("infino_forget", {"content": "the deploy key is in vault"}))
+    assert out["ok"] and out["matched"] == 2  # the row, and the file's entry
+    assert builtin.read_entries(tmp_path, "memory") == ["use pnpm"]
+    turn(p, 2)  # the next comparison does not find it again
+    assert contents(local_rows(tmp_path, tables.MEMORY)) == ["use pnpm"]
 
 
-def test_a_table_an_older_version_made_gains_the_columns_and_its_rows_are_current(home, tmp_path, monkeypatch):
-    old = {**tables.TEAM_TABLES, tables.MEMORY: (OLD_MEMORY_SCHEMA, tables.MEMORY_INDEXES)}
-    monkeypatch.setattr(tables, "TEAM_TABLES", old)
-    store = LocalStore(tmp_path / "db")
-    store.ensure_tables(with_vectors=False)
-    store.append(tables.MEMORY, [{"content": "written by the older version", "origin": "builtin:memory"}])
-    monkeypatch.undo()
-    store.ensure_tables(with_vectors=False)
-    [row] = store.query_sql(f"SELECT * FROM {tables.MEMORY}")
-    assert row[tables.SUPERSEDED] is None and row[tables.PRIOR_ROW_ID] is None
-    assert store.query_sql(f"SELECT content FROM {tables.MEMORY} WHERE {tables.current_predicate()}") == [
-        {"content": "written by the older version"}]
+def test_no_history_is_made_of_a_memory_a_teammate_forgot(env, platform, tmp_path):
+    # This machine still holds the row it pushed; a teammate's forget deleted it in the cloud.
+    _, p = make_manager(tmp_path)
+    p.on_memory_write("add", "memory", "standup is at ten")
+    p.on_memory_write("add", "memory", "Dana's PIN is 4321")
+    end_session(p)
+    platform.databases[TEAM_DB][tables.MEMORY] = [r for r in platform.rows(TEAM_DB, tables.MEMORY)
+                                                  if "4321" not in r["content"]]
+    _, p2 = make_manager(tmp_path)
+    p2.on_memory_write("replace", "memory", "Dana changed her PIN", {"previous_content": "Dana's PIN is 4321"})
+    end_session(p2)
+    assert not [r for r in local_rows(tmp_path, tables.HISTORY) + platform.rows(TEAM_DB, tables.HISTORY)
+                if "4321" in r["content"]]
 
 
-def test_a_cloud_table_an_older_version_made_gains_the_columns(home, platform):
-    c = InfinoClient("k", platform.url, retries=0)
-    c.ensure_database(TEAM_DB)
-    c.ensure_table(TEAM_DB, tables.MEMORY, OLD_MEMORY_SCHEMA, tables.MEMORY_INDEXES)
-    tables.ensure_all(c, TEAM_DB)
-    assert {tables.SUPERSEDED, tables.SUPERSEDED_BY, tables.PRIOR_ROW_ID} <= set(c.column_names(TEAM_DB, tables.MEMORY))
+def test_no_history_is_made_of_a_pushed_memory_the_cloud_cannot_be_asked_about(env, platform, tmp_path, monkeypatch):
+    _, p = make_manager(tmp_path)
+    p.on_memory_write("add", "memory", "Dana's PIN is 4321")
+    end_session(p)
+    _, p2 = make_manager(tmp_path)
+    b = p2._backend
+    monkeypatch.setattr(b.mirror, "matching_ids", lambda *a, **k: (_ for _ in ()).throw(OSError("unreachable")))
+    p2.on_memory_write("replace", "memory", "Dana changed her PIN", {"previous_content": "Dana's PIN is 4321"})
+    p2._drain()
+    assert local_rows(tmp_path, tables.HISTORY) == []
+
+
+# -- upgrading -------------------------------------------------------------------------
+
+def test_memory_keeps_its_schema_so_an_upgrade_adds_no_columns():
+    names = {f["name"] for f in tables.MEMORY_SCHEMA}
+    assert not names & {tables.SUPERSEDED, tables.SUPERSEDED_BY, tables.PRIOR_ROW_ID}
+
+
+def test_a_database_that_refuses_the_history_table_still_syncs_everything_else(env, platform, tmp_path):
+    platform.refused_tables = {tables.HISTORY}
+    _, p = make_manager(tmp_path)
+    p.on_memory_write("add", "memory", "standup is at ten")
+    p.on_memory_write("replace", "memory", "standup is at eleven", {"previous_content": "standup is at ten"})
+    end_session(p)
+    assert contents(platform.rows(TEAM_DB, tables.MEMORY)) == ["standup is at eleven"]  # memory synced
+    assert tables.HISTORY not in platform.databases[TEAM_DB]
+    assert by(local_rows(tmp_path, tables.HISTORY)) == [("standup is at ten", "standup is at eleven")]  # kept here
+    platform.refused_tables = set()

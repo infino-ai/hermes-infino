@@ -34,6 +34,7 @@ import fcntl
 import json
 import logging
 import os
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -180,6 +181,73 @@ def patched_entries(answer: Any) -> list[str]:
     many = answer.get("patched_entries_after")
     found = [answer.get("patched_entry_after"), *(many.values() if isinstance(many, dict) else ())]
     return list(dict.fromkeys(e.strip() for e in found if isinstance(e, str) and e.strip()))
+
+
+# Batches of Hermes's memory tool that remove entries and add others in one
+# call: a consolidation, whose removed entries are earlier versions of what
+# it added, not things forgotten. Noted by the tool hook before Hermes runs
+# the call (traces.py), keyed by the call's id, and read when Hermes reports
+# each removal to the provider with that id (`on_memory_write`). Held in this
+# process only: the report follows the hook within the same call.
+_consolidations: dict[str, tuple[str, list[str]]] = {}
+_consolidations_lock = threading.Lock()
+# Calls noted at once; the oldest is dropped past it (a call whose report
+# never came).
+MAX_NOTED_CONSOLIDATIONS = 256
+
+
+def note_consolidation(tool_call_id: str, args: Any) -> None:
+    """Note a call of Hermes's memory tool that removes some entries and
+    adds others in one batch: its target and the entries it adds."""
+    call = args if isinstance(args, dict) else {}
+    operations = call.get("operations")
+    if not tool_call_id or not isinstance(operations, list):
+        return
+    actions = {str(op.get("action") or "") for op in operations if isinstance(op, dict)}
+    _, added = call_entries(call)
+    if "remove" not in actions or not added:
+        return
+    with _consolidations_lock:
+        _consolidations[tool_call_id] = (str(call.get("target") or ""), added)
+        while len(_consolidations) > MAX_NOTED_CONSOLIDATIONS:
+            _consolidations.pop(next(iter(_consolidations)))
+
+
+def end_consolidation(tool_call_id: str) -> None:
+    """Drop the note of call `tool_call_id` once it ran: Hermes reported each
+    of its operations to the provider during the call."""
+    with _consolidations_lock:
+        _consolidations.pop(tool_call_id or "", None)
+
+
+def consolidation_of(tool_call_id: str) -> list[str]:
+    """The entries the batch call `tool_call_id` added, when it was a
+    consolidation (`note_consolidation`); none otherwise."""
+    with _consolidations_lock:
+        noted = _consolidations.get(tool_call_id or "")
+    return list(noted[1]) if noted else []
+
+
+def remove_from_files(texts: list[str], targets: tuple[str, ...]) -> int:
+    """Remove the entries holding exactly one of `texts` from Hermes's
+    built-in memory files of `targets`, through Hermes's own store (its lock
+    and its check for a file changed under it), so a forgotten entry is not
+    found again by the next comparison and stays out of the agent's context.
+    How many were removed; none outside a Hermes install."""
+    try:
+        from tools.memory_tool import load_on_disk_store
+    except ImportError:  # pragma: no cover - only outside a Hermes install
+        return 0
+    wanted = {t.strip() for t in texts if t and t.strip()}
+    store = load_on_disk_store()
+    removed = 0
+    for target in targets:
+        entries = list(store.memory_entries if target == "memory" else store.user_entries)
+        for entry in entries:
+            if entry.strip() in wanted:
+                result = store.remove(target, entry, matched_entry=entry)
+                removed += bool(isinstance(result, dict) and result.get("success"))
+    return removed
 
 
 def note_writers(state_dir: Path, home: Path, target: str, entries: list[str], chat: str) -> None:

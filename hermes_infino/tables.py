@@ -44,7 +44,9 @@ MEMORY = "memory"
 CONVERSATIONS = "conversations"
 TRACES = "traces"
 SKILLS = "skills"
-ALL = (MEMORY, CONVERSATIONS, TRACES, SKILLS)
+# Earlier versions of memories (see SUPERSEDED below).
+HISTORY = "memory_history"
+ALL = (MEMORY, CONVERSATIONS, TRACES, SKILLS, HISTORY)
 
 # The column the platform embeds, and the column it embeds from.
 EMBEDDING_COLUMN = "embedding"
@@ -53,10 +55,14 @@ ROW_ID = "row_id"
 STORED = "stored_ms"
 # A memory's group chat (chats.py): kept for that chat and recalled only there.
 CHAT = "chat"
-# A memory Hermes replaced or removed is kept, not deleted (provider.py): a
-# copy of its row, stamped when it was superseded and with what (empty when
-# nothing names the replacement), pointing at the row it copies. A current
-# memory has no `superseded_ms`. Only `infino_forget` deletes a memory.
+# The earlier versions of memories, kept in a table of their own beside
+# `memory` (backend.supersede_rows): a memory Hermes replaced, or consolidated
+# away in one batch with what replaced it, is copied here with when it was
+# superseded, what superseded it (empty when nothing names it, or when the
+# replacement was written for another chat) and the row it was. `memory`
+# itself holds current memories only, exactly as before, so nothing that
+# reads it changes, and a version that does not know this table never sees
+# or deletes it.
 SUPERSEDED = "superseded_ms"
 SUPERSEDED_BY = "superseded_by"
 PRIOR_ROW_ID = "prior_row_id"
@@ -72,14 +78,21 @@ MEMORY_SCHEMA = [
     {"name": "origin", "type": "utf8"},         # remember | builtin:memory | builtin:user
     {"name": CHAT, "type": "utf8"},             # the group chat it is kept for ("" or null: the team's or the person's)
     {"name": "created_ms", "type": "i64"},
-    {"name": SUPERSEDED, "type": "i64"},        # when Hermes replaced or removed it; null while current
-    {"name": SUPERSEDED_BY, "type": "utf8"},    # the entry that replaced it ("" when nothing names one)
-    {"name": PRIOR_ROW_ID, "type": "utf8"},     # the row this superseded copy was made from
     {"name": EMBEDDING_COLUMN, "type": "embedding", "source": [MEMORY_TEXT_COLUMN], "nullable": False},
 ]
 # No vector index is declared: the platform indexes an embedding column
 # (cosine) by itself and refuses a declaration for one.
 MEMORY_INDEXES = {"fts": [MEMORY_TEXT_COLUMN]}
+
+# `memory`'s columns, less its embedding (an earlier version is found by its
+# words, and is ranked for the question when ranking is on), with when it was
+# superseded, what superseded it, and the row it was.
+HISTORY_SCHEMA = [f for f in MEMORY_SCHEMA if f["type"] != "embedding"] + [
+    {"name": SUPERSEDED, "type": "i64"},
+    {"name": SUPERSEDED_BY, "type": "large_utf8"},
+    {"name": PRIOR_ROW_ID, "type": "utf8"},
+]
+HISTORY_INDEXES = {"fts": [MEMORY_TEXT_COLUMN]}
 
 CONVERSATIONS_SCHEMA = [
     {"name": ROW_ID, "type": "utf8"},
@@ -150,11 +163,16 @@ TEAM_TABLES = {
     CONVERSATIONS: (CONVERSATIONS_SCHEMA, CONVERSATIONS_INDEXES),
     TRACES: (TRACES_SCHEMA, TRACES_INDEXES),
     SKILLS: (SKILLS_SCHEMA, SKILLS_INDEXES),
+    HISTORY: (HISTORY_SCHEMA, HISTORY_INDEXES),
 }
-# A person's own database holds their personal memory, and the conversations
-# and traces kept personal (privacy.py): a personal profile's, a personal
-# scheduled job's, a chat a personal job's output went to.
-PERSONAL = (MEMORY, CONVERSATIONS, TRACES)
+# Tables a cloud database may lack without holding up the others: one that
+# cannot be made there (a key that may not create tables) keeps its own rows
+# on this machine, and every other table syncs as before (ensure_optional).
+OPTIONAL = (HISTORY,)
+# A person's own database holds their personal memory and its history, and
+# the conversations and traces kept personal (privacy.py): a personal
+# profile's, a personal scheduled job's, a chat a personal job's output went to.
+PERSONAL = (MEMORY, CONVERSATIONS, TRACES, HISTORY)
 PERSONAL_TABLES = {t: TEAM_TABLES[t] for t in PERSONAL}
 
 
@@ -167,12 +185,6 @@ def chat_predicate(visible: tuple[str, ...]) -> str:
     """Rows of the chats in `visible`, "" standing for no chat (null or empty)."""
     terms = [f"{CHAT} IS NULL OR {CHAT} = ''" if c == "" else f"{CHAT} = {sql_string(c)}" for c in visible]
     return "(" + " OR ".join(terms) + ")"
-
-
-def current_predicate() -> str:
-    """Memories still in force: not superseded (rows written before the
-    column existed read it as null, and are current)."""
-    return f"{SUPERSEDED} IS NULL"
 
 
 class OutdatedTable(Exception):
@@ -193,6 +205,8 @@ def ensure_all(client: InfinoClient, database: str, personal: bool = False) -> N
     machine meanwhile."""
     client.ensure_database(database)
     for table, (schema, indexes) in (PERSONAL_TABLES if personal else TEAM_TABLES).items():
+        if table in OPTIONAL:
+            continue  # made on its own (ensure_optional): it never holds up these
         try:
             client.ensure_table(database, table, schema, indexes)
         except InfinoError as e:
@@ -213,3 +227,17 @@ def ensure_all(client: InfinoClient, database: str, personal: bool = False) -> N
             raise OutdatedTable(f"{database}.{table} has no {names}, and adding it was refused ({e}). Add it as a "
                                 f"nullable column with a key that may manage {database}; until then nothing is "
                                 f"pushed to {database}, and every row stays on this machine") from None
+
+
+def ensure_optional(client: InfinoClient, database: str, table: str) -> None:
+    """Create one of OPTIONAL in `database` unless it exists, with every
+    column this version writes. Raises when it cannot be made: the caller
+    keeps that table's rows on this machine, and the database's other tables
+    are not held up."""
+    schema, indexes = TEAM_TABLES[table]
+    client.ensure_table(database, table, schema, indexes)
+    have = set(client.column_names(database, table))
+    missing = [f for f in schema if f["name"] not in have]
+    if missing:
+        client.add_columns(database, table, [{"name": f["name"], "type": f["type"], "nullable": True}
+                                             for f in missing])

@@ -144,7 +144,7 @@ PERSONAL_SOURCE_PREFIX = "personal_"
 PERSONAL_SOURCES = {PERSONAL_SOURCE_PREFIX + t: t for t in tables.PERSONAL}
 PERSONAL_MEMORY = PERSONAL_SOURCE_PREFIX + tables.MEMORY
 # What each team table's mark was called before marks named their database.
-LEGACY_MARKS = (*tables.ALL, PERSONAL_MEMORY)
+LEGACY_MARKS = (tables.MEMORY, tables.CONVERSATIONS, tables.TRACES, tables.SKILLS, PERSONAL_MEMORY)
 
 
 def _now_ms() -> int:
@@ -221,6 +221,11 @@ class Mirror:
         self._tables_ready: set[str] = set()
         self._tables_errors: dict[str, Exception] = {}
         self._tables_failed_at = 0.0
+        # The optional tables (tables.OPTIONAL) made in each cloud database,
+        # and when each of the others last failed to be: a table not made
+        # there keeps its own rows on this machine, holding up nothing else.
+        self._optional_ready: set[tuple[str, str]] = set()
+        self._optional_failed_at: dict[tuple[str, str], float] = {}
 
     # -- where rows go -------------------------------------------------------
 
@@ -269,6 +274,12 @@ class Mirror:
                 continue
             self._tables_ready.add(database)
             self._tables_errors.pop(database, None)
+            # The optional tables too, as best it can: one not made now is tried
+            # when its rows are next pushed, and holds up nothing meanwhile.
+            for table in tables.OPTIONAL:
+                if personal and table not in tables.PERSONAL:
+                    continue
+                self._optional_made(database, table)
         if failures:
             self._tables_ready -= set(failures)
             self._tables_errors.update(failures)
@@ -286,6 +297,27 @@ class Mirror:
         if due:
             self._ensure(due)
         return self.waiting()
+
+    def _optional_made(self, database: str, table: str) -> bool:
+        """Whether optional `table` is made in cloud `database`, making it when
+        it is not (at most once each ENSURE_RETRY_S after a failure). A table
+        that cannot be made holds up only its own rows, which stay here."""
+        key = (database, table)
+        if key in self._optional_ready:
+            return True
+        failed = self._optional_failed_at.get(key)
+        if failed is not None and time.monotonic() - failed < ENSURE_RETRY_S:
+            return False
+        try:
+            tables.ensure_optional(self.client, database, table)
+        except Exception as e:
+            logger.warning("infino: %s.%s could not be made, so its rows stay on this machine (tried again in %d s); "
+                           "everything else syncs: %s", database, table, ENSURE_RETRY_S, e)
+            self._optional_failed_at[key] = time.monotonic()
+            return False
+        self._optional_ready.add(key)
+        self._optional_failed_at.pop(key, None)
+        return True
 
     def waiting(self) -> dict[str, Exception]:
         """The cloud databases whose tables are not right, each with why its
@@ -307,6 +339,8 @@ class Mirror:
             for src in self.sources():
                 if src.database != database:
                     continue
+                if src.table in tables.OPTIONAL and (database, src.table) not in self._optional_ready:
+                    continue  # not made there yet (or not known to be): nothing of it to have lost
                 mark = marks.get(src.mark)
                 if mark is None or not src.store.has_row(src.table, mark[1]):
                     continue
@@ -453,6 +487,8 @@ class Mirror:
                 pushed[src.mark] = 0
                 if src.database in waiting:
                     continue  # its rows stay here, and its mark where it is, until its tables are right
+                if src.table in tables.OPTIONAL and not self._optional_made(src.database, src.table):
+                    continue  # this table's rows stay here until it is made; the others go on
                 check = src.mark in unsure
                 try:
                     while True:

@@ -29,7 +29,7 @@ from run_agent import AIAgent
 from tools.memory_tool_store import MemoryStore
 from tools.thread_context import propagate_context_to_thread
 
-from hermes_infino import chats, config, embed, tables, traces
+from hermes_infino import chats, config, embed, traces
 from hermes_infino.local import PERSONAL_DB_DIR, LocalStore
 from hermes_infino.provider import InfinoMemoryProvider
 
@@ -172,16 +172,6 @@ def local(tmp_path) -> LocalStore:
 
 def local_rows(tmp_path, table: str) -> list[dict]:
     return local(tmp_path).query_sql(f"SELECT * FROM {table} ORDER BY stored_ms, row_id")
-
-
-def current(rows: list[dict]) -> list[dict]:
-    """The memory rows still in force: not superseded copies."""
-    return [r for r in rows if r.get(tables.SUPERSEDED) is None]
-
-
-def superseded(rows: list[dict]) -> list[dict]:
-    """The superseded copies among memory rows (backend.supersede_rows)."""
-    return [r for r in rows if r.get(tables.SUPERSEDED) is not None]
 
 
 def personal_rows(tmp_path) -> list[dict]:

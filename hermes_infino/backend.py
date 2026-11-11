@@ -252,30 +252,34 @@ class Backend:
         also matches the text after any "About <name>: " prefix of that shape
         (a group's entries about its members, whoever wrote them).
 
+        Forgetting is total: every earlier version of the memory goes too,
+        the history rows that hold its text or were superseded by it, and
+        theirs in turn (`_forget_history`).
+
         This machine's rows are deleted here and, signed in, in the cloud by
         their ids. With `everywhere` (`infino_forget`) so is every matching
         row in the cloud, whichever machine saved it: the cloud is asked
         which rows match, and when it does not answer the forget is queued as
         its match, bounded to rows stored by now (one saved later is kept).
-        Returns how many rows were found."""
+        Returns how many rows were found, earlier versions included."""
         now = int(time.time() * 1000)
-        predicate, personal_predicate, reaches_personal = _memory_match(content, scope, visible, people,
-                                                                        about_prefix)
+        match = _text_match(content, about_prefix)
+        team_vis, personal_vis, reaches_personal = _reach(scope, visible, people)
+        predicate, personal_predicate = f"{match} AND {team_vis}", f"{match} AND {personal_vis}"
         team = self.local.delete(tables.MEMORY, predicate) if scope != recall.PERSONAL else []
         personal = self.personal.delete(tables.MEMORY, personal_predicate) if reaches_personal else []
         found = {str(r[tables.ROW_ID]) for r in team} | {str(r[tables.ROW_ID]) for r in personal}
-        # A superseded copy that names the forgotten text as its replacement
-        # keeps its own text and loses that name: forgetting is total.
-        named, personal_named, _ = _memory_match(content, scope, visible, people, about_prefix,
-                                                 column=tables.SUPERSEDED_BY)
-        if scope != recall.PERSONAL:
-            self._unname(self.local, named, self.settings.team_database, everywhere)
-        if reaches_personal:
-            self._unname(self.personal, personal_named, self.settings.personal_database, everywhere)
-        if self.mirror is None:
-            return len(found)
-        # Each row is deleted from the cloud database its source went to.
         s = self.settings
+        history = 0
+        if scope != recall.PERSONAL:
+            history += self._forget_history(self.local, content, about_prefix, team_vis,
+                                            s.team_database, everywhere, now)
+        if reaches_personal:
+            history += self._forget_history(self.personal, content, about_prefix, personal_vis,
+                                            s.personal_database, everywhere, now)
+        if self.mirror is None:
+            return len(found) + history
+        # Each row is deleted from the cloud database its source went to.
         targets = [(s.team_database, predicate, team)] if scope != recall.PERSONAL else []
         if reaches_personal and s.personal_database:
             targets.append((s.personal_database, personal_predicate, personal))
@@ -290,69 +294,88 @@ class Backend:
             self.mirror.forget(tables.MEMORY, database, sorted(ids))
             found |= ids
         self.schedule_sync()
-        return len(found)
+        return len(found) + history
 
-    def _unname(self, store: LocalStore, predicate: str, database: Optional[str], everywhere: bool) -> None:
-        """Clear `superseded_by` on the superseded copies matching `predicate`
-        (those naming text being forgotten): each is deleted by id, here and
-        in the cloud, and written again with the name empty. With
-        `everywhere`, copies other machines pushed to the cloud are rewritten
-        too; when the cloud cannot say which, they are deleted there instead,
-        bounded to rows stored by now, so the name never survives."""
-        rows = store.query_sql(f"SELECT * FROM {tables.MEMORY} WHERE ({predicate}) AND NOT {tables.current_predicate()}")
-        if self.mirror is not None and database and everywhere:
-            mine = {str(r[tables.ROW_ID]) for r in rows}
-            try:
-                rows += [r for r in self.mirror.matching_rows(tables.MEMORY, database, predicate)
-                         if r.get(tables.SUPERSEDED) is not None and str(r.get(tables.ROW_ID)) not in mine]
-            except Exception as e:  # unanswered: the cloud's copies go instead
-                logger.info("infino: the cloud did not say which copies name a forgotten memory; deleting them: %s", e)
-                now = int(time.time() * 1000)
-                self.mirror.forget_matching(tables.MEMORY, database, f"({predicate}) AND {tables.STORED} <= {now}")
+    def _forget_history(self, store: LocalStore, content: str, about_prefix: str, visible: str,
+                        database: Optional[str], everywhere: bool, now: int) -> int:
+        """Delete the history of a memory being forgotten, from `store` and
+        its cloud `database`: the rows holding its text, the rows it
+        superseded (its earlier versions), and theirs in turn, followed back
+        through `superseded_by` until no new text turns up. `visible` is the
+        chat and scope filter the forget runs under. With `everywhere`, the
+        cloud's rows are followed too, whichever machine pushed them; when the
+        cloud does not answer, the first step's match is queued there as a
+        delete, bounded to rows stored by now. Returns how many rows went."""
+        rows: dict[str, dict] = {}
+        texts: set[str] = set()
+        predicate = (f"({_text_match(content, about_prefix)} OR "
+                     f"{_text_match(content, about_prefix, tables.SUPERSEDED_BY)}) AND {visible}")
+        cloud = self.mirror is not None and bool(database) and everywhere
+        for _ in range(MAX_HISTORY_CHAIN):
+            found = store.query_sql(f"SELECT {tables.ROW_ID}, content FROM {tables.HISTORY} WHERE {predicate}")
+            if cloud:
+                try:
+                    found += self.mirror.matching_rows(tables.HISTORY, database, predicate)
+                except Exception as e:  # unanswered: what can be named now is queued there
+                    logger.info("infino: the cloud did not say which earlier versions to forget; queued: %s", e)
+                    self.mirror.forget_matching(tables.HISTORY, database, f"({predicate}) AND {tables.STORED} <= {now}")
+                    cloud = False
+            fresh = [r for r in found if str(r.get(tables.ROW_ID)) not in rows]
+            for r in fresh:
+                rows[str(r[tables.ROW_ID])] = r
+            more = {str(r.get("content") or "") for r in fresh} - texts
+            if not more:
+                break
+            texts |= more
+            listed = ", ".join(tables.sql_string(t) for t in sorted(more))
+            predicate = f"(content IN ({listed}) OR {tables.SUPERSEDED_BY} IN ({listed})) AND {visible}"
         if not rows:
-            return
-        ids = [str(r[tables.ROW_ID]) for r in rows]
-        store.delete(tables.MEMORY, f"{tables.ROW_ID} IN ({', '.join(tables.sql_string(i) for i in ids)})")
+            return 0
+        ids = sorted(rows)
+        store.delete(tables.HISTORY, f"{tables.ROW_ID} IN ({', '.join(tables.sql_string(i) for i in ids)})")
         if self.mirror is not None and database:
-            self.mirror.forget(tables.MEMORY, database, ids)
-        store.append(tables.MEMORY, [{**{k: v for k, v in r.items() if k not in _NOT_COPIED}, tables.SUPERSEDED_BY: ""}
-                                     for r in rows])
-        self._last_write = time.monotonic()
+            self.mirror.forget(tables.HISTORY, database, ids)
+        return len(ids)
 
     def supersede_memory(self, content: str, superseded_by: str, scope: Optional[str] = None,
                          visible: tuple[str, ...] = ("",), people: Optional[tuple[str, ...]] = None,
-                         about_prefix: str = "") -> int:
-        """What Hermes's replace or remove of a built-in memory does to its
-        row: the current memories with exactly this text, matched as
-        `forget_memory` matches them on this machine, are kept as superseded
-        copies (`supersede_rows`), never deleted. Returns how many were found."""
-        predicate, personal_predicate, reaches_personal = _memory_match(content, scope, visible, people,
-                                                                        about_prefix)
-        current = tables.current_predicate()
+                         about_prefix: str = "", replacement_chat: Optional[str] = None) -> int:
+        """What a replacement of a built-in memory does to its row: the
+        memories with exactly this text, matched as `forget_memory` matches
+        them on this machine, go to the history as earlier versions of
+        `superseded_by` (`supersede_rows`). Returns how many were found."""
+        match = _text_match(content, about_prefix)
+        team_vis, personal_vis, reaches_personal = _reach(scope, visible, people)
         rows: list[tuple[bool, dict]] = []
         if scope != recall.PERSONAL:
             rows += [(False, r) for r in self.local.query_sql(
-                f"SELECT * FROM {tables.MEMORY} WHERE ({predicate}) AND {current}")]
+                f"SELECT * FROM {tables.MEMORY} WHERE {match} AND {team_vis}")]
         if reaches_personal:
             rows += [(True, r) for r in self.personal.query_sql(
-                f"SELECT * FROM {tables.MEMORY} WHERE ({personal_predicate}) AND {current}")]
-        self.supersede_rows(rows, superseded_by)
+                f"SELECT * FROM {tables.MEMORY} WHERE {match} AND {personal_vis}")]
+        self.supersede_rows(rows, superseded_by, replacement_chat)
         return len(rows)
 
-    def supersede_rows(self, rows: list[tuple[bool, dict]], superseded_by: str = "") -> None:
-        """Keep memory rows that Hermes no longer holds: each is copied, with a
-        row id of its own, the time it was superseded, `superseded_by` (the
-        entry that replaced it, "" when nothing names one) and the id of the
-        row it copies, into the database it was in; then the row itself is
-        deleted by id, here and in the cloud, as `forget_rows` deletes it.
+    def supersede_rows(self, rows: list[tuple[bool, dict]], superseded_by: str = "",
+                       replacement_chat: Optional[str] = None) -> None:
+        """Keep memory rows that were replaced: each is copied into the
+        history table of the database it was in (`tables.HISTORY`), with a row
+        id of its own, when it was superseded, what superseded it and the id
+        of the row it was; then the row itself is deleted by id, here and in
+        the cloud, as `forget_rows` deletes it.
 
-        Copies are kept for good, like every other row: what a turn sees is
-        decided when it asks (recall), never by deleting history here. The
-        copy is written before the delete, so a crash between them leaves
-        both and loses neither: the row, still current, is superseded again
-        next time, and a copy of it already kept is not made twice. `rows`
-        are (personal, row) pairs, as `builtin_rows` gives them; a row without
-        its other columns is read back first."""
+        `superseded_by` is written only on a copy of a row in the same chat
+        as the replacement (`replacement_chat`; None: every row): a group's
+        note never reaches the team's or another chat's history by naming.
+        No copy is made of a row this machine pushed that the cloud no longer
+        has, nor of one it cannot ask about: someone forgot it, and a copy
+        would bring its text back (`_gone_from_cloud`). A text already kept
+        (same origin, chat, scope and author) is kept once. The copy is
+        written before the delete, so a crash between them leaves both and
+        loses neither; the row is superseded again next time, and its copy
+        is not made twice. `rows` are (personal, row) pairs, as
+        `builtin_rows` gives them; a row without its other columns is read
+        back first."""
         if not rows:
             return
         now = int(time.time() * 1000)
@@ -364,48 +387,70 @@ class Backend:
             listed = ", ".join(tables.sql_string(i) for i in ids)
             whole = store.query_sql(f"SELECT * FROM {tables.MEMORY} WHERE {tables.ROW_ID} IN ({listed})")
             kept = {str(r[tables.PRIOR_ROW_ID]) for r in store.query_sql(
-                f"SELECT {tables.PRIOR_ROW_ID} FROM {tables.MEMORY} WHERE {tables.PRIOR_ROW_ID} IN ({listed})")}
-            copies = [_superseded_copy(r, now, superseded_by) for r in whole
-                      if str(r[tables.ROW_ID]) not in kept and not self._has_superseded(store, r)]
+                f"SELECT {tables.PRIOR_ROW_ID} FROM {tables.HISTORY} WHERE {tables.PRIOR_ROW_ID} IN ({listed})")}
+            gone = self._gone_from_cloud(personal, whole)
+
+            def named(row: dict) -> str:
+                same_chat = replacement_chat is None or str(row.get(tables.CHAT) or "") == replacement_chat
+                return superseded_by if same_chat else ""
+
+            copies = [_superseded_copy(r, now, named(r)) for r in whole
+                      if str(r[tables.ROW_ID]) not in kept | gone and not self._has_history(store, r)]
             if copies:
-                store.append(tables.MEMORY, copies)
+                store.append(tables.HISTORY, copies)
                 self._last_write = time.monotonic()
         self.forget_rows(rows)
 
+    def _gone_from_cloud(self, personal: bool, rows: list[dict]) -> set[str]:
+        """The ids among `rows` this machine pushed to the cloud that the cloud
+        no longer has (a teammate forgot them), or every pushed one when the
+        cloud cannot be asked: no history is made of those. Rows the cloud
+        never had, or with no cloud, are none of them."""
+        if self.mirror is None:
+            return set()
+        database = self.settings.personal_database if personal else self.settings.team_database
+        if not database:
+            return set()
+        mark = self.mirror.unsynced_after(PERSONAL_MEMORY if personal else tables.MEMORY)
+        pushed = [str(r[tables.ROW_ID]) for r in rows if not recall.past(r, mark)]
+        if not pushed:
+            return set()
+        try:
+            have = self.mirror.matching_ids(
+                tables.MEMORY, database, f"{tables.ROW_ID} IN ({', '.join(tables.sql_string(i) for i in pushed)})")
+        except Exception as e:
+            logger.info("infino: could not ask the cloud whether replaced memories were forgotten there; "
+                        "no history is kept of them: %s", e)
+            return set(pushed)
+        return set(pushed) - have
+
     @staticmethod
-    def _has_superseded(store: LocalStore, row: dict) -> bool:
-        """Whether `store` already keeps a superseded copy of this text (same
-        origin, chat, scope and author): an entry that leaves its file again,
-        or comes and goes as the review rewrites the file, is kept once."""
+    def _has_history(store: LocalStore, row: dict) -> bool:
+        """Whether `store`'s history already holds this text (same origin,
+        chat, scope and author): a text replaced again is kept once."""
         def same(column: str) -> str:
             value = row.get(column)
             return f"{column} IS NULL" if value is None else f"{column} = {tables.sql_string(str(value))}"
         where = " AND ".join([f"content = {tables.sql_string(str(row.get('content') or ''))}",
-                              *(same(c) for c in ("origin", tables.CHAT, "scope", "author")),
-                              f"NOT {tables.current_predicate()}"])
-        found = store.query_sql(f"SELECT count(*) AS n FROM {tables.MEMORY} WHERE {where}")
+                              *(same(c) for c in ("origin", tables.CHAT, "scope", "author"))])
+        found = store.query_sql(f"SELECT count(*) AS n FROM {tables.HISTORY} WHERE {where}")
         return bool(found and found[0]["n"])
 
     # -- Hermes's built-in memory files (builtin.py) --------------------------
 
     def builtin_rows(self, target: str) -> list[tuple[bool, dict]]:
-        """This machine's current `memory` rows kept from one of Hermes's
-        built-in memory files, each with whether it is in the person's own
-        database. A superseded copy is not one: its entry left the file on
-        purpose."""
+        """This machine's `memory` rows kept from one of Hermes's built-in
+        memory files, each with whether it is in the person's own database."""
         sql = (f"SELECT {tables.ROW_ID}, content FROM {tables.MEMORY} "
-               f"WHERE origin = {tables.sql_string('builtin:' + target)} AND {tables.current_predicate()}")
+               f"WHERE origin = {tables.sql_string('builtin:' + target)}")
         return ([(False, r) for r in self.local.query_sql(sql)]
                 + [(True, r) for r in self.personal.query_sql(sql)])
 
     def has_memory(self, row: dict) -> bool:
-        """Whether this machine already keeps a current memory row like `row`
-        (its text, origin, chat and, for personal memory, author). A
-        superseded copy of the same text does not count: an entry written
-        again is current again."""
+        """Whether this machine already keeps a memory row like `row` (its text,
+        origin, chat and, for personal memory, author)."""
         where = (f"content = {tables.sql_string(row['content'])} AND origin = {tables.sql_string(row['origin'])} "
-                 f"AND {tables.chat_predicate((str(row.get(tables.CHAT) or ''),))} "
-                 f"AND {tables.current_predicate()}")
+                 f"AND {tables.chat_predicate((str(row.get(tables.CHAT) or ''),))}")
         store = self.local
         if row.get("scope") == recall.PERSONAL:
             store = self.personal
@@ -594,11 +639,14 @@ class Backend:
         s = self.settings
         mirror = self.mirror
         sources = [recall.Source(recall.TEAM, self.local, s.team_database,
-                                 lambda: mirror.unsynced_after(tables.MEMORY))]
+                                 lambda: mirror.unsynced_after(tables.MEMORY),
+                                 lambda: mirror.unsynced_after(tables.HISTORY))]
         # Without a personal database, personal memory stays on this machine:
         # its local copy is all there is, so it is searched whole.
+        personal_history = PERSONAL_SOURCE_PREFIX + tables.HISTORY
         sources.append(recall.Source(recall.PERSONAL, self.personal, s.personal_database or None,
-                                     (lambda: mirror.unsynced_after(PERSONAL_MEMORY)) if s.personal_database else None))
+                                     (lambda: mirror.unsynced_after(PERSONAL_MEMORY)) if s.personal_database else None,
+                                     (lambda: mirror.unsynced_after(personal_history)) if s.personal_database else None))
         # Recall is waited on by the turn: a short timeout and no retries.
         cloud = InfinoClient(s.api_key, s.url, timeout=recall.RECALL_TIMEOUT_S, retries=0)
         return recall.Recaller(sources, cloud, rank=s.rank_recall)
@@ -707,32 +755,40 @@ def flush_at_exit() -> None:
         _exit_flusher.join(EXIT_FLUSH_WAIT_S)
 
 
-def _memory_match(content: str, scope: Optional[str], visible: tuple[str, ...],
-                  people: Optional[tuple[str, ...]], about_prefix: str,
-                  column: str = tables.MEMORY_TEXT_COLUMN) -> tuple[str, str, bool]:
-    """The predicates of the memories with exactly this text in `column` that
-    a chat in `visible` may reach (see `Backend.forget_memory`): the team's
-    table's, the person's own table's, and whether the person's own is
-    reached at all."""
+def _text_match(content: str, about_prefix: str = "", column: str = tables.MEMORY_TEXT_COLUMN) -> str:
+    """Rows whose `column` holds exactly this text, or, with `about_prefix`,
+    holds it after any "About <name>: " prefix of that shape."""
     match = f"{column} = {tables.sql_string(content)}"
     if about_prefix:
         match = (f"({match} OR ({column} LIKE {tables.sql_string(about_prefix + '%')} "
                  f"AND ends_with({column}, {tables.sql_string(': ' + content)})))")
+    return match
+
+
+def _reach(scope: Optional[str], visible: tuple[str, ...],
+           people: Optional[tuple[str, ...]]) -> tuple[str, str, bool]:
+    """The rows a chat in `visible` may reach (see `Backend.forget_memory`):
+    the filter on the team's tables, the filter on the person's own, and
+    whether the person's own are reached at all."""
     # A chat's key is among a joined value's when the value, fenced by the
     # joiner at both ends, holds the key fenced the same way.
     joiner = tables.sql_string(CHATS_JOIN)
     among = [f"strpos(concat({joiner}, {tables.CHAT}, {joiner}), "
              f"{tables.sql_string(CHATS_JOIN + key + CHATS_JOIN)}) > 0" for key in visible if key]
-    predicate = f"{match} AND ({' OR '.join([tables.chat_predicate(visible), *among])})"
+    team = f"({' OR '.join([tables.chat_predicate(visible), *among])})"
     if scope:
-        predicate += f" AND scope = {tables.sql_string(scope)}"
+        team += f" AND scope = {tables.sql_string(scope)}"
     # A group chat never reaches the person's own memory (`visible` holds a chat).
     reaches_personal = scope in (None, recall.PERSONAL) and visible == ("",) and people != ()
-    personal_predicate = predicate
+    personal = team
     if people:
-        personal_predicate += f" AND author IN ({', '.join(tables.sql_string(p) for p in people)})"
-    return predicate, personal_predicate, reaches_personal
+        personal += f" AND author IN ({', '.join(tables.sql_string(p) for p in people)})"
+    return team, personal, reaches_personal
 
+
+# Steps a forget follows a memory's history back through `superseded_by`:
+# each step is one query, and Hermes's files hold a few dozen entries.
+MAX_HISTORY_CHAIN = 100
 
 # Columns a superseded copy does not carry over from the row it copies: its
 # own id and commit stamp are its own, and a search's score is not a column.

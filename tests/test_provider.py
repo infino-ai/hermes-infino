@@ -154,8 +154,7 @@ def test_a_forget_needs_the_exact_text(mgr, tmp_path):
     assert len(local_rows(tmp_path, tables.MEMORY)) == 1
 
 
-def test_a_removed_builtin_memory_is_forgotten_not_kept(mgr, tmp_path):
-    # A removal is how the agent forgets when someone asks it to: nothing is kept.
+def test_a_removed_builtin_memory_is_forgotten(mgr, tmp_path):
     _, p = mgr
     p.on_memory_write("add", "memory", "the build uses make")
     p.on_memory_write("remove", "memory", "", {"previous_content": "the build uses make"})

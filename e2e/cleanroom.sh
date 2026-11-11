@@ -62,7 +62,7 @@ for p in $(find "$HH" -path '*/bin/python3*' \( -type f -o -type l \) 2>/dev/nul
   "$p" -c 'import infino, pyarrow' > /dev/null 2>&1 && { HPY=$p; break; }
 done
 [ -n "$HPY" ] && ok "Hermes's Python with the plugin's dependencies: $HPY" || { bad "no Python with the plugin's dependencies"; exit 1; }
-grep -q superseded_ms "$HH/plugins/infino/tables.py" && ok "the installed plugin is the branch (keeps superseded memories)" || { bad "installed plugin lacks the change"; exit 1; }
+grep -q memory_history "$HH/plugins/infino/tables.py" && ok "the installed plugin is the branch (keeps a memory history)" || { bad "installed plugin lacks the change"; exit 1; }
 echo "memory.provider = $("$HERMES" config get memory.provider 2>&1 | tail -n 1)"
 
 step "4. config (README step 3) and a model"
@@ -79,9 +79,8 @@ check() { "$HPY" - "$@" <<'PY'
 import json, subprocess, sys
 want = sys.argv[1]
 rows = json.loads(subprocess.run([sys.argv[2], sys.argv[3], sys.argv[4]], capture_output=True, text=True).stdout)
-team = rows["team"] if isinstance(rows["team"], list) else []
-cur = [r for r in team if r["superseded_ms"] is None]
-old = [r for r in team if r["superseded_ms"] is not None]
+cur = rows["team"] if isinstance(rows["team"], list) else []
+old = rows.get("team_history") if isinstance(rows.get("team_history"), list) else []
 print("current: ", [r["content"] for r in cur])
 print("superseded:", [(r["content"], r["superseded_by"]) for r in old])
 ok = eval(want, {"cur": cur, "old": old, "any": any, "all": all, "len": len})
@@ -129,7 +128,7 @@ else:
     print("INFO: no stored message carries the recall block (Hermes may not persist injected context)")
 PY
 
-step "8. a hand edit drops the entry: kept, superseded, nothing named as its replacement"
+step "8. a hand edit drops the entry: a person's removal, deleted, not kept"
 "$HPY" - "$HH/memories/MEMORY.md" <<'PY'
 import sys
 p = sys.argv[1]
@@ -141,10 +140,10 @@ print(f"removed {len(entries) - len(kept)} entry by hand")
 PY
 model "$HERMES" chat -Q --max-turns 2 -q "Say hi." | tail -n 1
 sleep 3
-check "not any('Thursday' in r['content'] for r in cur) and any('Thursday' in r['content'] and (r['superseded_by'] or '') == '' for r in old)" "$HPY" "$S/memory_rows.py" "$HH"
+check "not any('Thursday' in r['content'] for r in cur + old)" "$HPY" "$S/memory_rows.py" "$HH"
 
 step "9. infino_forget deletes every copy"
-EXACT=$("$HPY" "$S/memory_rows.py" "$HH" | "$HPY" -c "import json,sys; t=json.load(sys.stdin)['team']; print(next(r['content'] for r in t if 'Tuesday' in r['content']))")
+EXACT=$("$HPY" "$S/memory_rows.py" "$HH" | "$HPY" -c "import json,sys; t=json.load(sys.stdin)['team_history']; print(next(r['content'] for r in t if 'Tuesday' in r['content']))")
 echo "forgetting: $EXACT"
 model "$HERMES" chat -Q --max-turns 6 -q "Call the infino_forget tool once with content exactly: $EXACT" | tail -n 3
 sleep 3
@@ -171,10 +170,8 @@ from hi.client import InfinoClient, InfinoError
 c = InfinoClient(os.environ["INFINO_API_KEY"], os.environ["URL"], timeout=30)
 db = os.environ["DB"]
 code = os.environ["CODE"]
-rows = c.query_sql(db, f"SELECT content, {tables.SUPERSEDED}, {tables.SUPERSEDED_BY} FROM memory "
-                       f"WHERE content LIKE '%{code}%'")
-cur = [r for r in rows if r.get(tables.SUPERSEDED) is None]
-old = [r for r in rows if r.get(tables.SUPERSEDED) is not None]
+cur = c.query_sql(db, f"SELECT content FROM {tables.MEMORY} WHERE content LIKE '%{code}%'")
+old = c.query_sql(db, f"SELECT content, {tables.SUPERSEDED_BY} FROM {tables.HISTORY} WHERE content LIKE '%{code}%'")
 print("cloud current:", [r["content"] for r in cur])
 print("cloud superseded:", [(r["content"], r.get(tables.SUPERSEDED_BY)) for r in old])
 print(("PASS" if any("Monday" in r["content"] for r in old) and any("Wednesday" in r["content"] for r in cur) else "FAIL")

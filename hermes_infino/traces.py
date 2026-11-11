@@ -415,6 +415,9 @@ class TraceRecorder:
         fails or hangs on (`pre_tool_call` fails closed)."""
         if kw.get("tool_name") != MEMORY_TOOL:
             return None
+        # A batch that removes some entries and adds others: its removals are
+        # earlier versions of what it adds (provider.on_memory_write).
+        builtin.note_consolidation(str(kw.get("tool_call_id") or ""), privacy.json_value(kw.get("args")))
         try:
             _note_entries(str(kw.get("session_id") or ""), *builtin.call_entries(privacy.json_value(kw.get("args"))))
         except Exception as e:
@@ -437,6 +440,8 @@ class TraceRecorder:
     def on_tool(self, **kw: Any) -> None:
         tool = str(kw.get("tool_name") or "")
         session = str(kw.get("session_id") or "")
+        if tool == MEMORY_TOOL:
+            builtin.end_consolidation(str(kw.get("tool_call_id") or ""))
         self._note_call(tool, session, kw)
         if session and privacy.read_personal(tool, kw.get("result")):
             # The session the agent runs, as Hermes names it for the call: Hermes may have moved
