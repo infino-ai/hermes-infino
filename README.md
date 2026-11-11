@@ -8,9 +8,19 @@ When you [sign in](#signing-in) to Infino, your agent data is synced with Infino
 
 ## What it stores in Infino
 
-The plugin keeps four tables.
+The plugin keeps five tables.
 
-**`memory`** holds the entries in Hermes's `MEMORY.md` and `USER.md`, including edits you make by hand, plus whatever the agent saves with `infino_remember`. A shared profile on a gateway keeps no `USER.md` entries. `infino_forget` deletes a memory, even one a teammate's agent saved.
+**`memory`** holds the entries in Hermes's `MEMORY.md` and `USER.md`, including edits you make by hand, plus whatever the agent saves with `infino_remember`. A shared profile on a gateway keeps no `USER.md` entries.
+
+**`memory_history`** holds the earlier versions of memories. Hermes keeps its memory files short: it patches entries as it learns, and consolidates several into one when the file fills up. When it does, the plugin keeps what it replaced:
+
+- An entry Hermes patches or replaces is copied into `memory_history`, with `superseded_ms` (when it was replaced), `superseded_by` (what replaced it) and `prior_row_id` (the row it was). `memory` keeps the current entry only.
+- So are the entries a batch removes when the same batch adds what replaces them, which is how Hermes consolidates.
+- A text replaced again is kept once, and every earlier version is kept for good. What a turn sees is decided at recall.
+- `superseded_by` names a replacement only when it was written for the same chat. A group's note never shows in the team's history.
+- Any other removal deletes, as before: a removal on its own (how the agent forgets when it is asked to), a removal approved with `/memory approve`, an entry deleted from the file by hand.
+
+Forgetting is total. `infino_forget` deletes a memory and every earlier version of it, following `superseded_by` back through the history, on every machine's copy in the cloud. It also takes the entry out of `MEMORY.md` or `USER.md`, so it is not found again. A machine that still holds a memory a teammate forgot makes no history of it.
 
 **`conversations`** logs every message of every session a person has with the agent, and who sent it. Tool calls and tool results have their own columns. A message stays in the log even after context compression or `/undo` removes it from the session. Scheduled jobs and subagents add no conversation rows; their model and tool calls are in `traces`.
 
@@ -69,6 +79,21 @@ Once you sign in:
 - Forgetting a memory deletes it from the cloud too.
 - The cloud embeds memories itself, so your machine no longer has to embed locally.
 - Recall reads from the cloud first. If the cloud is slow or can't be reached, recall searches your local machine.
+- Recall shows every source's current memories first. Earlier versions fill only what is left, each marked with when it was superseded and what replaced it, so the agent can tell an old fact from the current one, and history never pushes a current memory out.
+
+### Ranked recall (off unless you turn it on)
+
+Set `INFINO_RANK_RECALL=on` to have the cloud rank what recall shows, instead of taking the search's top results. Each recall then sends the turn's message as the question with its searches of `memory` and `memory_history`, and the platform's triage pass grades a wider pool of each for it and returns the best. Current memories still come first.
+
+The triage pass is a model. On every turn, it reads the text of each memory it grades, up to the deployment's pool. That covers team memory, and in your own sessions your personal memory. It includes team memories kept for other group chats, because what a chat may see is filtered after the search. Those rows are graded but never shown in that chat. Turn it on only if that is acceptable for your data.
+
+When the ranking is not back in time, or the deployment does not offer it, recall uses the plain search.
+
+### Upgrading and downgrading
+
+The history lives in a table of its own, and `memory` keeps exactly the columns it had, so upgrading adds no column to any table a team already has. Where the cloud refuses to create `memory_history` (a key that may not create tables), the history stays on your machine and everything else syncs as before.
+
+A version older than this one does not know `memory_history`. It neither reads nor deletes it, so downgrading loses nothing.
 
 ## Install
 

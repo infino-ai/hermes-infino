@@ -7,7 +7,7 @@ import time
 import pytest
 
 from hermes_infino import chats, recall, tables
-from hermes_infino.client import InfinoClient
+from hermes_infino.client import InfinoClient, InfinoError, _rows, rerank_unavailable
 from hermes_infino.local import LocalStore
 from hermes_infino.recall import Recaller, Source
 
@@ -39,6 +39,7 @@ def personal_local(home, tmp_path) -> LocalStore:
 def cloud(platform) -> InfinoClient:
     c = InfinoClient("k", platform.url, retries=0)
     tables.ensure_all(c, TEAM_DB)
+    tables.ensure_optional(c, TEAM_DB, tables.HISTORY)
     return c
 
 
@@ -189,3 +190,219 @@ def test_personal_memory_shows_only_to_its_person(team_local, personal_local):
 ])
 def test_a_row_is_past_a_mark_in_commit_order(row, mark, past):
     assert recall.past(row, mark) is past
+
+
+# -- ranked at recall, superseded kept ---------------------------------------------
+
+# A day after the epoch, in milliseconds: the date a superseded memory's line names.
+A_DAY_MS = 86_400_000
+
+
+def by_words(*best_first: str):
+    """A grader that scores rows by which of these words their text holds, the
+    first word highest: it orders rows against their search score."""
+    def grade(question, row):
+        text = str(row.get("content", ""))
+        return next((len(best_first) - i for i, w in enumerate(best_first) if w in text), 0)
+    return grade
+
+
+def lines(block: str) -> list[str]:
+    return block.splitlines()[2:]
+
+
+def test_recall_is_not_ranked_unless_the_person_turned_it_on(team_local, cloud, platform):
+    platform.rerank_supported = True
+    cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploy freeze"}])
+    assert "deploy freeze" in Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud).recall("deploy freeze")[0]
+    assert platform.reranked == []  # no memory text was sent to be graded
+
+
+def test_the_cloud_ranks_recall_for_the_question_and_its_order_stands(team_local, cloud, platform):
+    platform.rerank_supported = True
+    platform.grade = by_words("Thursday", "Tuesday")
+    # The plain search ranks "deploys deploys" first; the grader prefers Thursday.
+    cloud.append(TEAM_DB, tables.MEMORY, [
+        {"row_id": "a", "content": "deploys deploys on Tuesday"},
+        {"row_id": "b", "content": "deploys moved to Thursday"}])
+    block, n = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True).recall("when are deploys")
+    assert n == 2
+    assert lines(block) == ["- [team] deploys moved to Thursday", "- [team] deploys deploys on Tuesday"]
+    asked = {body["table_name"]: body for body in platform.reranked}
+    assert set(asked) == {tables.MEMORY, tables.HISTORY}  # current memories and their history, each ranked
+    assert asked[tables.MEMORY]["rerank"] == {"question": "when are deploys",
+                                               "k": recall.RECALL_K * recall.CHAT_FILTER_DEPTH}
+    assert {tables.SUPERSEDED, tables.SUPERSEDED_BY} <= set(asked[tables.HISTORY]["projection"])
+
+
+def test_a_deployment_without_the_triage_pass_answers_from_the_plain_search_and_is_not_asked_again(
+        team_local, cloud, platform):
+    cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploy freeze"}])
+    r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True)
+    assert "deploy freeze" in r.recall("deploy freeze")[0]
+    asked = len(platform.reranked)
+    assert asked == len(recall.KINDS)  # one ask per table, each refused with 501
+    assert "deploy freeze" in r.recall("deploy freeze")[0]
+    assert len(platform.reranked) == asked  # remembered: no second ask
+
+
+def test_a_worker_built_without_the_triage_pass_is_remembered_too(team_local, cloud, platform):
+    platform.rerank_supported = True
+    platform.rerank_statuses = [400]
+    # The fake's scripted 400 says nothing of rerank: only the worker's own words turn it off.
+    cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploy freeze"}])
+    r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True)
+    r.recall("deploy freeze")
+    asked = len(platform.reranked)
+    r.recall("deploy freeze")
+    assert len(platform.reranked) > asked  # a 400 about this request is not "unavailable"
+    assert rerank_unavailable(InfinoError(400, "rerank is not available on this deployment; send the query without"))
+    assert rerank_unavailable(InfinoError(501, "anything"))
+    assert not rerank_unavailable(InfinoError(400, "scripted"))
+    assert not rerank_unavailable(InfinoError(503, "rerank is not available"))
+
+
+def test_a_worker_older_than_rerank_is_not_asked_again_and_hybrid_stays_on(team_local, cloud, platform):
+    # Seen on a deployment whose gateway forwards `rerank` to a worker built before it: a
+    # 400 naming the field as unknown, beside a list of fields that includes `vector_field`.
+    platform.rerank_unknown = True
+    cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploy freeze"}])
+    r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True)
+    assert "deploy freeze" in r.recall("deploy freeze")[0]
+    asked = len(platform.reranked)
+    hybrid = requests_to(platform, "hybrid_search")
+    assert "deploy freeze" in r.recall("deploy freeze")[0]
+    assert len(platform.reranked) == asked  # not asked again
+    assert TEAM_DB not in r._keyword_only
+    assert requests_to(platform, "hybrid_search") == hybrid + 1  # the plain search is still hybrid
+    assert rerank_unavailable(InfinoError(400, "unknown field `rerank`, expected one of `table_name`, `k`"))
+
+
+def test_a_ranking_that_fails_once_falls_back_and_is_asked_again(team_local, cloud, platform):
+    platform.rerank_supported = True
+    platform.rerank_statuses = [500] * len(recall.KINDS)
+    platform.grade = by_words("Thursday")
+    cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploys deploys on Tuesday"},
+                                          {"row_id": "b", "content": "deploys moved to Thursday"}])
+    r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True)
+    first, _ = r.recall("deploys")
+    assert lines(first)[0] == "- [team] deploys deploys on Tuesday"  # the plain search's order
+    second, _ = r.recall("deploys")
+    assert lines(second)[0] == "- [team] deploys moved to Thursday"  # ranked again
+    assert len(platform.reranked) == 2 * len(recall.KINDS)
+
+
+def test_a_ranking_slower_than_the_budget_leaves_the_plain_search_to_answer_in_time(
+        team_local, cloud, platform, monkeypatch):
+    monkeypatch.setattr(recall, "RECALL_BUDGET_S", SHORT_BUDGET_S)
+    platform.rerank_supported = True
+    platform.rerank_delay_s = SLOW_CLOUD_S
+    cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploy freeze"}])
+    started = time.monotonic()
+    block, n = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True).recall("deploy freeze")
+    assert n == 1 and "deploy freeze" in block
+    assert time.monotonic() - started < SLOW_CLOUD_S
+
+
+def test_a_ranked_recall_still_shows_only_what_the_chat_may_see(team_local, cloud, platform):
+    platform.rerank_supported = True
+    platform.grade = by_words("moved")
+    cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "standup moved", tables.CHAT: "telegram:-200"},
+                                          {"row_id": "b", "content": "standup is at ten", tables.CHAT: ""}])
+    block, n = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True).recall("standup", GROUP)
+    assert n == 1 and lines(block) == ["- [team] standup is at ten"]
+
+
+def test_a_ranked_recall_of_personal_memory_shows_only_its_person(team_local, personal_local, cloud, platform):
+    platform.rerank_supported = True
+    tables.ensure_all(cloud, "dana-own", personal=True)
+    cloud.append("dana-own", tables.MEMORY, [
+        {"row_id": "p1", "content": "deploy password hint is blue", "author": "dana", "scope": "personal"},
+        {"row_id": "p2", "content": "deploy password hint is red", "author": "sam", "scope": "personal"}])
+    source = Source(recall.PERSONAL, personal_local, "dana-own", lambda: (2 ** 62, ""))
+    block, n = Recaller([source], cloud, rank=True).recall("deploy password hint", people=("dana",))
+    assert n == 1 and "blue" in block and "red" not in block
+
+
+def test_a_keyword_only_database_is_ranked_too(team_local, cloud, platform):
+    platform.rerank_supported = True
+    platform.grade = by_words("Thursday")
+    cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploys deploys on Tuesday"},
+                                          {"row_id": "b", "content": "deploys moved to Thursday"}])
+    r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True)
+    r._keyword_only.add(TEAM_DB)
+    block, _ = r.recall("deploys")
+    assert lines(block)[0] == "- [team] deploys moved to Thursday"
+    assert all("field_name" in body for body in platform.reranked)  # bm25_search's body
+
+
+def history(**row) -> dict:
+    """An earlier version, as backend.supersede_rows keeps one."""
+    return {tables.SUPERSEDED: A_DAY_MS, tables.SUPERSEDED_BY: "", **row}
+
+
+def test_a_superseded_memory_is_recalled_marked_with_when_and_what_replaced_it(team_local):
+    team_local.append(tables.MEMORY, [{"content": "deploys are on Thursday"}])
+    team_local.append(tables.HISTORY, [
+        history(content="deploys are on Tuesday", superseded_by="deploys are on Thursday"),
+        history(content="deploys need a ticket")])
+    block, n = Recaller([Source(recall.TEAM, team_local)]).recall("deploys")
+    assert n == 3
+    assert lines(block)[0] == "- [team] deploys are on Thursday"  # current first
+    assert "deploys are on Tuesday [superseded 1970-01-02; replaced by: deploys are on Thursday]" in block
+    assert "deploys need a ticket [superseded 1970-01-02; no longer in memory]" in block
+    assert "superseded" in recall.PREAMBLE
+
+
+def test_history_never_pushes_a_current_memory_out(team_local, personal_local):
+    # However many earlier versions match better, every current memory is shown first.
+    team_local.append(tables.HISTORY, [history(content=f"deploy deploy note {i} old") for i in range(40)])
+    team_local.append(tables.MEMORY, [{"content": "deploy window is Thursday"}])
+    personal_local.append(tables.MEMORY, [{"content": "a deploy makes me nervous", "scope": "personal"}])
+    block, _ = Recaller([Source(recall.TEAM, team_local), Source(recall.PERSONAL, personal_local)]).recall("deploy")
+    shown = lines(block)
+    assert shown[:2] == ["- [team] deploy window is Thursday", "- [personal] a deploy makes me nervous"]
+    assert all("[superseded" in line for line in shown[2:])
+
+
+def test_earlier_versions_fill_only_what_current_memories_leave(team_local):
+    team_local.append(tables.HISTORY, [history(content=f"deploy note {i} old") for i in range(recall.RECALL_K)])
+    team_local.append(tables.MEMORY, [{"content": f"deploy note {i} " + "x" * LONG} for i in range(recall.RECALL_K)])
+    block, n = Recaller([Source(recall.TEAM, team_local)]).recall("deploy note")
+    assert "superseded" not in "\n".join(lines(block))  # the budget went to current memories
+
+
+def test_the_grader_may_put_a_superseded_memory_first_within_the_history(team_local, cloud, platform):
+    platform.rerank_supported = True
+    platform.grade = by_words("staging")
+    cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "b", "content": "deploys on Thursday"}])
+    cloud.append(TEAM_DB, tables.HISTORY, [
+        history(row_id="a", content="deploys on Tuesday", superseded_by="deploys on Wednesday"),
+        history(row_id="c", content="deploys on Tuesday, staging first", superseded_by="deploys on Thursday")])
+    block, _ = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True).recall("deploys staging")
+    shown = lines(block)
+    assert shown[0] == "- [team] deploys on Thursday"
+    assert shown[1].startswith("- [team] deploys on Tuesday, staging first [superseded")
+
+
+def test_a_cloud_without_the_history_table_still_recalls(team_local, platform):
+    c = InfinoClient("k", platform.url, retries=0)
+    tables.ensure_all(c, TEAM_DB)  # no history table there
+    c.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploy freeze"}])
+    team_local.append(tables.HISTORY, [history(content="deploy freeze was in June")])
+    block, n = Recaller([cloud_source(team_local, (2 ** 62, ""))], c).recall("deploy freeze")
+    assert "- [team] deploy freeze" in block
+    assert "deploy freeze was in June [superseded" in block  # this machine's history answers
+
+
+def test_a_long_replacement_is_cut_in_the_note(team_local):
+    team_local.append(tables.HISTORY, [history(content="deploys are on Tuesday", superseded_by="deploys " + "y" * 500)])
+    block, _ = Recaller([Source(recall.TEAM, team_local)]).recall("deploys")
+    note = block.split("replaced by: ", 1)[1]
+    assert note.endswith("…]") and len(note) <= recall.REPLACED_BY_CHARS + len("…]")
+
+
+def test_a_reranked_response_is_read_under_rows():
+    assert _rows({"rows": [{"a": 1}], "rerank": {"graded": 1}}) == [{"a": 1}]
+    assert _rows({"data": [{"a": 2}]}) == [{"a": 2}]
+    assert _rows([{"a": 3}]) == [{"a": 3}]

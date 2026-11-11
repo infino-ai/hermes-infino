@@ -64,6 +64,7 @@ sync; a recall the cloud is slow to answer is answered from this machine.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import sys
@@ -188,7 +189,11 @@ SYSTEM_PROMPT = (
     "Use infino_remember to save what is worth keeping. Memory is the team's unless it is about one person: "
     "work knowledge (decisions, conventions, fixes, owners, how things are set up) is team memory, saved "
     "without asking; a person's preferences, credentials, schedule or private matters are personal "
-    "(scope 'personal'). infino_forget deletes a memory by its exact text. infino_publish_skill shares one of "
+    "(scope 'personal'). Your built-in memory (the memory tool) is kept in Infino by itself: an entry you "
+    "replace stays there as history, marked superseded, and an entry you remove is forgotten. Never use "
+    "infino_remember or infino_forget to copy a memory-tool change into Infino. infino_forget deletes a memory "
+    "and its history for good, by its exact text: use it when someone asks for something to be forgotten. "
+    "infino_publish_skill shares one of "
     "your skills with the team. Everything the team's agents remembered, said and did is in the team's "
     "Infino database, read with the Infino tools below."
 )
@@ -220,6 +225,16 @@ ABOUT_ANYONE = "About "
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _entry_forms(text: str) -> list[str]:
+    """`text` as a built-in memory file may hold it: as given, and, for a
+    USER.md entry recalled with the "About <name>: " prefix its row carries,
+    without that prefix."""
+    forms = [text]
+    if text.startswith(ABOUT_ANYONE) and ": " in text:
+        forms.append(text.split(": ", 1)[1])
+    return forms
 
 
 def _clip(text: Any) -> str:
@@ -796,6 +811,13 @@ class InfinoMemoryProvider(MemoryProvider):
         assert self._backend is not None
         return self._backend.forget_memory(content, scope, chat.visible, people, about_prefix, everywhere)
 
+    def _supersede(self, content: str, scope: Optional[str], chat: chats.Chat = chats.NO_CHAT,
+                   people: Optional[tuple[str, ...]] = None, about_prefix: str = "", *,
+                   superseded_by: str, replacement_chat: str) -> int:
+        assert self._backend is not None
+        return self._backend.supersede_memory(content, superseded_by, scope, chat.visible, people, about_prefix,
+                                              replacement_chat)
+
     def _builtin_row(self, target: str, content: str, chat: chats.Chat) -> Optional[dict]:
         """The `memory` row of a built-in memory entry written in the running
         turn (Hermes's own memory tool); None when it is not kept.
@@ -836,17 +858,34 @@ class InfinoMemoryProvider(MemoryProvider):
         assert self._settings is not None
         chat = self._chat()
         previous = (metadata or {}).get("previous_content")
+        # The entry that replaces the previous one, as its row will hold it: the
+        # superseded copy names it, so a recall of the old shows what took its place.
+        row = self._builtin_row(target, content, chat) if action in ("add", "replace") and content else None
         if action in ("replace", "remove") and previous:
+            # A replacement (a patch, as Hermes reports one) moves the old entry
+            # to the history, naming what replaced it (backend.supersede_rows);
+            # so do the removals of a batch that adds the entries replacing
+            # them (a consolidation). Any other removal is how the agent
+            # forgets, and deletes the entry, as infino_forget does.
+            write = self._forget
+            consolidated = (builtin.consolidation_of(str((metadata or {}).get("tool_call_id") or ""))
+                            if action == "remove" else [])
+            if action == "replace" and row is not None:
+                write = functools.partial(self._supersede, superseded_by=str(row["content"]),
+                                          replacement_chat=str(row.get(tables.CHAT) or ""))
+            elif consolidated:
+                added = [r for r in (self._builtin_row(target, _clip(scrub(e)), chat) for e in consolidated) if r]
+                write = functools.partial(self._supersede, superseded_by=" | ".join(r["content"] for r in added),
+                                          replacement_chat=str(added[0].get(tables.CHAT) or "") if added else "")
             if chat.group and not chat.owner_writes:
                 # The entry may be about another member, who wrote it: any "About <name>: ".
-                self._run_write(self._forget, previous, TEAM, chat, None, ABOUT_ANYONE if target == "user" else "")
+                self._run_write(write, previous, TEAM, chat, None, ABOUT_ANYONE if target == "user" else "")
             elif target != "user" or self._keeps_personal(chat):
                 person = self._person()
                 about = ABOUT_PERSON.format(author=person) if target == "user" and person else ""
                 scope = PERSONAL if target == "user" else self._default_scope()
-                self._run_write(self._forget, about + previous, scope, chats.NO_CHAT, self._people())
+                self._run_write(write, about + previous, scope, chats.NO_CHAT, self._people())
         if action in ("add", "replace") and content:
-            row = self._builtin_row(target, content, chat)
             if row is not None:
                 self._run_write(self._add_builtin, row)
             if target == "user" and (row is None or row["scope"] != PERSONAL) and not chat.untyped:
@@ -875,7 +914,9 @@ class InfinoMemoryProvider(MemoryProvider):
         """Keep the `memory` table in step with Hermes's built-in memory
         files, whoever wrote them (builtin.py): an entry no row holds is added
         (_mirrored_row); a row whose entry left its file is deleted, here and
-        in the cloud. `chat` and `by_agent` are the running turn's.
+        in the cloud: a replacement reaches the history through
+        `on_memory_write`, and what leaves the file otherwise is a person's
+        removal (an approved one, a hand edit). `chat` and `by_agent` are the running turn's.
 
         Hermes's background review follows a turn and writes the files with no
         provider to tell; the tool hooks note who wrote each entry of a turn
@@ -923,6 +964,9 @@ class InfinoMemoryProvider(MemoryProvider):
                     if not self._backend.has_memory(row):
                         self._append(tables.MEMORY, [row])
                 if stale:
+                    # An entry that left the file with nothing reporting what
+                    # replaced it: an approved removal, a hand edit, a forget.
+                    # Deleted, as a person removing it means.
                     self._backend.forget_rows(stale)
 
     def sync_turn(
@@ -1060,7 +1104,8 @@ class InfinoMemoryProvider(MemoryProvider):
                 "description": "Save a memory to Infino. It is the team's unless it is about one person: "
                                "decisions, conventions, fixes, owners and how things work are team memory; "
                                "a person's preferences, credentials, schedule or private matters take scope "
-                               "'personal'. Teammates read it as written: name people, never 'the user', 'I' or 'me'.",
+                               "'personal'. Teammates read it as written: name people, never 'the user', 'I' or 'me'. "
+                               "Not for what you saved with the memory tool: that is kept in Infino by itself.",
                 "parameters": {
                     "type": "object",
                     "properties": {"content": {"type": "string"}, "scope": scope},
@@ -1069,8 +1114,10 @@ class InfinoMemoryProvider(MemoryProvider):
             },
             {
                 "name": "infino_forget",
-                "description": "Delete a memory from Infino by its exact text (as recalled), whichever "
-                               "teammate's agent saved it.",
+                "description": "Delete a memory from Infino for good by its exact text (as recalled), "
+                               "whichever teammate's agent saved it, its superseded copies included. Only when "
+                               "someone asks for it to be forgotten: a change you make with the memory tool "
+                               "reaches Infino by itself and needs no forget.",
                 "parameters": {
                     "type": "object",
                     "properties": {"content": {"type": "string"}, "scope": scope},
@@ -1125,8 +1172,14 @@ class InfinoMemoryProvider(MemoryProvider):
             if tool_name == "infino_forget":
                 # Every machine's copy: a memory recalled from a teammate's is forgotten too.
                 scope = None if chat.group else (asked or None)
-                matched = self._forget(str(args["content"]), scope, chat, self._people(), "", everywhere=True)
-                return json.dumps({"ok": True, "scope": scope or "any", "matched": matched})
+                text = str(args["content"])
+                matched = self._forget(text, scope, chat, self._people(), "", everywhere=True)
+                # Out of Hermes's own files too, or the next comparison finds the
+                # entry again: the team's file always, the person's own only
+                # where this turn may reach it.
+                in_files = builtin.remove_from_files(_entry_forms(text), ("memory",) if chat.group else
+                                                     tuple(builtin.FILES))
+                return json.dumps({"ok": True, "scope": scope or "any", "matched": matched + in_files})
             if tool_name == "infino_publish_skill":
                 if (chat.group and not chat.owner_writes) or not self._keeps_personal(chat):
                     # Every profile on the team loads a published skill: publishing is

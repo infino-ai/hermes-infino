@@ -204,6 +204,16 @@ def test_the_launch_profiles_own_turn_still_reads_its_environment(home, tmp_path
     assert served(tmp_path, {}, multiplexed=False).team_database == "alice-team"
 
 
+def test_recall_ranking_is_off_unless_turned_on(home, tmp_path):
+    assert not config.load(tmp_path).rank_recall
+    for on in ("on", "true", "yes", "1"):
+        home.setenv("INFINO_RANK_RECALL", on)
+        assert config.load(tmp_path).rank_recall
+    for other in ("off", "", "maybe"):
+        home.setenv("INFINO_RANK_RECALL", other)
+        assert not config.load(tmp_path).rank_recall
+
+
 def test_team_skills_are_on_unless_turned_off(home, tmp_path):
     assert config.load(tmp_path).team_skills
     for off in ("off", "OFF", "false", "0", "no"):

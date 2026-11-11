@@ -108,7 +108,7 @@ def test_a_long_cell_is_cut_and_the_count_is_bounded(home, tmp_path):
 def test_an_unknown_table_is_refused_by_name(home, tmp_path):
     _, p = make_manager(tmp_path)
     out = search(p, query="x", table="skills")
-    assert out == {"ok": False, "error": "table must be one of memory, conversations, traces, not 'skills'"}
+    assert out == {"ok": False, "error": "table must be one of memory, conversations, traces, memory_history, not 'skills'"}
 
 
 def test_signed_in_it_searches_the_personal_cloud_database(env, platform, tmp_path):
