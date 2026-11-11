@@ -272,17 +272,19 @@ def _rerank(question: Optional[str], k: int) -> dict:
 
 
 # The statuses a search with `rerank` answers on a deployment that cannot
-# grade: 501 from a gateway without the triage pass, 400 from a worker built
-# without it (its message says "rerank is not available").
+# grade: 501 from a gateway without the triage pass; 400 from a worker built
+# without it (its message says "rerank is not available"), or from one older
+# than the field, whose request type refuses it as an unknown field.
 RERANK_UNAVAILABLE_STATUSES = (400, 501)
-RERANK_UNAVAILABLE_WORDS = "rerank is not available"
+RERANK_UNAVAILABLE_WORDS = ("rerank is not available", "unknown field `rerank`")
 
 
 def rerank_unavailable(error: "InfinoError") -> bool:
     """Whether a search's refusal says the deployment cannot rerank at all,
     rather than that this one request failed."""
+    message = error.message.lower()
     return error.status == 501 or (error.status in RERANK_UNAVAILABLE_STATUSES
-                                   and RERANK_UNAVAILABLE_WORDS in error.message.lower())
+                                   and any(words in message for words in RERANK_UNAVAILABLE_WORDS))
 
 
 def _rows(out: Any) -> list[dict]:

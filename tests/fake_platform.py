@@ -48,6 +48,7 @@ class FakePlatform:
         # pass refuses it (501) unless `rerank_supported`; then graded by
         # `grade` (question, row) -> score, highest first, the best `k` kept.
         self.rerank_supported = False
+        self.rerank_unknown = False    # a worker older than `rerank`: 400, an unknown field
         self.grade = None
         self.rerank_statuses: list[int] = []  # the next reranked searches answer these statuses, in order
         self.rerank_delay_s = 0.0      # a reranked search answers after this long
@@ -252,6 +253,11 @@ class FakePlatform:
         search's, unscripted) graded for the question, best first, under
         `rows` beside the pass's coverage."""
         self.reranked.append(body)
+        if self.rerank_unknown:
+            # A worker older than the field: its request type refuses it, listing the fields it knows.
+            fields = ("`table_name`, `text_field`, `text_query`, `mode`, `vector_field`, `vector_query`, `k`, "
+                      "`projection`") if op == "hybrid_search" else "`table_name`, `field_name`, `query`, `k`"
+            return 400, {"error": f"unknown field `rerank`, expected one of {fields}"}, None
         if not self.rerank_supported:
             return 501, {"error": "rerank is not available on this deployment: it runs no triage pass "
                                   "(ask.triage); send the query without `rerank`"}, None

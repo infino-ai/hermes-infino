@@ -165,7 +165,11 @@ class Recaller:
             except InfinoError as e:
                 if rerank and rerank_unavailable(e):
                     raise RerankUnavailable(str(e)) from e
-                if e.status not in NO_VECTOR_STATUSES:
+                # What a refusal says about the vector leg is read off the plain
+                # search alone, which runs beside this one: a ranked search's
+                # refusal (a field the server does not know, listed beside
+                # `vector_field`) must never turn the database keyword-only.
+                if rerank or e.status not in NO_VECTOR_STATUSES:
                     raise
                 logger.info("infino: hybrid recall refused on %s (%s); using keyword search", database, e.status)
                 # 403 holds for the table; a 400 only when it names the vector

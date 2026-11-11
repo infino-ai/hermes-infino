@@ -251,6 +251,22 @@ def test_a_worker_built_without_the_triage_pass_is_remembered_too(team_local, cl
     assert not rerank_unavailable(InfinoError(503, "rerank is not available"))
 
 
+def test_a_worker_older_than_rerank_is_not_asked_again_and_hybrid_stays_on(team_local, cloud, platform):
+    # Seen on a deployment whose gateway forwards `rerank` to a worker built before it: a
+    # 400 naming the field as unknown, beside a list of fields that includes `vector_field`.
+    platform.rerank_unknown = True
+    cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploy freeze"}])
+    r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud)
+    assert "deploy freeze" in r.recall("deploy freeze")[0]
+    asked = len(platform.reranked)
+    hybrid = requests_to(platform, "hybrid_search")
+    assert "deploy freeze" in r.recall("deploy freeze")[0]
+    assert len(platform.reranked) == asked  # not asked again
+    assert TEAM_DB not in r._keyword_only
+    assert requests_to(platform, "hybrid_search") == hybrid + 1  # the plain search is still hybrid
+    assert rerank_unavailable(InfinoError(400, "unknown field `rerank`, expected one of `table_name`, `k`"))
+
+
 def test_a_ranking_that_fails_once_falls_back_and_is_asked_again(team_local, cloud, platform):
     platform.rerank_supported = True
     platform.rerank_statuses = [500]
