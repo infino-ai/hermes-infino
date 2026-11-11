@@ -346,7 +346,9 @@ class Backend:
         row it copies, into the database it was in; then the row itself is
         deleted by id, here and in the cloud, as `forget_rows` deletes it.
 
-        The copy is written before the delete, so a crash between them leaves
+        Copies are kept for good, like every other row: what a turn sees is
+        decided when it asks (recall), never by deleting history here. The
+        copy is written before the delete, so a crash between them leaves
         both and loses neither: the row, still current, is superseded again
         next time, and a copy of it already kept is not made twice. `rows`
         are (personal, row) pairs, as `builtin_rows` gives them; a row without
@@ -369,9 +371,6 @@ class Backend:
                 store.append(tables.MEMORY, copies)
                 self._last_write = time.monotonic()
         self.forget_rows(rows)
-        for personal, store in ((False, self.local), (True, self.personal)):
-            if any(p == personal for p, _ in rows):
-                self._trim_superseded(store, personal)
 
     @staticmethod
     def _has_superseded(store: LocalStore, row: dict) -> bool:
@@ -386,14 +385,6 @@ class Backend:
                               f"NOT {tables.current_predicate()}"])
         found = store.query_sql(f"SELECT count(*) AS n FROM {tables.MEMORY} WHERE {where}")
         return bool(found and found[0]["n"])
-
-    def _trim_superseded(self, store: LocalStore, personal: bool) -> None:
-        """Keep at most SUPERSEDED_KEPT superseded copies in `store`: the
-        oldest past it are deleted, here and in the cloud."""
-        old = store.query_sql(f"SELECT {tables.ROW_ID} FROM {tables.MEMORY} WHERE NOT {tables.current_predicate()} "
-                              f"ORDER BY {tables.SUPERSEDED} DESC, {tables.STORED} DESC")[SUPERSEDED_KEPT:]
-        if old:
-            self.forget_rows([(personal, r) for r in old])
 
     # -- Hermes's built-in memory files (builtin.py) --------------------------
 
@@ -742,11 +733,6 @@ def _memory_match(content: str, scope: Optional[str], visible: tuple[str, ...],
         personal_predicate += f" AND author IN ({', '.join(tables.sql_string(p) for p in people)})"
     return predicate, personal_predicate, reaches_personal
 
-
-# Superseded copies kept per database (team, or the person's own); the
-# oldest past it are deleted. Hermes's memory files hold a few dozen entries,
-# so this is many rewrites' worth of history, and it bounds what recall reads.
-SUPERSEDED_KEPT = 200
 
 # Columns a superseded copy does not carry over from the row it copies: its
 # own id and commit stamp are its own, and a search's score is not a column.

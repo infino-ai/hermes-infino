@@ -15,7 +15,7 @@ The plugin keeps four tables.
 Hermes keeps its memory files short. It replaces entries as it learns, and its background review rewrites the files to fit. The plugin keeps what those rewrites drop:
 
 - An entry Hermes replaces, or that leaves the file when it is rewritten (by the review or by hand), stays in `memory` as a superseded copy. The copy is the same row with `superseded_ms` (when it left the file), `superseded_by` (the entry that replaced it, or empty when nothing names one) and `prior_row_id` (the row it was). Current entries have no `superseded_ms`.
-- A copy is kept once per text. The 200 most recent copies are kept in each database, and older ones are deleted.
+- Copies are kept for good, like every other row. A copy is kept once per text, so an entry the review keeps rewording does not repeat. What a turn sees is decided when it asks: recall puts current entries first, and ranked recall picks what fits the question.
 - Forgetting is total. An entry the agent removes with Hermes's memory tool, which is how it forgets when someone asks it to, is deleted, not kept. So is a memory `infino_forget` names, with every superseded copy of it, even one a teammate's agent saved. A copy that names the forgotten text as its replacement keeps its own text and loses that name.
 
 **`conversations`** logs every message of every session a person has with the agent, and who sent it. Tool calls and tool results have their own columns. A message stays in the log even after context compression or `/undo` removes it from the session. Scheduled jobs and subagents add no conversation rows; their model and tool calls are in `traces`.

@@ -8,7 +8,6 @@ import json
 
 import pytest
 
-from hermes_infino import backend as backend_mod
 from hermes_infino import tables
 from hermes_infino.client import InfinoClient
 from hermes_infino.local import LocalStore
@@ -162,16 +161,15 @@ def test_an_entry_the_review_keeps_rewording_back_is_kept_once(home, tmp_path):
     assert sorted(by(rows)) == [("use pnpm", ""), ("use pnpm, not npm", "")]
 
 
-def test_superseded_copies_are_capped_newest_kept(home, tmp_path, monkeypatch):
-    monkeypatch.setattr(backend_mod, "SUPERSEDED_KEPT", 3)
+def test_superseded_copies_are_kept_however_many_there_are(home, tmp_path):
     _, p = make_manager(tmp_path)
     p.on_memory_write("add", "memory", "release 1")
-    for n in range(2, 8):
+    for n in range(2, 41):
         p.on_memory_write("replace", "memory", f"release {n}", {"previous_content": f"release {n - 1}"})
     p._drain()
     rows = local_rows(tmp_path, tables.MEMORY)
-    assert contents(current(rows)) == ["release 7"]
-    assert [c for c, _ in by(rows)] == ["release 4", "release 5", "release 6"]
+    assert contents(current(rows)) == ["release 40"]
+    assert len(superseded(rows)) == 39  # every earlier version, none dropped
 
 
 def test_a_persons_superseded_entry_goes_to_their_own_database_never_the_teams(env, platform, tmp_path):
