@@ -188,7 +188,11 @@ SYSTEM_PROMPT = (
     "Use infino_remember to save what is worth keeping. Memory is the team's unless it is about one person: "
     "work knowledge (decisions, conventions, fixes, owners, how things are set up) is team memory, saved "
     "without asking; a person's preferences, credentials, schedule or private matters are personal "
-    "(scope 'personal'). infino_forget deletes a memory by its exact text. infino_publish_skill shares one of "
+    "(scope 'personal'). Your built-in memory (the memory tool) is kept in Infino by itself, history "
+    "included: an entry you replace or remove stays there marked superseded, so never use infino_remember or "
+    "infino_forget to copy a memory-tool change into Infino. infino_forget deletes a memory and its history "
+    "for good, by its exact text: use it only when someone asks for something to be forgotten or deleted. "
+    "infino_publish_skill shares one of "
     "your skills with the team. Everything the team's agents remembered, said and did is in the team's "
     "Infino database, read with the Infino tools below."
 )
@@ -1077,7 +1081,8 @@ class InfinoMemoryProvider(MemoryProvider):
                 "description": "Save a memory to Infino. It is the team's unless it is about one person: "
                                "decisions, conventions, fixes, owners and how things work are team memory; "
                                "a person's preferences, credentials, schedule or private matters take scope "
-                               "'personal'. Teammates read it as written: name people, never 'the user', 'I' or 'me'.",
+                               "'personal'. Teammates read it as written: name people, never 'the user', 'I' or 'me'. "
+                               "Not for what you saved with the memory tool: that is kept in Infino by itself.",
                 "parameters": {
                     "type": "object",
                     "properties": {"content": {"type": "string"}, "scope": scope},
@@ -1086,8 +1091,10 @@ class InfinoMemoryProvider(MemoryProvider):
             },
             {
                 "name": "infino_forget",
-                "description": "Delete a memory from Infino by its exact text (as recalled), whichever "
-                               "teammate's agent saved it.",
+                "description": "Delete a memory from Infino for good by its exact text (as recalled), "
+                               "whichever teammate's agent saved it, its superseded copies included. Only when "
+                               "someone asks for it to be forgotten: a change you make with the memory tool is "
+                               "kept in Infino by itself, the old entry as history, and needs no forget.",
                 "parameters": {
                     "type": "object",
                     "properties": {"content": {"type": "string"}, "scope": scope},
