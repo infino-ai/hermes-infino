@@ -625,6 +625,13 @@ class Mirror:
         rows = client.query_sql(database, f"SELECT {tables.ROW_ID} FROM {table} WHERE {predicate}")
         return {str(r.get(tables.ROW_ID)) for r in rows if r.get(tables.ROW_ID)}
 
+    def matching_rows(self, table: str, database: str, predicate: str) -> list[dict]:
+        """The cloud rows matching `predicate`, whole, whichever machine pushed
+        them. Asked while a tool call waits, as `matching_ids` is."""
+        s = self.settings
+        client = InfinoClient(s.api_key, s.url, timeout=FORGET_LOOKUP_TIMEOUT_S, retries=0)
+        return client.query_sql(database, f"SELECT * FROM {table} WHERE {predicate}")
+
     def forget(self, table: str, database: str, row_ids: list[str]) -> None:
         """Queue the cloud delete of rows by their ids."""
         if row_ids:

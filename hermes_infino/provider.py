@@ -64,6 +64,7 @@ sync; a recall the cloud is slow to answer is answered from this machine.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import sys
@@ -188,10 +189,10 @@ SYSTEM_PROMPT = (
     "Use infino_remember to save what is worth keeping. Memory is the team's unless it is about one person: "
     "work knowledge (decisions, conventions, fixes, owners, how things are set up) is team memory, saved "
     "without asking; a person's preferences, credentials, schedule or private matters are personal "
-    "(scope 'personal'). Your built-in memory (the memory tool) is kept in Infino by itself, history "
-    "included: an entry you replace or remove stays there marked superseded, so never use infino_remember or "
-    "infino_forget to copy a memory-tool change into Infino. infino_forget deletes a memory and its history "
-    "for good, by its exact text: use it only when someone asks for something to be forgotten or deleted. "
+    "(scope 'personal'). Your built-in memory (the memory tool) is kept in Infino by itself: an entry you "
+    "replace stays there as history, marked superseded, and an entry you remove is forgotten. Never use "
+    "infino_remember or infino_forget to copy a memory-tool change into Infino. infino_forget deletes a memory "
+    "and its history for good, by its exact text: use it when someone asks for something to be forgotten. "
     "infino_publish_skill shares one of "
     "your skills with the team. Everything the team's agents remembered, said and did is in the team's "
     "Infino database, read with the Infino tools below."
@@ -800,9 +801,9 @@ class InfinoMemoryProvider(MemoryProvider):
         assert self._backend is not None
         return self._backend.forget_memory(content, scope, chat.visible, people, about_prefix, everywhere)
 
-    def _supersede(self, content: str, superseded_by: str, scope: Optional[str],
-                   chat: chats.Chat = chats.NO_CHAT, people: Optional[tuple[str, ...]] = None,
-                   about_prefix: str = "") -> int:
+    def _supersede(self, content: str, scope: Optional[str], chat: chats.Chat = chats.NO_CHAT,
+                   people: Optional[tuple[str, ...]] = None, about_prefix: str = "", *,
+                   superseded_by: str) -> int:
         assert self._backend is not None
         return self._backend.supersede_memory(content, superseded_by, scope, chat.visible, people, about_prefix)
 
@@ -850,19 +851,21 @@ class InfinoMemoryProvider(MemoryProvider):
         # superseded copy names it, so a recall of the old shows what took its place.
         row = self._builtin_row(target, content, chat) if action in ("add", "replace") and content else None
         if action in ("replace", "remove") and previous:
-            replaced_by = str(row["content"]) if action == "replace" and row is not None else ""
-            # Kept, not deleted: what Hermes compacts away stays recallable,
-            # marked superseded (backend.supersede_rows). Only infino_forget deletes.
+            # A replacement keeps the old entry, marked superseded and naming
+            # what replaced it (backend.supersede_rows): what Hermes rewrites
+            # stays recallable. A removal is how the agent forgets when it is
+            # asked to: the entry is deleted, as infino_forget deletes it.
+            write = self._forget
+            if action == "replace" and row is not None:
+                write = functools.partial(self._supersede, superseded_by=str(row["content"]))
             if chat.group and not chat.owner_writes:
                 # The entry may be about another member, who wrote it: any "About <name>: ".
-                self._run_write(self._supersede, previous, replaced_by, TEAM, chat, None,
-                                ABOUT_ANYONE if target == "user" else "")
+                self._run_write(write, previous, TEAM, chat, None, ABOUT_ANYONE if target == "user" else "")
             elif target != "user" or self._keeps_personal(chat):
                 person = self._person()
                 about = ABOUT_PERSON.format(author=person) if target == "user" and person else ""
                 scope = PERSONAL if target == "user" else self._default_scope()
-                self._run_write(self._supersede, about + previous, replaced_by, scope, chats.NO_CHAT,
-                                self._people())
+                self._run_write(write, about + previous, scope, chats.NO_CHAT, self._people())
         if action in ("add", "replace") and content:
             if row is not None:
                 self._run_write(self._add_builtin, row)
@@ -1093,8 +1096,8 @@ class InfinoMemoryProvider(MemoryProvider):
                 "name": "infino_forget",
                 "description": "Delete a memory from Infino for good by its exact text (as recalled), "
                                "whichever teammate's agent saved it, its superseded copies included. Only when "
-                               "someone asks for it to be forgotten: a change you make with the memory tool is "
-                               "kept in Infino by itself, the old entry as history, and needs no forget.",
+                               "someone asks for it to be forgotten: a change you make with the memory tool "
+                               "reaches Infino by itself and needs no forget.",
                 "parameters": {
                     "type": "object",
                     "properties": {"content": {"type": "string"}, "scope": scope},

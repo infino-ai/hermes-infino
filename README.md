@@ -12,7 +12,11 @@ The plugin keeps four tables.
 
 **`memory`** holds the entries in Hermes's `MEMORY.md` and `USER.md`, including edits you make by hand, plus whatever the agent saves with `infino_remember`. A shared profile on a gateway keeps no `USER.md` entries.
 
-Hermes keeps its memory files short. It replaces and removes entries as it learns, and its background review rewrites them to fit. The plugin keeps everything those rewrites drop. An entry Hermes replaces or removes stays in `memory` as a superseded copy: the same row with `superseded_ms` (when it left the file), `superseded_by` (the entry that replaced it, or empty when it was just removed) and `prior_row_id` (the row it was). Current entries have no `superseded_ms`. Only `infino_forget` deletes a memory, every copy of it, even one a teammate's agent saved.
+Hermes keeps its memory files short. It replaces entries as it learns, and its background review rewrites the files to fit. The plugin keeps what those rewrites drop:
+
+- An entry Hermes replaces, or that leaves the file when it is rewritten (by the review or by hand), stays in `memory` as a superseded copy. The copy is the same row with `superseded_ms` (when it left the file), `superseded_by` (the entry that replaced it, or empty when nothing names one) and `prior_row_id` (the row it was). Current entries have no `superseded_ms`.
+- A copy is kept once per text. The 200 most recent copies are kept in each database, and older ones are deleted.
+- Forgetting is total. An entry the agent removes with Hermes's memory tool, which is how it forgets when someone asks it to, is deleted, not kept. So is a memory `infino_forget` names, with every superseded copy of it, even one a teammate's agent saved. A copy that names the forgotten text as its replacement keeps its own text and loses that name.
 
 **`conversations`** logs every message of every session a person has with the agent, and who sent it. Tool calls and tool results have their own columns. A message stays in the log even after context compression or `/undo` removes it from the session. Scheduled jobs and subagents add no conversation rows; their model and tool calls are in `traces`.
 
@@ -71,8 +75,21 @@ Once you sign in:
 - Forgetting a memory deletes it from the cloud too.
 - The cloud embeds memories itself, so your machine no longer has to embed locally.
 - Recall reads from the cloud first. If the cloud is slow or can't be reached, recall searches your local machine.
-- The cloud also ranks what recall shows. Each recall sends the turn's message as the question with the search (`rerank`), and the platform grades a wider pool of memories for it and returns the best, current and superseded together. When the ranking is not back in time, or the deployment does not offer it, recall uses the plain search, with current entries first.
-- A superseded entry shows in recall marked with when it was superseded and what replaced it, so the agent can tell an old fact from the current one.
+- A superseded entry shows in recall marked with when it was superseded and what replaced it, so the agent can tell an old fact from the current one. Current entries come first.
+
+### Ranked recall (off unless you turn it on)
+
+Set `INFINO_RANK_RECALL=on` to have the cloud rank what recall shows, instead of taking the search's top results. Each recall then sends the turn's message as the question with its search, and the platform's triage pass grades a wider pool of memories for it and returns the best, current and superseded together.
+
+The triage pass is a model. On every turn, it reads the text of each memory it grades, up to the deployment's pool. That covers team memory, and in your own sessions your personal memory. It includes team memories kept for other group chats, because what a chat may see is filtered after the search. Those rows are graded but never shown in that chat. Turn it on only if that is acceptable for your data.
+
+When the ranking is not back in time, or the deployment does not offer it, recall uses the plain search.
+
+### Upgrading and downgrading
+
+Upgrading keeps every memory you have. Tables written by an older version gain the superseded columns, and their rows read as current.
+
+A version older than this one does not know superseded copies. It deletes them, locally and in the cloud, the first time it compares the memory files with the table. Downgrading therefore loses the kept history, though not the current memories.
 
 ## Install
 

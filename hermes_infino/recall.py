@@ -11,8 +11,9 @@ has no cloud database (personal memory without a personal database), the
 local database answers alone. Without an account the local databases are the
 only sources (hybrid, the question embedded on this machine).
 
-Signed in, the cloud also ranks: beside each source's plain search runs the
-same search with `rerank`, which has the platform's triage pass (the grader
+Signed in, and only where the person turned it on (INFINO_RANK_RECALL), the
+cloud also ranks: beside each source's plain search runs the same search
+with `rerank`, which has the platform's triage pass (the grader
 the ask loop ranks tables, columns and rows with) read a wider pool of
 memories for the question and return the best in its order. Its answer is
 used when it comes in time; otherwise, or where the deployment runs no
@@ -144,9 +145,12 @@ def past(row: dict, mark: Mark) -> bool:
 class Recaller:
     """Searches `memory`, remembering per cloud database whether the vector leg works."""
 
-    def __init__(self, sources: list[Source], cloud: Optional[InfinoClient] = None) -> None:
+    def __init__(self, sources: list[Source], cloud: Optional[InfinoClient] = None, rank: bool = False) -> None:
         self._sources = sources
         self._cloud = cloud
+        # Whether to ask the cloud to rank (INFINO_RANK_RECALL): a model then
+        # reads the text of the memories it grades.
+        self._rank = rank
         self._keyword_only: set[str] = set()
         # Cloud databases whose deployment said it runs no triage pass.
         self._no_rerank: set[str] = set()
@@ -230,7 +234,7 @@ class Recaller:
         # one, already there by then, when it does not.
         asked = {id(s): _pool.submit(self._cloud_rows, s, query) for s in clouded}
         ranked = {id(s): _pool.submit(self._cloud_rows, s, query, True)
-                  for s in clouded if s.database not in self._no_rerank}
+                  for s in clouded if self._rank and s.database not in self._no_rerank}
         rows: list[tuple[str, dict]] = []
         for src in sources:
             cloud_rows, graded = None, False

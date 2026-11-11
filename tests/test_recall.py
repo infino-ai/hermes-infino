@@ -210,6 +210,13 @@ def lines(block: str) -> list[str]:
     return block.splitlines()[2:]
 
 
+def test_recall_is_not_ranked_unless_the_person_turned_it_on(team_local, cloud, platform):
+    platform.rerank_supported = True
+    cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploy freeze"}])
+    assert "deploy freeze" in Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud).recall("deploy freeze")[0]
+    assert platform.reranked == []  # no memory text was sent to be graded
+
+
 def test_the_cloud_ranks_recall_for_the_question_and_its_order_stands(team_local, cloud, platform):
     platform.rerank_supported = True
     platform.grade = by_words("Thursday", "Tuesday")
@@ -217,7 +224,7 @@ def test_the_cloud_ranks_recall_for_the_question_and_its_order_stands(team_local
     cloud.append(TEAM_DB, tables.MEMORY, [
         {"row_id": "a", "content": "deploys deploys on Tuesday"},
         {"row_id": "b", "content": "deploys moved to Thursday"}])
-    block, n = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud).recall("when are deploys")
+    block, n = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True).recall("when are deploys")
     assert n == 2
     assert lines(block) == ["- [team] deploys moved to Thursday", "- [team] deploys deploys on Tuesday"]
     [asked] = platform.reranked
@@ -228,7 +235,7 @@ def test_the_cloud_ranks_recall_for_the_question_and_its_order_stands(team_local
 def test_a_deployment_without_the_triage_pass_answers_from_the_plain_search_and_is_not_asked_again(
         team_local, cloud, platform):
     cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploy freeze"}])
-    r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud)
+    r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True)
     assert "deploy freeze" in r.recall("deploy freeze")[0]
     assert len(platform.reranked) == 1  # refused with 501
     assert "deploy freeze" in r.recall("deploy freeze")[0]
@@ -240,7 +247,7 @@ def test_a_worker_built_without_the_triage_pass_is_remembered_too(team_local, cl
     platform.rerank_statuses = [400]
     # The fake's scripted 400 says nothing of rerank: only the worker's own words turn it off.
     cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploy freeze"}])
-    r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud)
+    r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True)
     r.recall("deploy freeze")
     asked = len(platform.reranked)
     r.recall("deploy freeze")
@@ -256,7 +263,7 @@ def test_a_worker_older_than_rerank_is_not_asked_again_and_hybrid_stays_on(team_
     # 400 naming the field as unknown, beside a list of fields that includes `vector_field`.
     platform.rerank_unknown = True
     cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploy freeze"}])
-    r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud)
+    r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True)
     assert "deploy freeze" in r.recall("deploy freeze")[0]
     asked = len(platform.reranked)
     hybrid = requests_to(platform, "hybrid_search")
@@ -273,7 +280,7 @@ def test_a_ranking_that_fails_once_falls_back_and_is_asked_again(team_local, clo
     platform.grade = by_words("Thursday")
     cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploys deploys on Tuesday"},
                                           {"row_id": "b", "content": "deploys moved to Thursday"}])
-    r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud)
+    r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True)
     first, _ = r.recall("deploys")
     assert lines(first)[0] == "- [team] deploys deploys on Tuesday"  # the plain search's order
     second, _ = r.recall("deploys")
@@ -288,7 +295,7 @@ def test_a_ranking_slower_than_the_budget_leaves_the_plain_search_to_answer_in_t
     platform.rerank_delay_s = SLOW_CLOUD_S
     cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploy freeze"}])
     started = time.monotonic()
-    block, n = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud).recall("deploy freeze")
+    block, n = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True).recall("deploy freeze")
     assert n == 1 and "deploy freeze" in block
     assert time.monotonic() - started < SLOW_CLOUD_S
 
@@ -298,7 +305,7 @@ def test_a_ranked_recall_still_shows_only_what_the_chat_may_see(team_local, clou
     platform.grade = by_words("moved")
     cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "standup moved", tables.CHAT: "telegram:-200"},
                                           {"row_id": "b", "content": "standup is at ten", tables.CHAT: ""}])
-    block, n = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud).recall("standup", GROUP)
+    block, n = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True).recall("standup", GROUP)
     assert n == 1 and lines(block) == ["- [team] standup is at ten"]
 
 
@@ -309,7 +316,7 @@ def test_a_ranked_recall_of_personal_memory_shows_only_its_person(team_local, pe
         {"row_id": "p1", "content": "deploy password hint is blue", "author": "dana", "scope": "personal"},
         {"row_id": "p2", "content": "deploy password hint is red", "author": "sam", "scope": "personal"}])
     source = Source(recall.PERSONAL, personal_local, "dana-own", lambda: (2 ** 62, ""))
-    block, n = Recaller([source], cloud).recall("deploy password hint", people=("dana",))
+    block, n = Recaller([source], cloud, rank=True).recall("deploy password hint", people=("dana",))
     assert n == 1 and "blue" in block and "red" not in block
 
 
@@ -318,7 +325,7 @@ def test_a_keyword_only_database_is_ranked_too(team_local, cloud, platform):
     platform.grade = by_words("Thursday")
     cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploys deploys on Tuesday"},
                                           {"row_id": "b", "content": "deploys moved to Thursday"}])
-    r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud)
+    r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True)
     r._keyword_only.add(TEAM_DB)
     block, _ = r.recall("deploys")
     assert lines(block)[0] == "- [team] deploys moved to Thursday"
@@ -353,7 +360,7 @@ def test_the_grader_may_put_a_superseded_memory_first(team_local, cloud, platfor
         {"row_id": "a", "content": "deploys on Tuesday, staging first", tables.SUPERSEDED: A_DAY_MS,
          tables.SUPERSEDED_BY: "deploys on Thursday"},
         {"row_id": "b", "content": "deploys on Thursday"}])
-    block, _ = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud).recall("what did we say about staging")
+    block, _ = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True).recall("what did we say about staging")
     assert lines(block)[0].startswith("- [team] deploys on Tuesday, staging first [superseded")
 
 

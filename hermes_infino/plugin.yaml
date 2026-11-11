@@ -35,6 +35,9 @@ optional_env:
   - name: INFINO_TEAM_SKILLS
     description: "off: do not load the skills teammates publish (default on)"
     password: false
+  - name: INFINO_RANK_RECALL
+    description: "on: the cloud ranks recall for each turn's message; a model reads the memories it grades (default off)"
+    password: false
   - name: INFINO_PERSONAL_PROFILE
     description: "on: this profile's conversations and traces are personal, never the team's (default off)"
     password: false

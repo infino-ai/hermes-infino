@@ -41,6 +41,11 @@ first.
                              since it names the config block
 - INFINO_TEAM_SKILLS         `off` stops this profile loading the skills its
                              teammates publish (default on)
+- INFINO_RANK_RECALL         `on` has the cloud rank what recall shows: each
+                             recall's search names the turn's message as the
+                             question, and the platform's triage pass - a
+                             model - reads the text of the memories it grades
+                             (default off; signed in only)
 - INFINO_PERSONAL_PROFILE    `on` makes this profile's conversations and traces
                              personal: kept in the personal database, or on
                              this machine, never the team's (default off). Any
@@ -102,6 +107,7 @@ URL_ENV = "INFINO_URL"
 AUTHOR_ENV = "INFINO_AUTHOR"
 MCP_SERVER_ENV = "INFINO_MCP_SERVER"
 TEAM_SKILLS_ENV = "INFINO_TEAM_SKILLS"
+RANK_RECALL_ENV = "INFINO_RANK_RECALL"
 PERSONAL_PROFILE_ENV = "INFINO_PERSONAL_PROFILE"
 PERSONAL_JOBS_ENV = "INFINO_PERSONAL_JOBS"
 OWNER_ROUTES_ENV = "INFINO_OWNER_ROUTES"
@@ -267,6 +273,9 @@ class Settings:
     source: str = ""
     # Whether the skills teammates publish load in this profile.
     team_skills: bool = True
+    # Whether recall asks the cloud to rank memories for the turn's message:
+    # a model reads the memories' text, so it is the person's choice to make.
+    rank_recall: bool = False
     # Whether every conversation and trace of this profile is personal.
     personal_profile: bool = False
     # The scheduled jobs (ids or names) whose runs and delivered output are personal.
@@ -408,6 +417,7 @@ def load(home_dir: Optional[Path] = None, *, from_config: bool = True) -> Settin
         home=home_dir,
         source=team_from if team_from == key_from else "+".join(w for w in (team_from, key_from) if w),
         team_skills=pick(TEAM_SKILLS_ENV)[0].lower() not in OFF_VALUES,
+        rank_recall=pick(RANK_RECALL_ENV)[0].lower() in ON_VALUES,
         personal_profile=_personal_profile(home_dir, pick(PERSONAL_PROFILE_ENV)[0]),
         personal_jobs=_names(pick(PERSONAL_JOBS_ENV)[0]),
         owner_routes=_names(pick(OWNER_ROUTES_ENV)[0]),
@@ -466,6 +476,13 @@ def config_schema() -> list[dict]:
             "description": "Load the skills teammates publish (off: only this profile's own)",
             "default": "on",
             "env_var": TEAM_SKILLS_ENV,
+        },
+        {
+            "key": "rank_recall",
+            "description": "on: the cloud ranks recall for each turn's message (a model reads the memories it "
+                           "grades); off: recall is the plain search",
+            "default": "off",
+            "env_var": RANK_RECALL_ENV,
         },
         {
             "key": "personal_profile",

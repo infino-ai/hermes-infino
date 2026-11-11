@@ -8,6 +8,7 @@ import json
 
 import pytest
 
+from hermes_infino import backend as backend_mod
 from hermes_infino import tables
 from hermes_infino.client import InfinoClient
 from hermes_infino.local import LocalStore
@@ -41,12 +42,35 @@ def test_a_chain_of_replacements_keeps_every_earlier_entry_with_what_replaced_it
 def test_an_entry_written_again_is_current_again_beside_its_superseded_copy(home, tmp_path):
     _, p = make_manager(tmp_path)
     p.on_memory_write("add", "memory", "use pnpm")
-    p.on_memory_write("remove", "memory", "", {"previous_content": "use pnpm"})
+    p.on_memory_write("replace", "memory", "use pnpm 9", {"previous_content": "use pnpm"})
     p.on_memory_write("add", "memory", "use pnpm")
     p._drain()
     rows = local_rows(tmp_path, tables.MEMORY)
-    assert contents(current(rows)) == ["use pnpm"]
-    assert by(rows) == [("use pnpm", "")]
+    assert contents(current(rows)) == ["use pnpm", "use pnpm 9"]
+    assert by(rows) == [("use pnpm", "use pnpm 9")]
+
+
+def test_a_removal_with_the_memory_tool_forgets_the_entry_and_keeps_no_copy(home, tmp_path):
+    # How the agent forgets when someone asks it to: recall never shows the entry again.
+    _, p = make_manager(tmp_path)
+    p.on_memory_write("add", "memory", "Dana's flight lands at 6")
+    p.on_memory_write("remove", "memory", "", {"previous_content": "Dana's flight lands at 6"})
+    p._drain()
+    assert local_rows(tmp_path, tables.MEMORY) == []
+    assert "flight" not in p.prefetch("when does Dana's flight land")
+
+
+def test_forgetting_an_entry_clears_its_text_from_the_copy_it_replaced(home, tmp_path):
+    _, p = make_manager(tmp_path)
+    p.on_memory_write("add", "memory", "the wiki is on Confluence")
+    p.on_memory_write("replace", "memory", "the wiki moved to notion.so/acme-secret",
+                      {"previous_content": "the wiki is on Confluence"})
+    p.on_memory_write("remove", "memory", "", {"previous_content": "the wiki moved to notion.so/acme-secret"})
+    p._drain()
+    rows = local_rows(tmp_path, tables.MEMORY)
+    assert current(rows) == []
+    assert by(rows) == [("the wiki is on Confluence", "")]  # kept, no longer naming what was forgotten
+    assert not [r for r in rows if "acme-secret" in json.dumps(r, default=str)]
 
 
 def test_a_dropped_entry_is_superseded_once_however_many_turns_follow(home, tmp_path):
@@ -95,16 +119,59 @@ def test_a_crash_between_the_copy_and_the_delete_loses_nothing_and_copies_once(h
 def test_infino_forget_deletes_the_memory_and_every_superseded_copy_here_and_in_the_cloud(env, platform, tmp_path):
     m, p = make_manager(tmp_path)
     p.on_memory_write("add", "memory", "the deploy key is in vault")
-    p.on_memory_write("remove", "memory", "", {"previous_content": "the deploy key is in vault"})
-    p.on_memory_write("add", "memory", "the deploy key is in vault")
+    p.on_memory_write("replace", "memory", "the deploy key is in 1Password",
+                      {"previous_content": "the deploy key is in vault"})
+    p.on_memory_write("replace", "memory", "the deploy key is in vault",
+                      {"previous_content": "the deploy key is in 1Password"})
     end_session(p)
-    assert len(platform.rows(TEAM_DB, tables.MEMORY)) == 2  # current and superseded
+    assert len(platform.rows(TEAM_DB, tables.MEMORY)) == 3  # vault current, vault and 1Password superseded
     m2, p2 = make_manager(tmp_path)
     out = json.loads(m2.handle_tool_call("infino_forget", {"content": "the deploy key is in vault"}))
     assert out["ok"] and out["matched"] == 2
     end_session(p2)
-    assert local_rows(tmp_path, tables.MEMORY) == []
-    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    for rows in (local_rows(tmp_path, tables.MEMORY), platform.rows(TEAM_DB, tables.MEMORY)):
+        assert not [r for r in rows if "vault" in str(r["content"]) + str(r.get(tables.SUPERSEDED_BY) or "")]
+        assert by(rows) == [("the deploy key is in 1Password", "")]
+
+
+def test_infino_forget_clears_the_name_from_a_copy_another_machine_pushed(env, platform, tmp_path):
+    _, p = make_manager(tmp_path)
+    p.on_memory_write("add", "memory", "standup is at ten")
+    end_session(p)
+    # A teammate's machine kept a copy that names the text being forgotten.
+    platform.databases[TEAM_DB][tables.MEMORY].append({
+        "row_id": "theirs", "stored_ms": 1, "content": "standup is at nine", "scope": "team", "origin": "builtin:memory",
+        "chat": "", tables.SUPERSEDED: 1, tables.SUPERSEDED_BY: "standup is at ten", tables.PRIOR_ROW_ID: "x"})
+    m2, p2 = make_manager(tmp_path)
+    out = json.loads(m2.handle_tool_call("infino_forget", {"content": "standup is at ten"}))
+    assert out["ok"]
+    end_session(p2)
+    rows = platform.rows(TEAM_DB, tables.MEMORY)
+    assert not [r for r in rows if "at ten" in str(r["content"]) + str(r.get(tables.SUPERSEDED_BY) or "")]
+    assert by(rows) == [("standup is at nine", "")]
+    assert not [r for r in rows if r["row_id"] == "theirs"]
+
+
+def test_an_entry_the_review_keeps_rewording_back_is_kept_once(home, tmp_path):
+    _, p = make_manager(tmp_path, session_id="cli")
+    for n in range(1, 7):  # the entry leaves and comes back, turn after turn
+        write_file(tmp_path, "memory", ["use pnpm"] if n % 2 else ["use pnpm, not npm"])
+        turn(p, n)
+    rows = local_rows(tmp_path, tables.MEMORY)
+    assert contents(current(rows)) == ["use pnpm, not npm"]
+    assert sorted(by(rows)) == [("use pnpm", ""), ("use pnpm, not npm", "")]
+
+
+def test_superseded_copies_are_capped_newest_kept(home, tmp_path, monkeypatch):
+    monkeypatch.setattr(backend_mod, "SUPERSEDED_KEPT", 3)
+    _, p = make_manager(tmp_path)
+    p.on_memory_write("add", "memory", "release 1")
+    for n in range(2, 8):
+        p.on_memory_write("replace", "memory", f"release {n}", {"previous_content": f"release {n - 1}"})
+    p._drain()
+    rows = local_rows(tmp_path, tables.MEMORY)
+    assert contents(current(rows)) == ["release 7"]
+    assert [c for c, _ in by(rows)] == ["release 4", "release 5", "release 6"]
 
 
 def test_a_persons_superseded_entry_goes_to_their_own_database_never_the_teams(env, platform, tmp_path):
