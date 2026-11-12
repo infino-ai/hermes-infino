@@ -998,6 +998,30 @@ def test_a_teammates_forget_of_every_earlier_version_this_machine_pushed_is_not_
     assert len(platform.rows(TEAM_DB, tables.MEMORY)) == 3
 
 
+@pytest.mark.parametrize("queued_as", ["ids", "match"])
+def test_a_teammates_forget_of_a_memory_and_its_history_brings_neither_back(m, platform, tmp_path, queued_as):
+    # This machine keeps one memory, with the address it replaced in its
+    # history; a teammate forgets the memory and its history. Every row this
+    # machine pushed to both tables is gone from the cloud.
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "oak", "content": "Dana lives at 99 Oak Ave"}])
+    m.local.append(tables.HISTORY, [{tables.ROW_ID: "elm", "content": "Dana lives at 12 Elm St", tables.SUPERSEDED: 1,
+                                     tables.SUPERSEDED_BY: "Dana lives at 99 Oak Ave", tables.PRIOR_ROW_ID: "x"}])
+    m.sync(wait=True)
+    teammate = make_mirror(tmp_path / "teammate", sign_in(tmp_path / "teammate", platform))
+    for table, where in ((tables.MEMORY, "content LIKE '%Oak%'"), (tables.HISTORY, "content LIKE '%Elm%'")):
+        if queued_as == "ids":
+            teammate.forget(table, TEAM_DB, sorted(teammate.matching_ids(table, TEAM_DB, where)))
+        else:
+            teammate.forget_matching(table, TEAM_DB, where)
+    teammate.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    assert platform.rows(TEAM_DB, tables.HISTORY) == []
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform))  # this machine's next process
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    assert platform.rows(TEAM_DB, tables.HISTORY) == []
+
+
 def test_a_dropped_database_gets_its_history_back_with_its_memory(m, platform):
     m.local.append(tables.MEMORY, [{"content": "standup is at ten"}])
     m.local.append(tables.HISTORY, [{"content": "standup is at nine", tables.SUPERSEDED: 1,
