@@ -239,5 +239,11 @@ def ensure_optional(client: InfinoClient, database: str, table: str) -> None:
     have = set(client.column_names(database, table))
     missing = [f for f in schema if f["name"] not in have]
     if missing:
-        client.add_columns(database, table, [{"name": f["name"], "type": f["type"], "nullable": True}
-                                             for f in missing])
+        try:
+            client.add_columns(database, table, [{"name": f["name"], "type": f["type"], "nullable": True}
+                                                 for f in missing])
+        except InfinoError as e:
+            if e.status != 403:
+                raise
+            raise OutdatedTable(f"{database}.{table} has no {', '.join(f['name'] for f in missing)}, and this key "
+                                f"may not add it: {e}") from e

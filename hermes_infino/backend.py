@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import config, embed, privacy, recall, tables
+from .builtin import ENTRY_DELIMITER
 from .chats import CHATS_JOIN
 from .client import InfinoClient
 from .local import PERSONAL_DB_DIR, LocalStore
@@ -776,7 +777,8 @@ def _named_among(texts: list[str]) -> str:
     """History rows whose `superseded_by` names one of `texts` among several
     (a consolidation names every entry that carries the removed one, joined
     by REPLACED_JOIN): fenced by the joiner at both ends, it holds the text
-    fenced the same way."""
+    fenced the same way. No entry holds the joiner, so a text is matched only
+    as a whole name."""
     joiner = tables.sql_string(REPLACED_JOIN)
     parts = [f"strpos(concat({joiner}, {tables.SUPERSEDED_BY}, {joiner}), "
              f"{tables.sql_string(REPLACED_JOIN + t + REPLACED_JOIN)}) > 0" for t in texts]
@@ -808,8 +810,10 @@ def _reach(scope: Optional[str], visible: tuple[str, ...],
 # each step is one query, and Hermes's files hold a few dozen entries.
 MAX_HISTORY_CHAIN = 100
 # What joins the entries a consolidated entry was folded into, in its
-# history row's `superseded_by` (provider.on_memory_write).
-REPLACED_JOIN = " | "
+# history row's `superseded_by` (provider.on_memory_write): Hermes's own
+# separator of a memory file's entries, which no entry can hold, so a name is
+# never split inside an entry's text. Recall shows it as " § ".
+REPLACED_JOIN = ENTRY_DELIMITER
 
 # Columns a superseded copy does not carry over from the row it copies: its
 # own id and commit stamp are its own, and a search's score is not a column.

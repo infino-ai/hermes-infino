@@ -139,8 +139,9 @@ FORGET_LOOKUP_TIMEOUT_S = 5.0
 # Seconds between attempts to make the cloud tables right after one failed.
 ENSURE_RETRY_S = 60.0
 # A refusal to make an optional table that asking again will not change: the
-# request was refused (bad, unauthorized, forbidden), not failed.
-OPTIONAL_REFUSED_STATUSES = (400, 401, 403)
+# key may not make tables there. Any other failure (a bad key being fixed, a
+# request the platform could not take) is tried again in ENSURE_RETRY_S.
+OPTIONAL_REFUSED_STATUSES = (403,)
 # The person's own sources, one per personal table: the team's are named by
 # their tables, these by the table after this prefix.
 PERSONAL_SOURCE_PREFIX = "personal_"
@@ -232,6 +233,9 @@ class Mirror:
         # Optional tables a database refused to make (a key that may not make
         # tables there): not asked again by this process.
         self._optional_refused: set[tuple[str, str]] = set()
+        # Optional tables that are there but lack a column this version writes,
+        # which the key may not add: their rows stay here; the cloud's are read.
+        self._optional_outdated: set[tuple[str, str]] = set()
 
     # -- where rows go -------------------------------------------------------
 
@@ -311,7 +315,7 @@ class Mirror:
         key = (database, table)
         if key in self._optional_ready:
             return True
-        if key in self._optional_refused:
+        if key in self._optional_refused or key in self._optional_outdated:
             return False
         failed = self._optional_failed_at.get(key)
         if failed is not None and time.monotonic() - failed < ENSURE_RETRY_S:
@@ -319,6 +323,15 @@ class Mirror:
         try:
             tables.ensure_optional(self.client, database, table)
         except Exception as e:
+            if isinstance(e, tables.OutdatedTable):
+                # There, but without a column this version writes, which this key
+                # may not add: its rows stay here, and the cloud's are still
+                # searched. Asked again by the next process, not every minute.
+                logger.warning("infino: %s.%s lacks a column this version writes and it cannot be added, so its "
+                               "rows stay on this machine (asked again when Hermes next starts); everything else "
+                               "syncs: %s", database, table, e)
+                self._optional_outdated.add(key)
+                return False
             if isinstance(e, InfinoError) and e.status in OPTIONAL_REFUSED_STATUSES:
                 # Refused, not failing: asked again by the next process, not every minute.
                 logger.warning("infino: %s refuses to make %s, so its rows stay on this machine (asked again when "
@@ -335,7 +348,9 @@ class Mirror:
 
     def refused_optional(self, database: Optional[str], table: str) -> bool:
         """Whether cloud `database` refused to make optional `table` (asked
-        once per process): its rows are on this machine alone."""
+        once per process): it is not there, and its rows are on this machine
+        alone. A table that is there without a column this version writes is
+        not refused: the cloud's rows are still read."""
         return (str(database), table) in self._optional_refused
 
     def waiting(self) -> dict[str, Exception]:
@@ -385,9 +400,14 @@ class Mirror:
                 self._optional_ready.discard((database, tables.HISTORY))  # made again before its rows go
             if lost:
                 logger.info("infino: the cloud lost %s; pushing this machine's rows again", ", ".join(lost))
+                # Each row up to the dropped mark is asked about before it is
+                # sent again (the re-check): the cloud may still have some of
+                # them, and a row it has is not sent twice.
+                rechecks = self._rechecks(state)
+                for mark in lost:
+                    rechecks[mark] = max(rechecks.get(mark, marks[mark]), marks[mark])
                 self._save_state({k: v for k, v in marks.items() if k not in lost},
-                                 str(state.get("last_error") or ""), self._in_flight(state),
-                                 {k: v for k, v in self._rechecks(state).items() if k not in lost})
+                                 str(state.get("last_error") or ""), self._in_flight(state), rechecks)
 
     # -- state ---------------------------------------------------------------
 

@@ -947,18 +947,19 @@ class InfinoMemoryProvider(MemoryProvider):
         whose entry left its file are still deleted; a note that is damaged is
         begun again (builtin.writers). While a call of Hermes's memory tool
         that replaces entries is in flight in any process of the profile
-        (builtin.note_replacing), a target's stale rows are left for the next
-        comparison, so that call's provider still finds what it keeps."""
+        (builtin.note_replacing), the stale rows of the entries it replaces
+        are left for the next comparison, so that call's provider still finds
+        what it keeps."""
         assert self._backend is not None and self._settings is not None
         home = self._home or config.home()
         owners_turn = not chat.group and not by_agent and self._platform not in chats.MULTI_PARTY_PLATFORMS
         with builtin.lock(config.state_dir(self._settings.home)):
             written = self._written_in(home)
             try:
-                in_flight = builtin.replacing(config.state_dir(self._settings.home))
+                in_flight: Optional[dict[str, list[str]]] = builtin.replacing(config.state_dir(self._settings.home))
             except Exception as e:  # unreadable now: no stale row is deleted this time
                 logger.info("infino: could not read which memory replacements are in flight: %s", e)
-                in_flight = set(builtin.FILES)
+                in_flight = None
             for target in builtin.FILES:
                 if target == "user" and not (owners_turn and self._user_file_is_owners()):
                     continue
@@ -976,12 +977,16 @@ class InfinoMemoryProvider(MemoryProvider):
                     else:
                         entries[key] = frozenset(noted) | (entries.get(key) or frozenset())
                 missing, stale = builtin.compare(list(entries), self._backend.builtin_rows(target))
-                if stale and target in in_flight:
-                    # A replacement of this file's entries runs in some process,
-                    # whose provider has not kept the earlier entries yet: deleting
-                    # their rows now would leave it nothing to keep. The next
-                    # comparison deletes what is still stale then.
-                    stale = []
+                if stale:
+                    # A replacement of one of this file's entries runs in some
+                    # process, whose provider has not kept the earlier entry yet:
+                    # deleting its row now would leave it nothing to keep. Such a
+                    # row (one holding a span the call names) is left for the next
+                    # comparison; the other stale rows go now.
+                    spans = None if in_flight is None else in_flight.get(target, [])
+                    stale = [] if spans is None else [
+                        (personal, r) for personal, r in stale
+                        if not any(s in str(r.get("content") or "") for s in spans)]
                 if written is None:  # who wrote them cannot be told now: added next time
                     missing = []
                 for entry in missing:
@@ -1204,14 +1209,18 @@ class InfinoMemoryProvider(MemoryProvider):
                 # Out of Hermes's own files too, or the next comparison finds the
                 # entry again: each file only where its rows are in the scope
                 # asked for (MEMORY.md's are the default scope's, USER.md's
-                # personal), and the person's own file only where this turn may
-                # reach it. Text is matched whole; USER.md's also without the
-                # "About <name>: " its rows carry for this profile's people.
+                # personal), and the owner's own file only where this turn may
+                # write the owner's personal memory (never a shared profile's
+                # gateway sender). Text is matched whole; USER.md's also without
+                # the "About <name>: " its rows carry for this profile's people.
                 wanted: dict[str, list[str]] = {}
                 if scope is None or scope == self._default_scope():
                     wanted["memory"] = [text]
-                if not chat.group and scope in (None, PERSONAL):
-                    names = tuple(dict.fromkeys(n for n in (self._person(), self._owner(), self._author) if n))
+                if not chat.group and scope in (None, PERSONAL) and self._keeps_personal(chat):
+                    # Every name this profile's USER.md rows were written under,
+                    # earlier ones included, and the running turn's person.
+                    names = tuple(dict.fromkeys(n for n in (self._person(), self._owner(), *self._owner_names)
+                                                if n))
                     wanted["user"] = _user_entry_forms(text, names)
                 in_files = builtin.remove_from_files(wanted)
                 return json.dumps({"ok": True, "scope": scope or "any", "matched": matched + in_files})

@@ -15,7 +15,7 @@ The plugin keeps five tables.
 **`memory_history`** holds the earlier versions of memories. Hermes keeps its memory files short: it patches entries as it learns, and consolidates several into one when the file fills up. When it does, the plugin keeps what it replaced:
 
 - An entry Hermes patches or replaces is copied into `memory_history`, with `superseded_ms` (when it was replaced), `superseded_by` (what replaced it) and `prior_row_id` (the row it was). `memory` keeps the current entry only.
-- So is an entry a batch removes when an entry the same batch adds carries at least half of its words, which is how Hermes consolidates. `superseded_by` names each added entry that carries it, joined by ` | `. A batch that removes one entry and adds an unrelated one ("forget X, remember Y") keeps no history of X.
+- So is an entry a batch removes when an entry the same batch adds carries it, which is how Hermes consolidates: at least three quarters of its words, and at least two, not counting common words such as "is" or "the", or "User". `superseded_by` names each added entry that carries it. A batch that removes one entry and adds another that doesn't carry it ("forget X, remember Y"), even about the same person, keeps no history of X: when in doubt, a removal deletes.
 - A text replaced again by the same text is kept once, and every earlier version is kept for good. What a turn sees is decided at recall.
 - `superseded_by` names a replacement only when it was written for the same chat. A group's note never shows in the team's history.
 - Any other removal deletes, as before: a removal on its own (how the agent forgets when it is asked to), a removal approved with `/memory approve`, an entry deleted from the file by hand.
@@ -91,7 +91,7 @@ When the ranking is not back in time, or the deployment does not offer it, recal
 
 ### Upgrading and downgrading
 
-The history lives in a table of its own, and `memory` keeps exactly the columns it had, so upgrading adds no column to any table a team already has. Where the cloud refuses to create `memory_history` (a key that may not create tables), the history stays on your machine and everything else syncs as before. After a refusal the plugin doesn't ask again until Hermes restarts, and recall reads this machine's history instead of searching the cloud's.
+The history lives in a table of its own, and `memory` keeps exactly the columns it had, so upgrading adds no column to any table a team already has. Where the cloud refuses to create `memory_history` (a key that may not create tables), the history stays on your machine and everything else syncs as before. After a refusal the plugin doesn't ask again until Hermes restarts, and recall reads this machine's history instead of searching the cloud's. A `memory_history` that exists but lacks a column a later version writes, which the key may not add, is still searched; only this machine's new history stays local.
 
 A version older than this one does not know `memory_history`. It neither reads nor deletes it, so downgrading loses nothing.
 

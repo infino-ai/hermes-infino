@@ -803,3 +803,36 @@ def test_a_refused_history_table_is_asked_for_once_per_process(home, platform, t
     assert asked == [tables.HISTORY]
     assert m.refused_optional(TEAM_DB, tables.HISTORY)
     platform.refused_tables = set()
+
+
+
+def test_history_pushed_again_after_a_lost_memory_mark_is_checked_with_the_cloud_first(m, platform):
+    # A teammate forgot the memory rows the lost-table check looks at; the history is still there.
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "r1", "content": "standup is at ten"}])
+    m.local.append(tables.HISTORY, [{tables.ROW_ID: "h1", "content": "standup is at nine", tables.SUPERSEDED: 1,
+                                     tables.SUPERSEDED_BY: "standup is at ten", tables.PRIOR_ROW_ID: "x"}])
+    m.sync(wait=True)
+    platform.databases[TEAM_DB][tables.MEMORY] = []
+    m.ensure_cloud_tables()
+    m.sync(wait=True)
+    assert [r["row_id"] for r in platform.rows(TEAM_DB, tables.HISTORY)] == ["h1"]  # not sent twice
+
+
+def test_a_history_table_refused_with_a_400_is_asked_for_again(home, platform, tmp_path, monkeypatch):
+    asked = []
+    real = tables.ensure_optional
+
+    def ensure(client, db, table):
+        asked.append(table)
+        if len(asked) == 1:
+            raise InfinoError(400, "bad request")
+        return real(client, db, table)
+
+    monkeypatch.setattr(tables, "ensure_optional", ensure)
+    monkeypatch.setattr(mirror, "ENSURE_RETRY_S", 0.0)
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform))
+    m.local.append(tables.HISTORY, [{"content": "standup is at nine", tables.SUPERSEDED: 1,
+                                     tables.SUPERSEDED_BY: "", tables.PRIOR_ROW_ID: "x"}])
+    m.sync(wait=True)
+    assert len(asked) >= 2 and not m.refused_optional(TEAM_DB, tables.HISTORY)
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.HISTORY)] == ["standup is at nine"]
