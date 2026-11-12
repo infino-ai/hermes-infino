@@ -292,6 +292,8 @@ class FakePlatform:
         con = sqlite3.connect(":memory:")
         con.create_function("ends_with", 2,
                             lambda s, t: None if s is None or t is None else int(str(s).endswith(str(t))))
+        con.create_function("strpos", 2,
+                            lambda s, t: None if s is None or t is None else str(s).find(str(t)) + 1)
         quoted = ", ".join('"' + c + '"' for c in columns)
         con.execute(f"CREATE TABLE t (_i INTEGER, {quoted})")
         con.executemany(f"INSERT INTO t VALUES ({', '.join('?' * (len(columns) + 1))})",

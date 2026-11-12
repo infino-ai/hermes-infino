@@ -138,6 +138,10 @@ LOST_CHECK_ROWS = 32
 FORGET_LOOKUP_TIMEOUT_S = 5.0
 # Seconds between attempts to make the cloud tables right after one failed.
 ENSURE_RETRY_S = 60.0
+# A refusal to make an optional table that asking again will not change: the
+# key may not make tables there. Any other failure (a bad key being fixed, a
+# request the platform could not take) is tried again in ENSURE_RETRY_S.
+OPTIONAL_REFUSED_STATUSES = (403,)
 # The person's own sources, one per personal table: the team's are named by
 # their tables, these by the table after this prefix.
 PERSONAL_SOURCE_PREFIX = "personal_"
@@ -226,6 +230,12 @@ class Mirror:
         # there keeps its own rows on this machine, holding up nothing else.
         self._optional_ready: set[tuple[str, str]] = set()
         self._optional_failed_at: dict[tuple[str, str], float] = {}
+        # Optional tables a database refused to make (a key that may not make
+        # tables there): not asked again by this process.
+        self._optional_refused: set[tuple[str, str]] = set()
+        # Optional tables that are there but lack a column this version writes,
+        # which the key may not add: their rows stay here; the cloud's are read.
+        self._optional_outdated: set[tuple[str, str]] = set()
 
     # -- where rows go -------------------------------------------------------
 
@@ -305,12 +315,29 @@ class Mirror:
         key = (database, table)
         if key in self._optional_ready:
             return True
+        if key in self._optional_refused or key in self._optional_outdated:
+            return False
         failed = self._optional_failed_at.get(key)
         if failed is not None and time.monotonic() - failed < ENSURE_RETRY_S:
             return False
         try:
             tables.ensure_optional(self.client, database, table)
         except Exception as e:
+            if isinstance(e, tables.OutdatedTable):
+                # There, but without a column this version writes, which this key
+                # may not add: its rows stay here, and the cloud's are still
+                # searched. Asked again by the next process, not every minute.
+                logger.warning("infino: %s.%s lacks a column this version writes and it cannot be added, so its "
+                               "rows stay on this machine (asked again when Hermes next starts); everything else "
+                               "syncs: %s", database, table, e)
+                self._optional_outdated.add(key)
+                return False
+            if isinstance(e, InfinoError) and e.status in OPTIONAL_REFUSED_STATUSES:
+                # Refused, not failing: asked again by the next process, not every minute.
+                logger.warning("infino: %s refuses to make %s, so its rows stay on this machine (asked again when "
+                               "Hermes next starts); everything else syncs: %s", database, table, e)
+                self._optional_refused.add(key)
+                return False
             logger.warning("infino: %s.%s could not be made, so its rows stay on this machine (tried again in %d s); "
                            "everything else syncs: %s", database, table, ENSURE_RETRY_S, e)
             self._optional_failed_at[key] = time.monotonic()
@@ -318,6 +345,13 @@ class Mirror:
         self._optional_ready.add(key)
         self._optional_failed_at.pop(key, None)
         return True
+
+    def refused_optional(self, database: Optional[str], table: str) -> bool:
+        """Whether cloud `database` refused to make optional `table` (asked
+        once per process): it is not there, and its rows are on this machine
+        alone. A table that is there without a column this version writes is
+        not refused: the cloud's rows are still read."""
+        return (str(database), table) in self._optional_refused
 
     def waiting(self) -> dict[str, Exception]:
         """The cloud databases whose tables are not right, each with why its
@@ -331,7 +365,8 @@ class Mirror:
         the oldest, is in the cloud, while this machine still has the row the
         mark points at. Many rows, pushed at different times, keep a
         teammate's forget of a few of them, or a cloud slow to show the
-        newest, from looking like a dropped table."""
+        newest, from looking like a dropped table. The history of memories
+        is lost when its memory table is, and never on its own."""
         with sync_lock(self.dir):
             state = self._state()
             marks = self.marks()
@@ -339,6 +374,8 @@ class Mirror:
             for src in self.sources():
                 if src.database != database:
                     continue
+                if src.table == tables.HISTORY:
+                    continue  # lost with the memory table, never on its own (below)
                 if src.table in tables.OPTIONAL and (database, src.table) not in self._optional_ready:
                     continue  # not made there yet (or not known to be): nothing of it to have lost
                 mark = marks.get(src.mark)
@@ -352,11 +389,25 @@ class Mirror:
                     src.database, f"SELECT count(*) AS n FROM {src.table} WHERE {tables.ROW_ID} IN ({ids})")
                 if not (found and found[0].get("n")):
                     lost.append(src.mark)
+            # The history is lost exactly when the memory table beside it is:
+            # a database dropped and made again. Its rows missing on their own
+            # are a teammate's forget of earlier versions, and pushing them
+            # again would bring the forgotten text back.
+            mark_of_table = {src.table: src.mark for src in self.sources() if src.database == database}
+            history = mark_of_table.get(tables.HISTORY)
+            if mark_of_table.get(tables.MEMORY) in lost and history in marks:
+                lost.append(history)
+                self._optional_ready.discard((database, tables.HISTORY))  # made again before its rows go
             if lost:
                 logger.info("infino: the cloud lost %s; pushing this machine's rows again", ", ".join(lost))
+                # Each row up to the dropped mark is asked about before it is
+                # sent again (the re-check): the cloud may still have some of
+                # them, and a row it has is not sent twice.
+                rechecks = self._rechecks(state)
+                for mark in lost:
+                    rechecks[mark] = max(rechecks.get(mark, marks[mark]), marks[mark])
                 self._save_state({k: v for k, v in marks.items() if k not in lost},
-                                 str(state.get("last_error") or ""), self._in_flight(state),
-                                 {k: v for k, v in self._rechecks(state).items() if k not in lost})
+                                 str(state.get("last_error") or ""), self._in_flight(state), rechecks)
 
     # -- state ---------------------------------------------------------------
 

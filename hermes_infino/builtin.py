@@ -34,6 +34,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -228,20 +229,172 @@ def consolidation_of(tool_call_id: str) -> list[str]:
     return list(noted[1]) if noted else []
 
 
-def remove_from_files(texts: list[str], targets: tuple[str, ...]) -> int:
-    """Remove the entries holding exactly one of `texts` from Hermes's
-    built-in memory files of `targets`, through Hermes's own store (its lock
-    and its check for a file changed under it), so a forgotten entry is not
-    found again by the next comparison and stays out of the agent's context.
-    How many were removed; none outside a Hermes install."""
+def _words(text: str) -> set[str]:
+    """The words of an entry that say what it is about: lower-cased, without
+    STOP_WORDS and one-letter tokens (the "s" of "Dana's")."""
+    return {w for w in re.findall(r"\w+", text.lower()) if len(w) > 1 and w not in STOP_WORDS}
+
+
+def carried_into(removed: str, added: list[str]) -> list[str]:
+    """The entries of `added` that carry the entry `removed`: at least
+    TIED_MIN_WORDS of its words (_words) and TIED_SHARE of them. That is what
+    a batch's removal was folded into. A batch also removes and adds
+    unrelated entries in one call ("forget X, remember Y"), often about the
+    same person; a removal no added entry carries is a forget, not an earlier
+    version. When unsure, it is a forget."""
+    words = _words(removed)
+    if len(words) < TIED_MIN_WORDS:
+        return []
+    return [a for a in added
+            if len(words & _words(a)) >= max(TIED_MIN_WORDS, TIED_SHARE * len(words))]
+
+
+# -- replacements in flight, across processes --------------------------------------
+
+# Beside the plugin's databases: the calls of Hermes's memory tool that replace
+# entries (a patch, a consolidation) and have run in some process of the
+# profile without that process's provider having kept their earlier versions
+# yet (JSON: call id -> {"target": target, "left": operations to report,
+# "spans": the old_text of each, "at": milliseconds}), and the lock its
+# writers take. While one is noted, a file comparison in any process leaves
+# the target's stale rows that hold one of its spans for the next comparison:
+# deleting one first would leave the replacement nothing to keep. Every other
+# stale row (an approved removal, a hand edit) is deleted as before.
+REPLACING = "builtin_replacing.json"
+REPLACING_LOCK = "builtin_replacing.lock"
+# How long a note of a replacement in flight holds: past it, a process that
+# never reported the call (a crash, or Hermes's background review, which runs
+# with providers off) holds up no deletion.
+REPLACING_KEEP_MS = 60 * 1000
+# What an added entry must carry of a removed entry's words to be what the
+# removal was folded into (carried_into): this share of them, and at least
+# this many. A shared subject alone ("Dana", "User") never ties two entries.
+TIED_SHARE = 0.75
+TIED_MIN_WORDS = 2
+# Words that say nothing of what an entry is about, and the subject Hermes
+# writes USER.md entries under.
+STOP_WORDS = frozenset("""
+a an and are as at be been but by for from has have he her his i in is it its me my of on or our she so that
+the their them they this to was we were will with you your user users
+""".split())
+# The memory tool's operations whose earlier entry a provider keeps.
+REPLACING_ACTIONS = ("patch", "replace")
+
+
+def replacing_operations(args: Any) -> tuple[str, int, list[str]]:
+    """A call of Hermes's memory tool's target, how many of its operations
+    may keep an earlier version (each patch, and each removal of a batch that
+    also adds), and the text each of those names in the entry it replaces
+    (its `old_text`: Hermes's own match is that text within one entry)."""
+    call = args if isinstance(args, dict) else {}
+    target = str(call.get("target") or "")
+    operations = call.get("operations")
+    ops = [op for op in (operations if isinstance(operations, list) and operations else [call])
+           if isinstance(op, dict)]
+    adds = any(str(op.get("action") or "") == "add" for op in ops)
+    replacing_ops = [op for op in ops if str(op.get("action") or "") in REPLACING_ACTIONS
+                     or (adds and str(op.get("action") or "") == "remove")]
+    spans = [str(op.get("old_text")).strip() for op in replacing_ops
+             if isinstance(op.get("old_text"), str) and str(op.get("old_text")).strip()]
+    return target, len(replacing_ops), list(dict.fromkeys(spans))
+
+
+def note_replacing(state_dir: Path, tool_call_id: str, args: Any) -> None:
+    """Before a call of Hermes's memory tool runs: note it while it replaces
+    entries, so no comparison deletes their rows before they are kept."""
+    target, n, spans = replacing_operations(args)
+    if not tool_call_id or not n or not spans or target not in FILES:
+        return
+    config.make_private_dir(Path(state_dir))
+    with lock(state_dir, REPLACING_LOCK, WRITERS_LOCK_WAIT_S):
+        notes = _read_replacing(state_dir)
+        notes[tool_call_id] = {"target": target, "left": n, "spans": spans, "at": _now_ms()}
+        _write_replacing(state_dir, notes)
+
+
+def done_replacing(state_dir: Path, tool_call_id: str, all_of_it: bool = False) -> None:
+    """One operation of call `tool_call_id` was kept (or, with `all_of_it`,
+    the call wrote nothing a provider will keep: it failed, or was held for
+    approval); the note goes once none is left."""
+    if not tool_call_id or not (Path(state_dir) / REPLACING).exists():
+        return
+    with lock(state_dir, REPLACING_LOCK, WRITERS_LOCK_WAIT_S):
+        notes = _read_replacing(state_dir)
+        note = notes.get(tool_call_id)
+        if note is None:
+            return
+        note["left"] = 0 if all_of_it else int(note.get("left") or 0) - 1
+        if note["left"] <= 0:
+            del notes[tool_call_id]
+        _write_replacing(state_dir, notes)
+
+
+def replacing(state_dir: Path) -> dict[str, list[str]]:
+    """Per target, the texts that name the entries a replacement in flight
+    replaces (note_replacing): a row holding one of them is that call's to
+    keep. Raises when the note cannot be read."""
+    if not (Path(state_dir) / REPLACING).exists():
+        return {}
+    with lock(state_dir, REPLACING_LOCK, WRITERS_LOCK_WAIT_S):
+        notes = _read_replacing(state_dir)
+    out: dict[str, list[str]] = {}
+    for note in notes.values():
+        out.setdefault(str(note.get("target")), []).extend(str(s) for s in note.get("spans") or [] if s)
+    return out
+
+
+def _live(note: Any, now: int) -> bool:
+    """Whether a note of a replacement in flight still holds: made at most
+    REPLACING_KEEP_MS ago. One dated after now (a clock put back) holds no
+    longer, so a clock's step never holds deletions up past that time."""
+    if not isinstance(note, dict):
+        return False
+    try:
+        age = now - int(note.get("at") or 0)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= age <= REPLACING_KEEP_MS
+
+
+def _read_replacing(state_dir: Path) -> dict:
+    """The note of replacements in flight, without those past
+    REPLACING_KEEP_MS; a damaged one is begun again (it only ever holds up
+    deletions)."""
+    try:
+        notes = json.loads((Path(state_dir) / REPLACING).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        logger.info("infino: could not read the replacements in flight; begun again: %s", e)
+        return {}
+    if not isinstance(notes, dict):
+        return {}
+    now = _now_ms()
+    return {k: v for k, v in notes.items() if _live(v, now)}
+
+
+def _write_replacing(state_dir: Path, notes: dict) -> None:
+    fresh = Path(state_dir) / (REPLACING + ".tmp")
+    fresh.write_text(json.dumps(notes))
+    os.replace(fresh, Path(state_dir) / REPLACING)
+
+
+def remove_from_files(texts: dict[str, list[str]]) -> int:
+    """Remove the entries holding exactly one of `texts[target]` from each
+    of Hermes's built-in memory files named, through Hermes's own store (its
+    lock and its check for a file changed under it), so a forgotten entry is
+    not found again by the next comparison and stays out of the agent's
+    context. How many were removed; none outside a Hermes install."""
     try:
         from tools.memory_tool import load_on_disk_store
     except ImportError:  # pragma: no cover - only outside a Hermes install
         return 0
-    wanted = {t.strip() for t in texts if t and t.strip()}
     store = load_on_disk_store()
     removed = 0
-    for target in targets:
+    for target, forms in texts.items():
+        if target not in FILES:
+            continue
+        wanted = {t.strip() for t in forms if t and t.strip()}
         entries = list(store.memory_entries if target == "memory" else store.user_entries)
         for entry in entries:
             if entry.strip() in wanted:
