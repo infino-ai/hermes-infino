@@ -1,0 +1,278 @@
+name: Review loop
+
+# `/autofix` on a PR runs review -> fix rounds until nothing is left for the fixer, then the tests CI
+# runs; when nothing is left for it to fix and the tests pass on the head commit, it says so in a
+# comment. It never approves: a person reviews and approves.
+# Started by hand, it can also review without fixing. Only maintainers (write access) can start it,
+# after reading the diff.
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number
+        required: true
+      mode:
+        description: autofix, or review (no fixes)
+        default: autofix
+        type: choice
+        options: [autofix, review]
+      reviewer_model:
+        description: Reviewer (Codex, through the Azure OpenAI endpoint)
+        default: gpt-6.1-sol
+      reviewer_effort:
+        description: Reviewer reasoning effort
+        default: high
+        type: choice
+        options: [medium, high, xhigh]
+      fixer_model:
+        description: Fixer (Claude Code, through Azure Foundry)
+        default: claude-opus-5-5-fast
+      max_iterations:
+        description: Most review rounds; a fix follows a review only when the reviewer asks for one
+        default: "3"
+
+# Reads use the workflow token; every write goes through the bot's App token.
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  # Decide whether this event is a loop request, and with which settings, before paying for a runner
+  # with Hermes and the agents on it.
+  request:
+    # GitHub cannot filter comment events by text, so this expression does the rough cut without a
+    # runner: other comments end as skipped, and the bot's own comments (App tokens start workflows,
+    # unlike the workflow token) are ignored. The step below checks the command exactly.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request && github.event.comment.user.type != 'Bot' &&
+       contains(github.event.comment.body, '/autofix'))
+    runs-on: ubuntu-latest
+    # Write on issues only to react to the command; this job checks out and runs nothing of the PR.
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    outputs:
+      go: ${{ steps.req.outputs.go }}
+      pr: ${{ steps.req.outputs.pr }}
+      mode: ${{ steps.req.outputs.mode }}
+      reviewer: ${{ steps.req.outputs.reviewer }}
+      effort: ${{ steps.req.outputs.effort }}
+      fixer: ${{ steps.req.outputs.fixer }}
+      iter: ${{ steps.req.outputs.iter }}
+      head: ${{ steps.req.outputs.head }}
+      base: ${{ steps.req.outputs.base }}
+    steps:
+      - name: Resolve the request
+        id: req
+        env:
+          EVENT: ${{ github.event_name }}
+          COMMENT: ${{ github.event.comment.body }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          ISSUE: ${{ github.event.issue.number }}
+          IN_PR: ${{ github.event.inputs.pr }}
+          IN_MODE: ${{ github.event.inputs.mode }}
+          IN_REVIEWER: ${{ github.event.inputs.reviewer_model }}
+          IN_EFFORT: ${{ github.event.inputs.reviewer_effort }}
+          IN_FIXER: ${{ github.event.inputs.fixer_model }}
+          IN_ITER: ${{ github.event.inputs.max_iterations }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          # The loop spends model credits, runs the PR's code with the model keys in its environment,
+          # and pushes to the PR's branch: only maintainers (write access now, as GitHub reports it)
+          # may start it. Their `/autofix` says they have read the diff and trust its code to run.
+          # Anyone else is ignored without a run; a failed lookup counts as no access.
+          allowed() {
+            # `role_name` names the role; `permission` reports maintain as write.
+            perm=$(gh api "repos/$REPO/collaborators/$1/permission" --jq .role_name 2>/dev/null) || return 1
+            case "$perm" in admin|maintain|write) return 0;; *) return 1;; esac
+          }
+          refuse() { echo "go=false" >> "$GITHUB_OUTPUT"; echo "::notice::$1 has no write access; nothing to do"; exit 0; }
+          if [ "$EVENT" = "issue_comment" ]; then
+            # The command is the comment's first non-blank line, so leading blank lines do not hide it.
+            command=$(printf '%s\n' "$COMMENT" | awk 'NF { print $1; exit }')
+            case "$command" in
+              /autofix) mode=autofix;;
+              *) echo "go=false" >> "$GITHUB_OUTPUT"; echo "not a loop command"; exit 0;;
+            esac
+            allowed "$COMMENTER" || refuse "$COMMENTER"
+            # 👀 on the command: it was seen and a run is starting. A reaction that fails starts the run anyway.
+            gh api -X POST "repos/$REPO/issues/comments/$COMMENT_ID/reactions" -f content=eyes --silent || true
+            pr="$ISSUE"; reviewer=gpt-6.1-sol; effort=high; fixer=claude-opus-5-5-fast; iter=3
+          else
+            allowed "$ACTOR" || refuse "$ACTOR"
+            pr="$IN_PR"; mode="$IN_MODE"; reviewer="$IN_REVIEWER"; effort="$IN_EFFORT"
+            fixer="$IN_FIXER"; iter="$IN_ITER"
+          fi
+          case "$pr" in ''|*[!0-9]*) echo "::error::bad PR number"; exit 1;; esac
+          case "$iter" in ''|*[!0-9]*) echo "::error::bad max_iterations"; exit 1;; esac
+          meta=$(gh api "repos/$REPO/pulls/$pr")
+          # A fork's branch takes the App's push only when its author allows edits by maintainers;
+          # without that, the loop can review but has nowhere to put fixes.
+          fork=$(jq -r '.head.repo.full_name != .base.repo.full_name' <<<"$meta")
+          if [ "$fork" = true ] && [ "$(jq -r .maintainer_can_modify <<<"$meta")" != true ] && [ "$mode" = autofix ]; then
+            echo "::notice::the fork does not allow edits by maintainers; reviewing only"
+            mode=review
+          fi
+          # The commit the maintainer read when they asked, checked out by SHA: the run starts later
+          # (and may wait behind another run), and a push in between is code nobody approved. The
+          # loop stops if the PR's head moves during the run. Fetched from this repository, which
+          # has all of the base branch's history; fixes go to the PR's branch wherever it lives.
+          head=$(jq -r .head.sha <<<"$meta")
+          base=$(jq -r .base.ref <<<"$meta")
+          {
+            echo "go=true"; echo "pr=$pr"; echo "mode=$mode"; echo "iter=$iter"; echo "head=$head"
+            echo "base=$base"
+            echo "reviewer=$reviewer"; echo "effort=$effort"; echo "fixer=$fixer"
+          } >> "$GITHUB_OUTPUT"
+          echo "PR #$pr ($head): $mode, reviewer $reviewer ($effort), fixer $fixer, up to $iter rounds"
+
+  loop:
+    needs: request
+    if: needs.request.outputs.go == 'true'
+    # One loop per PR at a time; a second request waits rather than racing the first on the branch.
+    concurrency:
+      group: review-loop-${{ needs.request.outputs.pr }}
+      cancel-in-progress: false
+    # GitHub-hosted only: the PR's code runs here with the model keys in its environment, and only a
+    # hosted runner is a fresh machine thrown away after the job.
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Check out the loop
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.REVIEW_LOOP_REPO }}
+          ssh-key: ${{ secrets.REVIEW_LOOP_DEPLOY_KEY }}
+          path: tools
+          sparse-checkout: .review-loop
+          persist-credentials: false
+
+      - name: Check out the PR
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.request.outputs.head }}
+          path: hermes-infino
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The Hermes releases CI tests against (tests.yml), each beside the PR with its own locked
+      # environment, so the loop's tests are CI's tests.
+      - name: Check out Hermes v0.23.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: v0.23.0
+          path: hermes/v0.23.0
+          persist-credentials: false
+
+      - name: Check out Hermes v0.22.7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: v0.22.7
+          path: hermes/v0.22.7
+          persist-credentials: false
+
+      - name: Check out Hermes v0.22.6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: v0.22.6
+          path: hermes/v0.22.6
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          # The uv version Hermes pins in pm/lock.json, as tests.yml uses.
+          version: "0.13.5"
+          enable-cache: true
+          cache-dependency-glob: |
+            hermes/*/uv.lock
+            hermes-infino/pyproject.toml
+
+      # As tests.yml: Hermes's locked environment (Python 3.14, which Hermes pins), plus the plugin's
+      # dependencies. `hermes-pytest <release> [pytest args]` then runs pytest from the checkout it is
+      # called in, with that release's environment and source on the path; the loop's gates and the
+      # agents both use it.
+      - name: Install each release's environment
+        run: |
+          for h in hermes/*/; do
+            (cd "$h" && uv sync --locked --python 3.14 --group dev)
+            uv pip install --python "$h.venv" -r hermes-infino/pyproject.toml --extra test
+          done
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
+          cat > "$bin/hermes-pytest" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          release=${1:?usage: hermes-pytest <release> [pytest args]}; shift
+          h="$HERMES_ROOT/$release"
+          [ -x "$h/.venv/bin/python" ] || { echo "no Hermes $release; have: $(ls "$HERMES_ROOT")" >&2; exit 2; }
+          export VIRTUAL_ENV="$h/.venv" PATH="$h/.venv/bin:$PATH"
+          export PYTHONPATH="$PWD:$h${PYTHONPATH:+:$PYTHONPATH}"
+          # The tests' bytecode stays out of the checkout and the Hermes trees.
+          export PYTHONDONTWRITEBYTECODE=1
+          exec python -m pytest "$@"
+          EOF
+          chmod +x "$bin/hermes-pytest"
+          echo "$bin" >> "$GITHUB_PATH"
+          echo "HERMES_ROOT=$GITHUB_WORKSPACE/hermes" >> "$GITHUB_ENV"
+
+      # The team's rules as the base branch has them. The PR's own copies are part of the change under
+      # review; the agents never take instructions from them.
+      - name: The base branch's rules
+        env:
+          BASE: ${{ needs.request.outputs.base }}
+        run: |
+          dir="$RUNNER_TEMP/rules"
+          mkdir -p "$dir"
+          for f in CLAUDE.md CONTRIBUTING.md AGENTS.md; do
+            gh api "repos/$REPO/contents/$f?ref=$BASE" --jq .content 2>/dev/null | base64 -d > "$dir/$f" || true
+            [ -s "$dir/$f" ] || rm -f "$dir/$f"
+          done
+          ls "$dir"
+          echo "REVIEWLOOP_RULES_DIR=$dir" >> "$GITHUB_ENV"
+
+      - name: Install Claude Code and Codex
+        run: npm install -g @anthropic-ai/claude-code@2.1.319 @openai/codex@0.166.0
+
+      - name: Run the loop
+        env:
+          CLAUDE_CODE_USE_FOUNDRY: "1"
+          ANTHROPIC_FOUNDRY_API_KEY: ${{ secrets.OPUS_FOUNDRY_API_KEY }}
+          ANTHROPIC_FOUNDRY_BASE_URL: ${{ secrets.OPUS_FOUNDRY_BASE_URL }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          # The runner is a throwaway machine; Codex's own sandbox needs kernel features it may lack.
+          REVIEWLOOP_CODEX_NO_SANDBOX: "1"
+          # The loop mints the bot's installation token itself, and again before it expires (a token
+          # lasts an hour). The maintainer who comments `/autofix` has read the diff, so the PR's code
+          # running beside the key is code they chose to trust.
+          REVIEWER_APP_ID: ${{ secrets.REVIEWER_APP_ID }}
+          REVIEWER_APP_PRIVATE_KEY: ${{ secrets.REVIEWER_APP_PRIVATE_KEY }}
+          PR: ${{ needs.request.outputs.pr }}
+          MODE: ${{ needs.request.outputs.mode }}
+          REVIEWER: ${{ needs.request.outputs.reviewer }}
+          EFFORT: ${{ needs.request.outputs.effort }}
+          FIXER: ${{ needs.request.outputs.fixer }}
+          ITER: ${{ needs.request.outputs.iter }}
+          # Only comments by people with write access (and installed bots) reach the agents.
+          REVIEWLOOP_TRUST: writers
+        run: |
+          args=(--repo "$REPO" --pr "$PR" --workdir hermes-infino
+                --reviewer-model "$REVIEWER" --reviewer-effort "$EFFORT" --fixer-model "$FIXER"
+                --max-iterations "$ITER")
+          [ "$MODE" = review ] && args+=(--review-only)
+          uv run --project tools/.review-loop reviewloop "${args[@]}"
