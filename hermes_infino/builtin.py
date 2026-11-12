@@ -230,18 +230,23 @@ def consolidation_of(tool_call_id: str) -> list[str]:
 
 
 def _words(text: str) -> set[str]:
-    return set(re.findall(r"\w+", text.lower()))
+    """The words of an entry that say what it is about: lower-cased, without
+    STOP_WORDS and one-letter tokens (the "s" of "Dana's")."""
+    return {w for w in re.findall(r"\w+", text.lower()) if len(w) > 1 and w not in STOP_WORDS}
 
 
 def carried_into(removed: str, added: list[str]) -> list[str]:
-    """The entries of `added` that carry at least TIED_SHARE of the words of
-    `removed`: what a batch's removal was folded into. A batch also removes
-    and adds unrelated entries in one call ("forget X, remember Y"); a
-    removal no added entry carries is a forget, not an earlier version."""
+    """The entries of `added` that carry the entry `removed`: at least
+    TIED_MIN_WORDS of its words (_words) and TIED_SHARE of them. That is what
+    a batch's removal was folded into. A batch also removes and adds
+    unrelated entries in one call ("forget X, remember Y"), often about the
+    same person; a removal no added entry carries is a forget, not an earlier
+    version. When unsure, it is a forget."""
     words = _words(removed)
-    if not words:
+    if len(words) < TIED_MIN_WORDS:
         return []
-    return [a for a in added if len(words & _words(a)) >= TIED_SHARE * len(words)]
+    return [a for a in added
+            if len(words & _words(a)) >= max(TIED_MIN_WORDS, TIED_SHARE * len(words))]
 
 
 # -- replacements in flight, across processes --------------------------------------
@@ -250,48 +255,60 @@ def carried_into(removed: str, added: list[str]) -> list[str]:
 # entries (a patch, a consolidation) and have run in some process of the
 # profile without that process's provider having kept their earlier versions
 # yet (JSON: call id -> {"target": target, "left": operations to report,
-# "at": milliseconds}), and the lock its writers take. While one is noted, a
-# file comparison in any process leaves that target's stale rows for the next
-# comparison: deleting one first would leave the replacement nothing to keep.
+# "spans": the old_text of each, "at": milliseconds}), and the lock its
+# writers take. While one is noted, a file comparison in any process leaves
+# the target's stale rows that hold one of its spans for the next comparison:
+# deleting one first would leave the replacement nothing to keep. Every other
+# stale row (an approved removal, a hand edit) is deleted as before.
 REPLACING = "builtin_replacing.json"
 REPLACING_LOCK = "builtin_replacing.lock"
 # How long a note of a replacement in flight holds: past it, a process that
 # never reported the call (a crash, or Hermes's background review, which runs
 # with providers off) holds up no deletion.
 REPLACING_KEEP_MS = 60 * 1000
-# The share of a removed entry's words an added entry must carry to be what
-# the removal was folded into (carried_into).
-TIED_SHARE = 0.5
+# What an added entry must carry of a removed entry's words to be what the
+# removal was folded into (carried_into): this share of them, and at least
+# this many. A shared subject alone ("Dana", "User") never ties two entries.
+TIED_SHARE = 0.75
+TIED_MIN_WORDS = 2
+# Words that say nothing of what an entry is about, and the subject Hermes
+# writes USER.md entries under.
+STOP_WORDS = frozenset("""
+a an and are as at be been but by for from has have he her his i in is it its me my of on or our she so that
+the their them they this to was we were will with you your user users
+""".split())
 # The memory tool's operations whose earlier entry a provider keeps.
 REPLACING_ACTIONS = ("patch", "replace")
 
 
-def replacing_operations(args: Any) -> tuple[str, int]:
-    """A call of Hermes's memory tool's target and how many of its
-    operations may keep an earlier version: each patch, and each removal of a
-    batch that also adds."""
+def replacing_operations(args: Any) -> tuple[str, int, list[str]]:
+    """A call of Hermes's memory tool's target, how many of its operations
+    may keep an earlier version (each patch, and each removal of a batch that
+    also adds), and the text each of those names in the entry it replaces
+    (its `old_text`: Hermes's own match is that text within one entry)."""
     call = args if isinstance(args, dict) else {}
     target = str(call.get("target") or "")
     operations = call.get("operations")
     ops = [op for op in (operations if isinstance(operations, list) and operations else [call])
            if isinstance(op, dict)]
-    actions = [str(op.get("action") or "") for op in ops]
-    n = sum(a in REPLACING_ACTIONS for a in actions)
-    if "add" in actions:
-        n += actions.count("remove")
-    return target, n
+    adds = any(str(op.get("action") or "") == "add" for op in ops)
+    replacing_ops = [op for op in ops if str(op.get("action") or "") in REPLACING_ACTIONS
+                     or (adds and str(op.get("action") or "") == "remove")]
+    spans = [str(op.get("old_text")).strip() for op in replacing_ops
+             if isinstance(op.get("old_text"), str) and str(op.get("old_text")).strip()]
+    return target, len(replacing_ops), list(dict.fromkeys(spans))
 
 
 def note_replacing(state_dir: Path, tool_call_id: str, args: Any) -> None:
     """Before a call of Hermes's memory tool runs: note it while it replaces
     entries, so no comparison deletes their rows before they are kept."""
-    target, n = replacing_operations(args)
-    if not tool_call_id or not n or target not in FILES:
+    target, n, spans = replacing_operations(args)
+    if not tool_call_id or not n or not spans or target not in FILES:
         return
     config.make_private_dir(Path(state_dir))
     with lock(state_dir, REPLACING_LOCK, WRITERS_LOCK_WAIT_S):
         notes = _read_replacing(state_dir)
-        notes[tool_call_id] = {"target": target, "left": n, "at": _now_ms()}
+        notes[tool_call_id] = {"target": target, "left": n, "spans": spans, "at": _now_ms()}
         _write_replacing(state_dir, notes)
 
 
@@ -312,15 +329,31 @@ def done_replacing(state_dir: Path, tool_call_id: str, all_of_it: bool = False) 
         _write_replacing(state_dir, notes)
 
 
-def replacing(state_dir: Path) -> set[str]:
-    """The targets a replacement is in flight for (note_replacing), its note
-    younger than REPLACING_KEEP_MS. Raises when the note cannot be read."""
+def replacing(state_dir: Path) -> dict[str, list[str]]:
+    """Per target, the texts that name the entries a replacement in flight
+    replaces (note_replacing): a row holding one of them is that call's to
+    keep. Raises when the note cannot be read."""
     if not (Path(state_dir) / REPLACING).exists():
-        return set()
+        return {}
     with lock(state_dir, REPLACING_LOCK, WRITERS_LOCK_WAIT_S):
         notes = _read_replacing(state_dir)
-    oldest = _now_ms() - REPLACING_KEEP_MS
-    return {str(n.get("target")) for n in notes.values() if int(n.get("at") or 0) >= oldest}
+    out: dict[str, list[str]] = {}
+    for note in notes.values():
+        out.setdefault(str(note.get("target")), []).extend(str(s) for s in note.get("spans") or [] if s)
+    return out
+
+
+def _live(note: Any, now: int) -> bool:
+    """Whether a note of a replacement in flight still holds: made at most
+    REPLACING_KEEP_MS ago. One dated after now (a clock put back) holds no
+    longer, so a clock's step never holds deletions up past that time."""
+    if not isinstance(note, dict):
+        return False
+    try:
+        age = now - int(note.get("at") or 0)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= age <= REPLACING_KEEP_MS
 
 
 def _read_replacing(state_dir: Path) -> dict:
@@ -336,8 +369,8 @@ def _read_replacing(state_dir: Path) -> dict:
         return {}
     if not isinstance(notes, dict):
         return {}
-    oldest = _now_ms() - REPLACING_KEEP_MS
-    return {k: v for k, v in notes.items() if isinstance(v, dict) and int(v.get("at") or 0) >= oldest}
+    now = _now_ms()
+    return {k: v for k, v in notes.items() if _live(v, now)}
 
 
 def _write_replacing(state_dir: Path, notes: dict) -> None:
