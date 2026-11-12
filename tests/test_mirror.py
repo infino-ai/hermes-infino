@@ -604,6 +604,161 @@ def test_a_table_dropped_after_a_forget_gets_the_rest_again_never_the_forgotten(
     assert sorted(r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)) == ["m0", "m2"]
 
 
+def failing_forgotten(m: Mirror, status: int = 503) -> dict:
+    """Make the cloud fail every request about `forgotten` with `status`
+    while the returned switch's "down" is true: a failure that may pass."""
+    switch = {"down": True}
+    real_ensure, real_append, real_query = m.client.ensure_table, m.client.append, m.client.query_sql
+
+    def ensure(database, table, *a, **k):
+        if switch["down"] and table == tables.FORGOTTEN:
+            raise InfinoError(status, "unavailable")
+        return real_ensure(database, table, *a, **k)
+
+    def append(database, table, rows):
+        if switch["down"] and table == tables.FORGOTTEN:
+            raise InfinoError(status, "unavailable")
+        return real_append(database, table, rows)
+
+    def query(database, sql):
+        if switch["down"] and f"FROM {tables.FORGOTTEN} " in sql:
+            raise InfinoError(status, "unavailable")
+        return real_query(database, sql)
+
+    m.client.ensure_table, m.client.append, m.client.query_sql = ensure, append, query
+    return switch
+
+
+def forgotten_ids(platform, table: str = tables.MEMORY) -> list[str]:
+    return sorted(r[tables.ROW_ID] for r in platform.rows(TEAM_DB, tables.FORGOTTEN)
+                  if r[tables.FORGOTTEN_FROM] == table)
+
+
+def test_a_failure_to_make_forgotten_that_may_pass_never_takes_a_forget_for_a_drop(home, platform, tmp_path,
+                                                                                  monkeypatch):
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform))
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: f"r{i}", "content": f"secret {i}"} for i in range(5)])
+    m.sync(wait=True)
+    teammate = make_mirror(tmp_path / "teammate", sign_in(tmp_path / "teammate", platform))
+    teammate.forget_matching(tables.MEMORY, TEAM_DB, "content LIKE 'secret%'")
+    teammate.sync(wait=True)
+    mark = m.marks()[m.mark_of(tables.MEMORY)]
+    monkeypatch.setattr(mirror, "ENSURE_RETRY_S", 0.0)
+    # This machine's next process starts while the cloud fails on `forgotten`.
+    m = local_mirror(tmp_path, sign_in(tmp_path, platform))
+    switch = failing_forgotten(m)
+    with pytest.raises(mirror.ForgottenUnknown):
+        m.ensure_cloud_tables()  # the team database waits: it can't tell a forget from a drop yet
+    for _ in range(2):
+        with pytest.raises(mirror.ForgottenUnknown):
+            m.sync(wait=True)  # waits, and says why
+    assert m.marks()[m.mark_of(tables.MEMORY)] == mark
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    switch["down"] = False
+    m.sync(wait=True)
+    assert m.marks()[m.mark_of(tables.MEMORY)] == mark  # a forget, not a lost table
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+
+
+def test_a_forget_stays_queued_while_forgotten_may_be_there(home, platform, tmp_path, monkeypatch):
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform))
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "z", "content": "gone"}])
+    m.sync(wait=True)
+    monkeypatch.setattr(mirror, "ENSURE_RETRY_S", 3600.0)  # inside the back-off after a failure
+    m = local_mirror(tmp_path, sign_in(tmp_path, platform))
+    switch = failing_forgotten(m)
+    m.ensure_cloud_tables()
+    m.forget(tables.MEMORY, TEAM_DB, ["z"])
+    with pytest.raises(mirror.ForgottenUnknown):
+        m.sync(wait=True)
+    assert [r[tables.ROW_ID] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["z"]  # not deleted unrecorded
+    assert "z" in (m.dir / mirror.FORGET_FILE).read_text()
+    switch["down"] = False
+    monkeypatch.setattr(mirror, "ENSURE_RETRY_S", 0.0)
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == [] and forgotten_ids(platform) == ["z"]
+    assert (m.dir / mirror.FORGET_FILE).read_text() == ""
+
+
+def test_a_404_writing_forgotten_keeps_the_forget_queued(m, platform):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "z", "content": "gone"}])
+    m.sync(wait=True)
+    switch = failing_forgotten(m, status=404)
+    m.forget(tables.MEMORY, TEAM_DB, ["z"])
+    with pytest.raises(mirror.ForgottenUnknown):
+        m.sync(wait=True)
+    assert "z" in (m.dir / mirror.FORGET_FILE).read_text()  # not taken for its own table being gone
+    assert [r[tables.ROW_ID] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["z"]
+    switch["down"] = False
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == [] and forgotten_ids(platform) == ["z"]
+
+
+def test_a_retried_forget_records_its_ids_once(m, platform):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "z", "content": "gone"}])
+    m.sync(wait=True)
+    real = m.client.delete
+    failures = [InfinoError(503, "unavailable")]
+
+    def delete(*a):
+        if failures:
+            raise failures.pop()
+        return real(*a)
+
+    m.client.delete = delete
+    m.forget(tables.MEMORY, TEAM_DB, ["z"])
+    with pytest.raises(InfinoError):
+        m.sync(wait=True)  # recorded, then the delete failed: stays queued
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == [] and forgotten_ids(platform) == ["z"]
+
+
+def test_a_row_pushed_while_a_forget_by_match_runs_is_recorded_before_it_is_deleted(m, platform, tmp_path):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: f"r{i}", "content": f"secret {i}"} for i in range(3)])
+    m.sync(wait=True)
+    other = make_mirror(tmp_path / "other", sign_in(tmp_path / "other", platform))
+    real_query, deletes = m.client.query_sql, []
+
+    def query(database, sql):
+        found = real_query(database, sql)
+        if "LIKE 'secret%'" in sql and not deletes:
+            # Another machine's late row lands between the select and the delete.
+            other.client.append(TEAM_DB, tables.MEMORY, [{tables.ROW_ID: "late", "content": "secret late"}])
+        return found
+
+    real_delete = m.client.delete
+    m.client.query_sql = query
+    m.client.delete = lambda database, table, predicate: (deletes.append(predicate),
+                                                          real_delete(database, table, predicate))[1]
+    m.forget_matching(tables.MEMORY, TEAM_DB, "content LIKE 'secret%'")
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    assert forgotten_ids(platform) == ["late", "r0", "r1", "r2"]  # every row deleted is on record
+    assert all(d.startswith(f"{tables.ROW_ID} IN (") for d in deletes)  # by id, never by the match
+
+
+def test_rows_never_sent_are_not_what_a_lost_check_asks_about(home, platform, tmp_path):
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform))
+    platform.refused_marker = "BAD"
+    # Two team memories, one the cloud refuses, then many personal memories an
+    # older version left in the team's table: the latest rows up to the mark
+    # are all ones this machine never sent.
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "a0", "content": "team 0"},
+                                   {tables.ROW_ID: "a1", "content": "team 1"},
+                                   {tables.ROW_ID: "b", "content": "BAD"}]
+                   + [{tables.ROW_ID: f"p{i:02d}", "content": f"mine {i}", "scope": "personal"}
+                      for i in range(mirror.LOST_CHECK_ROWS + 8)])
+    m.sync(wait=True)
+    assert m.refused() == 1
+    assert sorted(r[tables.ROW_ID] for r in platform.rows(TEAM_DB, tables.MEMORY)) == ["a0", "a1"]
+    teammate = make_mirror(tmp_path / "teammate", sign_in(tmp_path / "teammate", platform))
+    teammate.forget(tables.MEMORY, TEAM_DB, ["a0", "a1"])
+    teammate.sync(wait=True)
+    mark = m.marks()[m.mark_of(tables.MEMORY)]
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform))
+    assert m.marks()[m.mark_of(tables.MEMORY)] == mark  # every row it sent was forgotten: not lost
+
+
 def test_nothing_is_pushed_while_a_cloud_table_lacks_a_column_it_cannot_get(home, platform, tmp_path):
     client_rows = [f for f in tables.MEMORY_SCHEMA if f["name"] != tables.CHAT]
     settings = sign_in(tmp_path, platform)

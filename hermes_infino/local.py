@@ -360,12 +360,6 @@ class LocalStore:
         found = self.query_sql(f"SELECT count(*) AS n FROM {table} WHERE {_after(mark, until_ms)}")
         return int(found[0]["n"]) if found else 0
 
-    def pushed_ids(self, table: str, upto_ms: int, limit: int) -> list[str]:
-        """The `row_id`s of the latest `limit` rows stored at or before `upto_ms`."""
-        found = self.query_sql(f"SELECT {tables.ROW_ID} FROM {table} WHERE {tables.STORED} <= {int(upto_ms)} "
-                               f"ORDER BY {tables.STORED} DESC, {tables.ROW_ID} DESC LIMIT {int(limit)}")
-        return [str(r[tables.ROW_ID]) for r in found]
-
     def has_row(self, table: str, row_id: str) -> bool:
         found = self.query_sql(f"SELECT count(*) AS n FROM {table} WHERE {tables.ROW_ID} = {tables.sql_string(row_id)}")
         return bool(found and found[0]["n"])
