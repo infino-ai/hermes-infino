@@ -88,7 +88,7 @@ def test_a_personal_database_adds_the_personal_sources(home, platform, tmp_path)
         assert (f"{PERSONAL_DB}/personal_{table}", m.personal, table, PERSONAL_DB) in sources
     assert f"{PERSONAL_DB}/{mirror.PERSONAL_MEMORY}" in [s[0] for s in sources]  # the mark kept since before
     # The person's database holds their memory and the conversations and traces kept personal.
-    assert set(platform.databases[PERSONAL_DB]) == set(tables.PERSONAL)
+    assert set(platform.databases[PERSONAL_DB]) == {*tables.PERSONAL, *tables.CLOUD_ONLY}
     # Nothing in the person's own tables has a source that goes to the team's database.
     assert all(s.database == PERSONAL_DB for s in m.sources() if s.store is m.personal)
 
@@ -536,6 +536,229 @@ def test_a_teammates_forget_of_this_machines_rows_never_looks_like_a_lost_table(
     assert len(platform.rows(TEAM_DB, tables.MEMORY)) == 3  # nothing pushed again
 
 
+@pytest.mark.parametrize("queued_as", ["ids", "match"])
+def test_a_teammates_forget_of_every_row_this_machine_pushed_is_not_pushed_back(m, platform, tmp_path, queued_as):
+    # A teammate's infino_forget matched every memory this machine pushed, by
+    # their ids (the cloud answered the lookup) or as the match (it did not).
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: f"r{i}", "content": f"secret {i}"} for i in range(5)])
+    m.sync(wait=True)
+    teammate = make_mirror(tmp_path / "teammate", sign_in(tmp_path / "teammate", platform))
+    if queued_as == "ids":
+        ids = teammate.matching_ids(tables.MEMORY, TEAM_DB, "content LIKE 'secret%'")
+        teammate.forget(tables.MEMORY, TEAM_DB, sorted(ids))
+    else:
+        teammate.forget_matching(tables.MEMORY, TEAM_DB, "content LIKE 'secret%'")
+    teammate.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    mark = m.marks()[m.mark_of(tables.MEMORY)]
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform))  # this machine's next process
+    assert m.marks()[m.mark_of(tables.MEMORY)] == mark  # a forget, not a lost table
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    # A row saved after the forget still goes.
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "later", "content": "saved after"}])
+    m.sync(wait=True)
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["saved after"]
+
+
+def test_a_forget_writes_the_ids_it_deletes_before_deleting_them(m, platform):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "a", "content": "kept"}, {tables.ROW_ID: "z", "content": "gone"}])
+    m.sync(wait=True)
+    seen = []
+    real = m.client.delete
+    m.client.delete = lambda *a: (seen.append(list(platform.rows(TEAM_DB, tables.FORGOTTEN))), real(*a))[1]
+    m.forget(tables.MEMORY, TEAM_DB, ["z"])
+    m.sync(wait=True)
+    [before] = seen
+    assert [(r[tables.FORGOTTEN_FROM], r[tables.ROW_ID]) for r in before] == [(tables.MEMORY, "z")]
+    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["kept"]
+
+
+def test_a_forget_where_forgotten_cannot_be_made_still_deletes(home, platform, tmp_path):
+    platform.refused_tables = {tables.FORGOTTEN}
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform))
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "z", "content": "gone"}])
+    m.sync(wait=True)
+    m.forget(tables.MEMORY, TEAM_DB, ["z"])
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    assert (m.dir / mirror.FORGET_FILE).read_text() == ""
+
+
+def test_a_forget_by_match_whose_table_is_gone_is_dropped(m, platform):
+    m.forget_matching("dropped_since", TEAM_DB, "content = 'x'")
+    m.sync(wait=True)
+    assert (m.dir / mirror.FORGET_FILE).read_text() == ""
+
+
+def test_a_table_dropped_after_a_forget_gets_the_rest_again_never_the_forgotten(m, platform, tmp_path):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: f"r{i}", "content": f"m{i}"} for i in range(3)])
+    m.sync(wait=True)
+    teammate = make_mirror(tmp_path / "teammate", sign_in(tmp_path / "teammate", platform))
+    teammate.forget(tables.MEMORY, TEAM_DB, ["r1"])
+    teammate.sync(wait=True)
+    del platform.databases[TEAM_DB][tables.MEMORY]  # dropped; `forgotten` still names r1
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform))
+    m.sync(wait=True)
+    # Its rows go again, but not the one forgotten before it was dropped.
+    assert sorted(r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)) == ["m0", "m2"]
+
+
+def failing_forgotten(m: Mirror, status: int = 503) -> dict:
+    """Make the cloud fail every request about `forgotten` with `status`
+    while the returned switch's "down" is true: a failure that may pass."""
+    switch = {"down": True}
+    real_ensure, real_append, real_query = m.client.ensure_table, m.client.append, m.client.query_sql
+
+    def ensure(database, table, *a, **k):
+        if switch["down"] and table == tables.FORGOTTEN:
+            raise InfinoError(status, "unavailable")
+        return real_ensure(database, table, *a, **k)
+
+    def append(database, table, rows):
+        if switch["down"] and table == tables.FORGOTTEN:
+            raise InfinoError(status, "unavailable")
+        return real_append(database, table, rows)
+
+    def query(database, sql):
+        if switch["down"] and f"FROM {tables.FORGOTTEN} " in sql:
+            raise InfinoError(status, "unavailable")
+        return real_query(database, sql)
+
+    m.client.ensure_table, m.client.append, m.client.query_sql = ensure, append, query
+    return switch
+
+
+def forgotten_ids(platform, table: str = tables.MEMORY) -> list[str]:
+    return sorted(r[tables.ROW_ID] for r in platform.rows(TEAM_DB, tables.FORGOTTEN)
+                  if r[tables.FORGOTTEN_FROM] == table)
+
+
+def test_a_failure_to_make_forgotten_that_may_pass_never_takes_a_forget_for_a_drop(home, platform, tmp_path,
+                                                                                  monkeypatch):
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform))
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: f"r{i}", "content": f"secret {i}"} for i in range(5)])
+    m.sync(wait=True)
+    teammate = make_mirror(tmp_path / "teammate", sign_in(tmp_path / "teammate", platform))
+    teammate.forget_matching(tables.MEMORY, TEAM_DB, "content LIKE 'secret%'")
+    teammate.sync(wait=True)
+    mark = m.marks()[m.mark_of(tables.MEMORY)]
+    monkeypatch.setattr(mirror, "ENSURE_RETRY_S", 0.0)
+    # This machine's next process starts while the cloud fails on `forgotten`.
+    m = local_mirror(tmp_path, sign_in(tmp_path, platform))
+    switch = failing_forgotten(m)
+    with pytest.raises(mirror.ForgottenUnknown):
+        m.ensure_cloud_tables()  # the team database waits: it can't tell a forget from a drop yet
+    for _ in range(2):
+        with pytest.raises(mirror.ForgottenUnknown):
+            m.sync(wait=True)  # waits, and says why
+    assert m.marks()[m.mark_of(tables.MEMORY)] == mark
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    switch["down"] = False
+    m.sync(wait=True)
+    assert m.marks()[m.mark_of(tables.MEMORY)] == mark  # a forget, not a lost table
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+
+
+def test_a_forget_stays_queued_while_forgotten_may_be_there(home, platform, tmp_path, monkeypatch):
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform))
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "z", "content": "gone"}])
+    m.sync(wait=True)
+    monkeypatch.setattr(mirror, "ENSURE_RETRY_S", 3600.0)  # inside the back-off after a failure
+    m = local_mirror(tmp_path, sign_in(tmp_path, platform))
+    switch = failing_forgotten(m)
+    m.ensure_cloud_tables()
+    m.forget(tables.MEMORY, TEAM_DB, ["z"])
+    with pytest.raises(mirror.ForgottenUnknown):
+        m.sync(wait=True)
+    assert [r[tables.ROW_ID] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["z"]  # not deleted unrecorded
+    assert "z" in (m.dir / mirror.FORGET_FILE).read_text()
+    switch["down"] = False
+    monkeypatch.setattr(mirror, "ENSURE_RETRY_S", 0.0)
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == [] and forgotten_ids(platform) == ["z"]
+    assert (m.dir / mirror.FORGET_FILE).read_text() == ""
+
+
+def test_a_404_writing_forgotten_keeps_the_forget_queued(m, platform):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "z", "content": "gone"}])
+    m.sync(wait=True)
+    switch = failing_forgotten(m, status=404)
+    m.forget(tables.MEMORY, TEAM_DB, ["z"])
+    with pytest.raises(mirror.ForgottenUnknown):
+        m.sync(wait=True)
+    assert "z" in (m.dir / mirror.FORGET_FILE).read_text()  # not taken for its own table being gone
+    assert [r[tables.ROW_ID] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["z"]
+    switch["down"] = False
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == [] and forgotten_ids(platform) == ["z"]
+
+
+def test_a_retried_forget_records_its_ids_once(m, platform):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "z", "content": "gone"}])
+    m.sync(wait=True)
+    real = m.client.delete
+    failures = [InfinoError(503, "unavailable")]
+
+    def delete(*a):
+        if failures:
+            raise failures.pop()
+        return real(*a)
+
+    m.client.delete = delete
+    m.forget(tables.MEMORY, TEAM_DB, ["z"])
+    with pytest.raises(InfinoError):
+        m.sync(wait=True)  # recorded, then the delete failed: stays queued
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == [] and forgotten_ids(platform) == ["z"]
+
+
+def test_a_row_pushed_while_a_forget_by_match_runs_is_recorded_before_it_is_deleted(m, platform, tmp_path):
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: f"r{i}", "content": f"secret {i}"} for i in range(3)])
+    m.sync(wait=True)
+    other = make_mirror(tmp_path / "other", sign_in(tmp_path / "other", platform))
+    real_query, deletes = m.client.query_sql, []
+
+    def query(database, sql):
+        found = real_query(database, sql)
+        if "LIKE 'secret%'" in sql and not deletes:
+            # Another machine's late row lands between the select and the delete.
+            other.client.append(TEAM_DB, tables.MEMORY, [{tables.ROW_ID: "late", "content": "secret late"}])
+        return found
+
+    real_delete = m.client.delete
+    m.client.query_sql = query
+    m.client.delete = lambda database, table, predicate: (deletes.append(predicate),
+                                                          real_delete(database, table, predicate))[1]
+    m.forget_matching(tables.MEMORY, TEAM_DB, "content LIKE 'secret%'")
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    assert forgotten_ids(platform) == ["late", "r0", "r1", "r2"]  # every row deleted is on record
+    assert all(d.startswith(f"{tables.ROW_ID} IN (") for d in deletes)  # by id, never by the match
+
+
+def test_rows_never_sent_are_not_what_a_lost_check_asks_about(home, platform, tmp_path):
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform))
+    platform.refused_marker = "BAD"
+    # Two team memories, one the cloud refuses, then many personal memories an
+    # older version left in the team's table: the latest rows up to the mark
+    # are all ones this machine never sent.
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "a0", "content": "team 0"},
+                                   {tables.ROW_ID: "a1", "content": "team 1"},
+                                   {tables.ROW_ID: "b", "content": "BAD"}]
+                   + [{tables.ROW_ID: f"p{i:02d}", "content": f"mine {i}", "scope": "personal"}
+                      for i in range(mirror.LOST_CHECK_ROWS + 8)])
+    m.sync(wait=True)
+    assert m.refused() == 1
+    assert sorted(r[tables.ROW_ID] for r in platform.rows(TEAM_DB, tables.MEMORY)) == ["a0", "a1"]
+    teammate = make_mirror(tmp_path / "teammate", sign_in(tmp_path / "teammate", platform))
+    teammate.forget(tables.MEMORY, TEAM_DB, ["a0", "a1"])
+    teammate.sync(wait=True)
+    mark = m.marks()[m.mark_of(tables.MEMORY)]
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform))
+    assert m.marks()[m.mark_of(tables.MEMORY)] == mark  # every row it sent was forgotten: not lost
+
+
 def test_nothing_is_pushed_while_a_cloud_table_lacks_a_column_it_cannot_get(home, platform, tmp_path):
     client_rows = [f for f in tables.MEMORY_SCHEMA if f["name"] != tables.CHAT]
     settings = sign_in(tmp_path, platform)
@@ -775,6 +998,30 @@ def test_a_teammates_forget_of_every_earlier_version_this_machine_pushed_is_not_
     assert len(platform.rows(TEAM_DB, tables.MEMORY)) == 3
 
 
+@pytest.mark.parametrize("queued_as", ["ids", "match"])
+def test_a_teammates_forget_of_a_memory_and_its_history_brings_neither_back(m, platform, tmp_path, queued_as):
+    # This machine keeps one memory, with the address it replaced in its
+    # history; a teammate forgets the memory and its history. Every row this
+    # machine pushed to both tables is gone from the cloud.
+    m.local.append(tables.MEMORY, [{tables.ROW_ID: "oak", "content": "Dana lives at 99 Oak Ave"}])
+    m.local.append(tables.HISTORY, [{tables.ROW_ID: "elm", "content": "Dana lives at 12 Elm St", tables.SUPERSEDED: 1,
+                                     tables.SUPERSEDED_BY: "Dana lives at 99 Oak Ave", tables.PRIOR_ROW_ID: "x"}])
+    m.sync(wait=True)
+    teammate = make_mirror(tmp_path / "teammate", sign_in(tmp_path / "teammate", platform))
+    for table, where in ((tables.MEMORY, "content LIKE '%Oak%'"), (tables.HISTORY, "content LIKE '%Elm%'")):
+        if queued_as == "ids":
+            teammate.forget(table, TEAM_DB, sorted(teammate.matching_ids(table, TEAM_DB, where)))
+        else:
+            teammate.forget_matching(table, TEAM_DB, where)
+    teammate.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    assert platform.rows(TEAM_DB, tables.HISTORY) == []
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform))  # this machine's next process
+    m.sync(wait=True)
+    assert platform.rows(TEAM_DB, tables.MEMORY) == []
+    assert platform.rows(TEAM_DB, tables.HISTORY) == []
+
+
 def test_a_dropped_database_gets_its_history_back_with_its_memory(m, platform):
     m.local.append(tables.MEMORY, [{"content": "standup is at ten"}])
     m.local.append(tables.HISTORY, [{"content": "standup is at nine", tables.SUPERSEDED: 1,
@@ -800,7 +1047,7 @@ def test_a_refused_history_table_is_asked_for_once_per_process(home, platform, t
                                      tables.SUPERSEDED_BY: "", tables.PRIOR_ROW_ID: "x"}])
     for _ in range(3):
         m.sync(wait=True)
-    assert asked == [tables.HISTORY]
+    assert [t for t in asked if t == tables.HISTORY] == [tables.HISTORY]
     assert m.refused_optional(TEAM_DB, tables.HISTORY)
     platform.refused_tables = set()
 

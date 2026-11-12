@@ -10,6 +10,9 @@ everything the team's agents remember, say, do and share.
   from tool plumbing, while the results stay searchable.
 - `traces`: every model call and tool call.
 - `skills`: the team's shared skills, one row per published version.
+- `forgotten`: the ids of the rows a forget deleted from the cloud, so a
+  machine whose rows a teammate forgot, every one, can tell that from a
+  dropped table (`mirror.py`). Cloud only: nothing on this machine.
 
 `conversations` and `traces` share `session_id` and `turn_id`, the grain a
 question joins them on: one turn is one user message, what answered it, and
@@ -94,6 +97,21 @@ HISTORY_SCHEMA = [f for f in MEMORY_SCHEMA if f["type"] != "embedding"] + [
 ]
 HISTORY_INDEXES = {"fts": [MEMORY_TEXT_COLUMN]}
 
+# The rows forgets deleted from the cloud, one row each, written before the
+# delete: the table it was in, its `row_id`, and when. A table dropped and
+# made again loses this machine's rows and has none of them here; a forget
+# of them has. It is in the same database as the rows, so a database dropped
+# and made again loses both. Ids only: never what was forgotten.
+FORGOTTEN = "forgotten"
+FORGOTTEN_FROM = "forgotten_from"
+FORGOTTEN_MS = "forgotten_ms"
+FORGOTTEN_SCHEMA = [
+    {"name": FORGOTTEN_FROM, "type": "utf8"},
+    {"name": ROW_ID, "type": "utf8"},
+    {"name": FORGOTTEN_MS, "type": "i64"},
+]
+FORGOTTEN_INDEXES: dict = {}
+
 CONVERSATIONS_SCHEMA = [
     {"name": ROW_ID, "type": "utf8"},
     {"name": STORED, "type": "i64"},
@@ -169,6 +187,9 @@ TEAM_TABLES = {
 # cannot be made there (a key that may not create tables) keeps its own rows
 # on this machine, and every other table syncs as before (ensure_optional).
 OPTIONAL = (HISTORY,)
+# Tables the cloud databases have and this machine does not (no rows of
+# them are kept or pushed here): optional too, made as OPTIONAL are.
+CLOUD_ONLY = {FORGOTTEN: (FORGOTTEN_SCHEMA, FORGOTTEN_INDEXES)}
 # A person's own database holds their personal memory and its history, and
 # the conversations and traces kept personal (privacy.py): a personal
 # profile's, a personal scheduled job's, a chat a personal job's output went to.
@@ -233,8 +254,8 @@ def ensure_optional(client: InfinoClient, database: str, table: str) -> None:
     """Create one of OPTIONAL in `database` unless it exists, with every
     column this version writes. Raises when it cannot be made: the caller
     keeps that table's rows on this machine, and the database's other tables
-    are not held up."""
-    schema, indexes = TEAM_TABLES[table]
+    are not held up. One of CLOUD_ONLY likewise."""
+    schema, indexes = TEAM_TABLES[table] if table in TEAM_TABLES else CLOUD_ONLY[table]
     client.ensure_table(database, table, schema, indexes)
     have = set(client.column_names(database, table))
     missing = [f for f in schema if f["name"] not in have]

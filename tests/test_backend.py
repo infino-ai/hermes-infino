@@ -101,7 +101,7 @@ def test_in_local_mode_nothing_is_scheduled(local_backend):
 
 def test_signing_in_drops_the_local_vectors_and_makes_the_cloud_tables(cloud_backend, platform):
     assert not cloud_backend.local.has_vectors() and not cloud_backend.personal.has_vectors()
-    assert set(platform.databases[TEAM_DB]) == set(tables.ALL)
+    assert set(platform.databases[TEAM_DB]) == {*tables.ALL, *tables.CLOUD_ONLY}
 
 
 def an_older_versions_personal_memory(b: Backend, database: str, personal: bool = False) -> None:
@@ -311,7 +311,7 @@ def test_a_forget_is_queued_for_the_cloud(cloud_backend, platform):
 def test_signed_in_queries_go_to_the_cloud(cloud_backend, platform):
     platform.databases[TEAM_DB][tables.SKILLS].append({"name": "from-the-cloud"})
     assert cloud_backend.query("SELECT name FROM skills") == [{"name": "from-the-cloud"}]
-    assert set(cloud_backend.table_names()) == set(tables.ALL)
+    assert set(cloud_backend.table_names()) == {*tables.ALL, *tables.CLOUD_ONLY}
 
 
 def test_a_sync_another_process_held_off_runs_again(cloud_backend, platform, tmp_path):

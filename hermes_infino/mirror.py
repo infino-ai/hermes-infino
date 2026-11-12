@@ -25,7 +25,12 @@ is dropped when the cloud has lost this machine's rows while this machine
 still has them - the cloud table was dropped and made again - so the new
 table gets this machine's rows. A teammate's `infino_forget` deletes rows of
 this machine from the cloud too, so a table counts as lost only when none of
-the last LOST_CHECK_ROWS rows pushed, nor the first, is in the cloud.
+the last LOST_CHECK_ROWS rows pushed, nor the first, is in the cloud, and
+not every one of them is in the database's `forgotten` table: each forget
+writes there the ids of the rows it deletes, before it deletes them, so a
+teammate's forget of every row this machine pushed is never pushed back. (A
+forget by a version before `forgotten`, or where it cannot be made, leaves
+no such record.)
 
 Nothing is pushed to a cloud database until its tables are right
 (`tables.ensure_all`): a database whose tables lack a column this version
@@ -98,6 +103,17 @@ from .local import LATE_COMMITS_FILE, LocalStore, append_line
 
 logger = logging.getLogger(__name__)
 
+
+class ForgottenUnknown(Exception):
+    """Whether rows were forgotten cannot be told now: making or reading a
+    database's `forgotten` failed in a way that may pass (a timeout, a 5xx).
+    The caller stops and tries again, never acting as if there were no record."""
+
+
+class ForgetUnfinished(Exception):
+    """A forget by match still finds rows after FORGET_MATCH_ROUNDS rounds:
+    it stays queued for the next sync."""
+
 STATE_FILE = "mirror.json"
 FORGET_FILE = "forget.jsonl"
 LOCK_FILE = "mirror.lock"
@@ -133,6 +149,10 @@ FORGET_BATCH = 100
 # The latest rows pushed that a table's loss is checked against (with the
 # first): a table is lost only when the cloud holds none of them.
 LOST_CHECK_ROWS = 32
+# Rounds a forget by match runs (select the matching ids, record them, delete
+# them by id) before it is left queued for the next sync: each round takes the
+# rows pushed while the one before ran.
+FORGET_MATCH_ROUNDS = 5
 # Seconds a forget waits for the cloud to say which rows match before it is
 # queued as its match instead.
 FORGET_LOOKUP_TIMEOUT_S = 5.0
@@ -230,6 +250,7 @@ class Mirror:
         # there keeps its own rows on this machine, holding up nothing else.
         self._optional_ready: set[tuple[str, str]] = set()
         self._optional_failed_at: dict[tuple[str, str], float] = {}
+        self._optional_errors: dict[tuple[str, str], Exception] = {}
         # Optional tables a database refused to make (a key that may not make
         # tables there): not asked again by this process.
         self._optional_refused: set[tuple[str, str]] = set()
@@ -286,8 +307,8 @@ class Mirror:
             self._tables_errors.pop(database, None)
             # The optional tables too, as best it can: one not made now is tried
             # when its rows are next pushed, and holds up nothing meanwhile.
-            for table in tables.OPTIONAL:
-                if personal and table not in tables.PERSONAL:
+            for table in (*tables.OPTIONAL, *tables.CLOUD_ONLY):
+                if personal and table in tables.TEAM_TABLES and table not in tables.PERSONAL:
                     continue
                 self._optional_made(database, table)
         if failures:
@@ -341,10 +362,28 @@ class Mirror:
             logger.warning("infino: %s.%s could not be made, so its rows stay on this machine (tried again in %d s); "
                            "everything else syncs: %s", database, table, ENSURE_RETRY_S, e)
             self._optional_failed_at[key] = time.monotonic()
+            self._optional_errors[key] = e
             return False
         self._optional_ready.add(key)
         self._optional_failed_at.pop(key, None)
+        self._optional_errors.pop(key, None)
         return True
+
+    def _forgotten_kept(self, database: str) -> bool:
+        """Whether cloud `database` keeps a `forgotten` record, making it when
+        it is not made yet. False when the database refused it (not asked
+        again by this process), and there is no record to read or write.
+        Raises ForgottenUnknown while a failure to make it may pass (a
+        timeout, a 5xx, the ENSURE_RETRY_S after one): the record may be
+        there, so no caller may act as if it were empty."""
+        key = (database, tables.FORGOTTEN)
+        if self._optional_made(database, tables.FORGOTTEN):
+            return True
+        if key in self._optional_refused or key in self._optional_outdated:
+            return False
+        raise ForgottenUnknown(f"{database}.{tables.FORGOTTEN} cannot be read now, so whether rows were forgotten "
+                               f"is not known (tried again in {int(ENSURE_RETRY_S)} s): "
+                               f"{self._optional_errors.get(key)}")
 
     def refused_optional(self, database: Optional[str], table: str) -> bool:
         """Whether cloud `database` refused to make optional `table` (asked
@@ -365,8 +404,10 @@ class Mirror:
         the oldest, is in the cloud, while this machine still has the row the
         mark points at. Many rows, pushed at different times, keep a
         teammate's forget of a few of them, or a cloud slow to show the
-        newest, from looking like a dropped table. The history of memories
-        is lost when its memory table is, and never on its own."""
+        newest, from looking like a dropped table; and a table whose rows
+        were all forgotten (each in `forgotten`) is not lost either. The
+        history of memories is lost when its memory table is, and never on
+        its own."""
         with sync_lock(self.dir):
             state = self._state()
             marks = self.marks()
@@ -381,14 +422,19 @@ class Mirror:
                 mark = marks.get(src.mark)
                 if mark is None or not src.store.has_row(src.table, mark[1]):
                     continue
-                oldest = src.store.rows_after(src.table, None, mark[0], 1)
-                latest = src.store.pushed_ids(src.table, mark[0], LOST_CHECK_ROWS)
-                ids = ", ".join(tables.sql_string(i) for i in
-                                {mark[1], *latest, *(str(r[tables.ROW_ID]) for r in oldest)})
+                probes = self._sent_probes(src, mark)
+                if not probes:
+                    continue  # nothing up to the mark was sent: nothing there to have lost
+                ids = ", ".join(tables.sql_string(i) for i in sorted(probes))
                 found = self.client.query_sql(
                     src.database, f"SELECT count(*) AS n FROM {src.table} WHERE {tables.ROW_ID} IN ({ids})")
-                if not (found and found[0].get("n")):
-                    lost.append(src.mark)
+                if found and found[0].get("n"):
+                    continue
+                # Raises while `forgotten` cannot be read: the database waits,
+                # its marks kept, and the check runs again (`_ensure`).
+                if self._forgotten(src, probes) == probes:
+                    continue  # a forget of every one of them, not a dropped table
+                lost.append(src.mark)
             # The history is lost exactly when the memory table beside it is:
             # a database dropped and made again. Its rows missing on their own
             # are a teammate's forget of earlier versions, and pushing them
@@ -402,12 +448,71 @@ class Mirror:
                 logger.info("infino: the cloud lost %s; pushing this machine's rows again", ", ".join(lost))
                 # Each row up to the dropped mark is asked about before it is
                 # sent again (the re-check): the cloud may still have some of
-                # them, and a row it has is not sent twice.
+                # them, and a row it has is not sent twice; a row in
+                # `forgotten`, deleted by a forget before the table was lost,
+                # is not sent at all.
                 rechecks = self._rechecks(state)
-                for mark in lost:
-                    rechecks[mark] = max(rechecks.get(mark, marks[mark]), marks[mark])
+                for k in lost:
+                    rechecks[k] = max(rechecks.get(k, marks[k]), marks[k])
                 self._save_state({k: v for k, v in marks.items() if k not in lost},
                                  str(state.get("last_error") or ""), self._in_flight(state), rechecks)
+
+    def _sent_probes(self, src: Source, mark: tuple[int, str]) -> set[str]:
+        """The rows a lost check asks the cloud for: the latest LOST_CHECK_ROWS
+        rows up to `mark`, and the oldest, among those this machine sent. A
+        row it never sent - set aside as refused (REFUSED_FILE), or a
+        personal memory in the team's own table (`_sendable`) - is not in the
+        cloud whatever happened there, so it is not asked about."""
+        ms, row_id = int(mark[0]), tables.sql_string(mark[1])
+        where = (f"({tables.STORED} < {ms} OR ({tables.STORED} = {ms} AND {tables.ROW_ID} <= {row_id}))")
+        if src.store is self.local and src.table == tables.MEMORY:
+            where += f" AND (scope IS NULL OR scope != {tables.sql_string(recall.PERSONAL)})"
+        unsent = self._set_aside_ids(src)
+        if unsent:
+            where += f" AND {tables.ROW_ID} NOT IN ({', '.join(map(tables.sql_string, sorted(unsent)))})"
+        probes: set[str] = set()
+        for order, limit in (("DESC", LOST_CHECK_ROWS), ("ASC", 1)):
+            found = src.store.query_sql(f"SELECT {tables.ROW_ID} FROM {src.table} WHERE {where} "
+                                        f"ORDER BY {tables.STORED} {order}, {tables.ROW_ID} {order} LIMIT {limit}")
+            probes |= {str(r[tables.ROW_ID]) for r in found}
+        return probes
+
+    def _set_aside_ids(self, src: Source) -> set[str]:
+        """The ids of `src`'s rows the cloud refused outright (REFUSED_FILE)."""
+        try:
+            lines = (self.dir / REFUSED_FILE).read_text().splitlines()
+        except FileNotFoundError:
+            return set()
+        out = set()
+        for line in lines:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(e, dict) and (e.get("database"), e.get("table")) == (src.database, src.table):
+                out.add(str(e.get("row_id")))
+        return out
+
+    def _forgotten(self, src: Source, ids: set[str]) -> set[str]:
+        """The rows of `ids` in `src`'s database's `forgotten`: deleted from
+        `src`'s table by a forget. A database that refused to make it has no
+        forget on record; one where that is not known yet raises
+        ForgottenUnknown (`_forgotten_kept`)."""
+        if not ids or not self._forgotten_kept(src.database):
+            return set()
+        return self._recorded(src.database, src.table, ids)
+
+    def _recorded(self, database: str, table: str, ids: set[str]) -> set[str]:
+        """The rows of `ids` that `database`'s `forgotten` names for `table`."""
+        out: set[str] = set()
+        ordered = sorted(ids)
+        for start in range(0, len(ordered), FORGET_BATCH):
+            found = self.client.query_sql(
+                database, f"SELECT {tables.ROW_ID} FROM {tables.FORGOTTEN} WHERE {tables.FORGOTTEN_FROM} = "
+                          f"{tables.sql_string(table)} AND {tables.ROW_ID} IN "
+                          f"({', '.join(map(tables.sql_string, ordered[start:start + FORGET_BATCH]))})")
+            out |= {str(r.get(tables.ROW_ID)) for r in found}
+        return out & ids
 
     # -- state ---------------------------------------------------------------
 
@@ -679,10 +784,12 @@ class Mirror:
             fcntl.flock(f, fcntl.LOCK_UN)
 
     def _not_in_cloud(self, src: Source, rows: list[dict]) -> list[dict]:
-        """The rows of a batch the cloud does not have."""
+        """The rows of a batch the cloud does not have, nor had and forgot
+        (in `forgotten`)."""
         ids = ", ".join(tables.sql_string(str(r[tables.ROW_ID])) for r in rows)
         have = {str(r.get(tables.ROW_ID)) for r in self.client.query_sql(
             src.database, f"SELECT {tables.ROW_ID} FROM {src.table} WHERE {tables.ROW_ID} IN ({ids})")}
+        have |= self._forgotten(src, {str(r[tables.ROW_ID]) for r in rows} - have)
         return [r for r in rows if str(r[tables.ROW_ID]) not in have]
 
     def unpushed(self) -> bool:
@@ -813,12 +920,64 @@ class Mirror:
             fcntl.flock(f, fcntl.LOCK_UN)
 
     def _delete(self, entry: dict) -> None:
-        """Delete in the cloud what one queued forget names: the rows matching
-        its predicate, or its rows by id, FORGET_BATCH ids per request."""
-        if entry.get("predicate"):
-            self.client.delete(entry["database"], entry["table"], entry["predicate"])
+        """Delete in the cloud what one queued forget names, by id,
+        FORGET_BATCH ids per request, each batch written to `forgotten` first
+        (`_note_forgotten`): its rows by id, or the ids matching its
+        predicate. Those are deleted by id too, never by the predicate, so a
+        row pushed after the select is not deleted without a record; the
+        select runs again for such rows, up to FORGET_MATCH_ROUNDS times."""
+        database, table = entry["database"], entry["table"]
+        if not entry.get("predicate"):
+            self._delete_ids(database, table, list(entry["row_ids"]))
             return
-        ids = list(entry["row_ids"])
+        deleted: set[str] = set()
+        for _ in range(FORGET_MATCH_ROUNDS):
+            matched = self._matching(database, table, entry["predicate"]) - deleted
+            if not matched:
+                return
+            self._delete_ids(database, table, sorted(matched))
+            deleted |= matched
+        if self._matching(database, table, entry["predicate"]) - deleted:
+            raise ForgetUnfinished(f"rows of {database}.{table} still match a forget after {FORGET_MATCH_ROUNDS} "
+                                   f"rounds; it stays queued for the next sync")
+
+    def _matching(self, database: str, table: str, predicate: str) -> set[str]:
+        """The ids of `table`'s cloud rows matching `predicate`. A table that
+        is gone answers 404: the platform answers a query of one with a 400."""
+        try:
+            matched = self.client.query_sql(database, f"SELECT {tables.ROW_ID} FROM {table} WHERE {predicate}")
+        except InfinoError:
+            if table not in self.client.list_tables(database):
+                raise InfinoError(404, f"no table {table} in {database}") from None
+            raise
+        return {str(r[tables.ROW_ID]) for r in matched if r.get(tables.ROW_ID)}
+
+    def _delete_ids(self, database: str, table: str, ids: list[str]) -> None:
         for start in range(0, len(ids), FORGET_BATCH):
-            chunk = ", ".join(tables.sql_string(i) for i in ids[start:start + FORGET_BATCH])
-            self.client.delete(entry["database"], entry["table"], f"{tables.ROW_ID} IN ({chunk})")
+            chunk = ids[start:start + FORGET_BATCH]
+            self._note_forgotten(database, table, chunk)
+            self.client.delete(database, table, f"{tables.ROW_ID} IN ({', '.join(map(tables.sql_string, chunk))})")
+
+    def _note_forgotten(self, database: str, table: str, ids: list[str]) -> None:
+        """Write the ids a forget is about to delete to `database`'s
+        `forgotten`, so the machines that pushed them take the delete for a
+        forget, not a dropped table (`_drop_lost_marks`). Ids already there
+        (an earlier try of the same forget) are not written again.
+
+        Where the database refused to make `forgotten` the delete goes ahead
+        without it. Where that is not known yet, or writing fails, this
+        raises ForgottenUnknown, never an InfinoError: the forget stays
+        queued, and a 404 from `forgotten` is not taken for its own table
+        being gone (`_apply_forgets`)."""
+        if not ids or not self._forgotten_kept(database):
+            return
+        try:
+            new = [i for i in ids if i not in self._recorded(database, table, set(ids))]
+            now = _now_ms()
+            for start in range(0, len(new), PUSH_BATCH):
+                self.client.append(database, tables.FORGOTTEN, [
+                    {tables.FORGOTTEN_FROM: table, tables.ROW_ID: i, tables.FORGOTTEN_MS: now}
+                    for i in new[start:start + PUSH_BATCH]])
+        except InfinoError as e:
+            raise ForgottenUnknown(f"the ids a forget deletes could not be written to {database}."
+                                   f"{tables.FORGOTTEN}, so it stays queued: {e}") from e

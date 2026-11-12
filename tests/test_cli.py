@@ -176,7 +176,7 @@ def test_login_keeps_a_personal_database(home, platform, tmp_path, terminal):
     terminal("yes")
     assert run("login", "--url", platform.url, "--team-database", TEAM_DB, "--personal-database", "me") == 0
     assert config.read_credentials(tmp_path)["personal_database"] == "me"
-    assert set(platform.databases["me"]) == set(tables.PERSONAL)
+    assert set(platform.databases["me"]) == {*tables.PERSONAL, *tables.CLOUD_ONLY}
 
 
 def personal_database_of(home_dir) -> str:
@@ -194,7 +194,7 @@ def test_login_makes_a_personal_database_by_default(home, platform, tmp_path, te
     assert run("login", "--url", platform.url, "--team-database", TEAM_DB) == 0
     personal = personal_database_of(tmp_path)
     assert personal.startswith(TEAM_DB + cli.PERSONAL_PART)
-    assert set(platform.databases[personal]) == set(tables.PERSONAL)
+    assert set(platform.databases[personal]) == {*tables.PERSONAL, *tables.CLOUD_ONLY}
     out = capsys.readouterr().out
     assert cli.NEW_PERSONAL_DATABASE in out and f"Your personal database is '{personal}'" in out
 

@@ -33,7 +33,7 @@ LATER_S = 0.01
 
 def test_team_tables_are_created(env, platform, tmp_path):
     make_manager(tmp_path)
-    assert set(platform.databases[TEAM_DB]) == set(tables.ALL)
+    assert set(platform.databases[TEAM_DB]) == {*tables.ALL, *tables.CLOUD_ONLY}
     embedding = [f for f in platform.schemas[(TEAM_DB, tables.MEMORY)] if f["name"] == "embedding"][0]
     assert embedding == {"name": "embedding", "type": "embedding", "source": ["content"], "nullable": False}
     # The local copy has every table; signed in, the cloud embeds, so it carries no vectors.
@@ -45,7 +45,7 @@ def test_personal_database_holds_the_personal_tables_only(env, platform, tmp_pat
     # Personal memory, and personal conversations and traces; never skills.
     env.setenv("INFINO_PERSONAL_DATABASE", PERSONAL_DB)
     make_manager(tmp_path)
-    assert set(platform.databases[PERSONAL_DB]) == set(tables.PERSONAL)
+    assert set(platform.databases[PERSONAL_DB]) == {*tables.PERSONAL, *tables.CLOUD_ONLY}
 
 
 def test_account_at_its_database_limit_still_gets_its_tables(env, platform, tmp_path):
@@ -684,7 +684,7 @@ def test_settings_come_from_the_tools_config_block(home, platform, tmp_path):
     # Run as a script, the launcher reads the environment Hermes started it with, not the config.
     assert config.load(tmp_path, from_config=False).team_database == "a-different-team"
     make_manager(tmp_path)
-    assert set(platform.databases[TEAM_DB]) == set(tables.ALL)
+    assert set(platform.databases[TEAM_DB]) == {*tables.ALL, *tables.CLOUD_ONLY}
 
 
 def test_an_unset_key_reference_keeps_the_profile_local(home, platform, tmp_path):

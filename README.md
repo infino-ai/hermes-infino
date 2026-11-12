@@ -20,7 +20,13 @@ The plugin keeps five tables.
 - `superseded_by` names a replacement only when it was written for the same chat. A group's note never shows in the team's history.
 - Any other removal deletes, as before: a removal on its own (how the agent forgets when it is asked to), a removal approved with `/memory approve`, an entry deleted from the file by hand.
 
-Forgetting is total. `infino_forget` deletes a memory and every earlier version of it, following `superseded_by` back through the history, on every machine's copy in the cloud. It also takes the entry out of `MEMORY.md` or `USER.md`, so it is not found again: only an entry with exactly that text, only from the file whose memories are in the scope asked for, and from `USER.md` also without the "About <name>: " its memories carry for this profile's people. A machine that still holds a memory a teammate forgot makes no history of it, and history rows a teammate forgot are not pushed back.
+Forgetting is total. `infino_forget` deletes a memory and every earlier version of it, following `superseded_by` back through the history, on every machine's copy in the cloud. It also takes the entry out of `MEMORY.md` or `USER.md`, so it is not found again: only an entry with exactly that text, only from the file whose memories are in the scope asked for, and from `USER.md` also without the "About <name>: " its memories carry for this profile's people. A machine that still holds a memory a teammate forgot makes no history of it, and pushes back none of what a teammate forgot, even when the forget took every memory that machine had pushed. The exceptions are below: a forget made by an older version, and a database dropped and made again.
+
+Each forget writes the ids of the rows it deletes, and nothing else of them, to a `forgotten` table in the same database, just before deleting them; a forget by match deletes the ids it wrote, not whatever matches by then. That is how a machine tells a teammate's forget of every row it pushed from a cloud table that was dropped and made again: after a drop it pushes its rows again, all but the ones in `forgotten`. While `forgotten` can't be made or read for a reason that may pass (a timeout, a server error), nothing is decided: forgets stay queued, and a machine that needs the record to tell a forget from a drop pushes nothing to that database until it can read it. These cases still push forgotten memories back:
+
+- A forget made by a version older than this one writes nothing to `forgotten`, so a machine whose every pushed memory such a forget took pushes them back.
+- `forgotten` lives in the same database as the rows. A database dropped and made again loses both, and every machine pushes all its rows again, forgotten ones included.
+- Where the cloud refuses to create `forgotten` (a key that may not create tables), forgets still delete, without that record.
 
 **`conversations`** logs every message of every session a person has with the agent, and who sent it. Tool calls and tool results have their own columns. A message stays in the log even after context compression or `/undo` removes it from the session. Scheduled jobs and subagents add no conversation rows; their model and tool calls are in `traces`.
 
@@ -93,7 +99,7 @@ When the ranking is not back in time, or the deployment does not offer it, recal
 
 The history lives in a table of its own, and `memory` keeps exactly the columns it had, so upgrading adds no column to any table a team already has. Where the cloud refuses to create `memory_history` (a key that may not create tables), the history stays on your machine and everything else syncs as before. After a refusal the plugin doesn't ask again until Hermes restarts, and recall reads this machine's history instead of searching the cloud's. A `memory_history` that exists but lacks a column a later version writes, which the key may not add, is still searched; only this machine's new history stays local.
 
-A version older than this one does not know `memory_history`. It neither reads nor deletes it, so downgrading loses nothing.
+A version older than this one does not know `memory_history` or `forgotten`. It neither reads nor deletes them, so downgrading loses nothing.
 
 ## Install
 
