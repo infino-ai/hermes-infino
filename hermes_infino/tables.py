@@ -10,9 +10,6 @@ everything the team's agents remember, say, do and share.
   from tool plumbing, while the results stay searchable.
 - `traces`: every model call and tool call.
 - `skills`: the team's shared skills, one row per published version.
-- `reviews`: code reviews, one row per finding or verdict, as a reviewing
-  agent drafted it and as the reviewer posted it, so how often a reviewer
-  changes the draft is a GROUP BY. In the team's database only.
 - `forgotten`: the ids of the rows a forget deleted from the cloud, so a
   machine whose rows a teammate forgot, every one, can tell that from a
   dropped table (`mirror.py`). Cloud only: nothing on this machine.
@@ -34,9 +31,9 @@ The same tables exist in two places: the local database (the engine's Python
 binding, under the profile's home), always; and the team's cloud database,
 once signed in. They differ in their embedding columns. In the cloud every
 table people or agents write text to has one, filled by the platform from
-that text as rows are appended, so `memory`, `conversations`, `traces`,
-`skills` and `reviews` are all searched by meaning there (hybrid: keyword +
-vector), by recall, the Infino tools and SuperGrep alike. Locally only
+that text as rows are appended, so `memory`, `conversations`, `traces`
+and `skills` are all searched by meaning there (hybrid: keyword + vector),
+by recall, the Infino tools and SuperGrep alike. Locally only
 `memory` has one, a 384-dimension vector this machine computes (`embed.py`).
 
 A person's own database, on this machine and in the cloud, has `PERSONAL`
@@ -55,10 +52,7 @@ TRACES = "traces"
 SKILLS = "skills"
 # Earlier versions of memories (see SUPERSEDED below).
 HISTORY = "memory_history"
-# Code reviews (see REVIEWS_SCHEMA below), and the outcomes a finding can have.
-REVIEWS = "reviews"
-REVIEW_OUTCOMES = ("kept", "edited", "dismissed", "added")
-ALL = (MEMORY, CONVERSATIONS, TRACES, SKILLS, HISTORY, REVIEWS)
+ALL = (MEMORY, CONVERSATIONS, TRACES, SKILLS, HISTORY)
 
 # The column the platform embeds, and the column it embeds from.
 EMBEDDING_COLUMN = "embedding"
@@ -180,41 +174,6 @@ SKILLS_SCHEMA = [
 SKILLS_INDEXES = {"fts": ["description", "content"]}
 SKILLS_SCHEMA.append({"name": EMBEDDING_COLUMN, "type": "embedding", "source": ["description", "content"]})
 
-# Code reviews (the `infino_record_review` tool): one row per finding of a
-# review a reviewing agent drafted or the reviewer added, and one per verdict
-# (`finding_id` empty), with what the draft said and what the reviewer
-# posted. Rows are never changed: once the reviewer's own review is in, each
-# finding's outcome (kept, edited, dismissed or added) is a new row with the
-# same repo, pr and finding_id, so a finding's newest row is its state and
-# the override rate is `outcome <> ''` grouped by reviewer and week. Columns a
-# query groups by, where memory holds free text.
-REVIEWS_SCHEMA = [
-    {"name": ROW_ID, "type": "utf8"},
-    {"name": STORED, "type": "i64"},
-    {"name": "repo", "type": "utf8"},               # owner/name
-    {"name": "pr", "type": "i64"},
-    {"name": "head_sha", "type": "utf8"},           # the commit the review read
-    {"name": "diff_fingerprint", "type": "utf8"},   # the diff's, so a rebase with the same changes matches
-    {"name": "finding_id", "type": "utf8"},         # the finding within the review ("" for the verdict)
-    {"name": "path", "type": "utf8"},
-    {"name": "line", "type": "i64"},
-    {"name": "domain", "type": "utf8"},             # correctness, concurrency, durability, public API, ...
-    {"name": "severity", "type": "utf8"},
-    {"name": "draft_text", "type": "large_utf8"},   # what the agent drafted
-    {"name": "final_text", "type": "large_utf8"},   # what the reviewer posted
-    {"name": "verdict_draft", "type": "utf8"},      # approve | comment | request_changes
-    {"name": "verdict_final", "type": "utf8"},
-    {"name": "outcome", "type": "utf8"},            # REVIEW_OUTCOMES, or "" on the draft's rows
-    {"name": "reviewer", "type": "utf8"},           # whose review it is: their GitHub handle
-    {"name": "author", "type": "utf8"},             # who the turn that recorded it was for
-    {"name": "profile", "type": "utf8"},
-    {"name": "session_id", "type": "utf8"},         # the session that recorded it, in `conversations`
-    {"name": "created_ms", "type": "i64"},
-    {"name": EMBEDDING_COLUMN, "type": "embedding", "source": ["draft_text", "final_text"]},
-]
-REVIEWS_INDEXES = {"fts": ["draft_text", "final_text"]}
-
-
 
 def keyword_only(schema: list[dict]) -> list[dict]:
     """A table's columns without its embedding column, for a deployment the
@@ -235,12 +194,11 @@ TEAM_TABLES = {
     TRACES: (TRACES_SCHEMA, TRACES_INDEXES),
     SKILLS: (SKILLS_SCHEMA, SKILLS_INDEXES),
     HISTORY: (HISTORY_SCHEMA, HISTORY_INDEXES),
-    REVIEWS: (REVIEWS_SCHEMA, REVIEWS_INDEXES),
 }
 # Tables a cloud database may lack without holding up the others: one that
 # cannot be made there (a key that may not create tables) keeps its own rows
 # on this machine, and every other table syncs as before (ensure_optional).
-OPTIONAL = (HISTORY, REVIEWS)
+OPTIONAL = (HISTORY,)
 # Tables the cloud databases have and this machine does not (no rows of
 # them are kept or pushed here): optional too, made as OPTIONAL are.
 CLOUD_ONLY = {FORGOTTEN: (FORGOTTEN_SCHEMA, FORGOTTEN_INDEXES)}

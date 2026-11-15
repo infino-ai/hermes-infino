@@ -70,7 +70,6 @@ import logging
 import sys
 import threading
 import time
-import uuid
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Optional
@@ -125,11 +124,6 @@ SUBAGENT_CONTEXT = "subagent"
 TOOL_WRITE_CONTEXTS = (PRIMARY_CONTEXT, SUBAGENT_CONTEXT, "cron")
 # The tool that searches the person's own database.
 PERSONAL_SEARCH_TOOL = privacy.PERSONAL_READ_TOOLS[0]
-RECORD_REVIEW_TOOL = "infino_record_review"
-# What `infino_record_review` takes besides `repo`, `pr` and `line`: the text columns of `reviews`.
-REVIEW_TEXT_ARGS = ("head_sha", "diff_fingerprint", "finding_id", "path", "domain", "severity", "draft_text",
-                    "final_text", "verdict_draft", "verdict_final", "outcome", "reviewer")
-REVIEW_VERDICTS = ("approve", "comment", "request_changes")
 # Rows a personal search returns when the call names no number, and the most it may ask for.
 PERSONAL_SEARCH_K = 10
 MAX_PERSONAL_SEARCH_K = 50
@@ -1172,40 +1166,6 @@ class InfinoMemoryProvider(MemoryProvider):
                     "required": ["name"],
                 },
             },
-            {
-                "name": RECORD_REVIEW_TOOL,
-                "description": "Record a code review in the team's `reviews` table, one row per call: each "
-                               "finding of a review you drafted (finding_id, path, line, domain, severity, "
-                               "draft_text), the draft's verdict (finding_id empty, verdict_draft), and, once the "
-                               "reviewer's own review is in, each finding's outcome as a new row with the same "
-                               "repo, pr and finding_id: kept, edited (final_text is what they posted), dismissed, "
-                               "or added (a finding they raised that the draft did not), and verdict_final on the "
-                               "verdict's row. Rows are never changed: a finding's newest row is its state.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "repo": {"type": "string", "description": "owner/name"},
-                        "pr": {"type": "integer"},
-                        "head_sha": {"type": "string", "description": "the commit the review read"},
-                        "diff_fingerprint": {"type": "string"},
-                        "finding_id": {"type": "string", "description": "the finding's id within the review; "
-                                                                        "empty for the verdict"},
-                        "path": {"type": "string"},
-                        "line": {"type": "integer"},
-                        "domain": {"type": "string", "description": "correctness, concurrency, durability, "
-                                                                    "public API, performance, tests, ..."},
-                        "severity": {"type": "string"},
-                        "draft_text": {"type": "string", "description": "what the draft said"},
-                        "final_text": {"type": "string", "description": "what the reviewer posted"},
-                        "verdict_draft": {"type": "string", "enum": list(REVIEW_VERDICTS)},
-                        "verdict_final": {"type": "string", "enum": list(REVIEW_VERDICTS)},
-                        "outcome": {"type": "string", "enum": list(tables.REVIEW_OUTCOMES),
-                                    "description": "only once the reviewer's own review is in"},
-                        "reviewer": {"type": "string", "description": "whose review it is: their GitHub handle"},
-                    },
-                    "required": ["repo", "pr"],
-                },
-            },
         ] + personal_search
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
@@ -1283,8 +1243,6 @@ class InfinoMemoryProvider(MemoryProvider):
                 return json.dumps({"ok": True, "published": name})
             if tool_name == PERSONAL_SEARCH_TOOL:
                 return self._personal_search(args, chat)
-            if tool_name == RECORD_REVIEW_TOOL:
-                return self._record_review(args)
         except Exception as e:  # a tool reports its failure; it never raises into Hermes
             return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"})
         return json.dumps({"ok": False, "error": f"unknown tool {tool_name}"})
@@ -1318,32 +1276,6 @@ class InfinoMemoryProvider(MemoryProvider):
         return json.dumps({"ok": True, "table": table, "rows": [
             {c: (v[:PERSONAL_RESULT_CELL_CHARS] if isinstance(v, str) else v)
              for c, v in r.items() if v not in (None, "")} for r in rows]}, default=str)
-
-    def _record_review(self, args: dict[str, Any]) -> str:
-        """`infino_record_review`: one row of the team's `reviews`."""
-        repo = str(args.get("repo") or "").strip()
-        if not repo:
-            return json.dumps({"ok": False, "error": "repo is empty: give it as owner/name"})
-        try:
-            pr = int(args.get("pr"))
-            line = None if args.get("line") in (None, "") else int(args["line"])
-        except (TypeError, ValueError):
-            return json.dumps({"ok": False, "error": "pr and line must be whole numbers"})
-        row: dict[str, Any] = {c: str(args.get(c) or "").strip() for c in REVIEW_TEXT_ARGS}
-        if row["outcome"] and row["outcome"] not in tables.REVIEW_OUTCOMES:
-            return json.dumps({"ok": False, "error": f"outcome must be one of {', '.join(tables.REVIEW_OUTCOMES)}, "
-                                                     f"not {row['outcome']!r}"})
-        for verdict in ("verdict_draft", "verdict_final"):
-            if row[verdict] and row[verdict] not in REVIEW_VERDICTS:
-                return json.dumps({"ok": False, "error": f"{verdict} must be one of {', '.join(REVIEW_VERDICTS)}, "
-                                                         f"not {row[verdict]!r}"})
-        for c in ("draft_text", "final_text"):  # scrubbed of secrets as everything else leaving this machine is
-            row[c] = _clip(scrub(row[c]))
-        row.update({tables.ROW_ID: str(uuid.uuid4()), "repo": repo, "pr": pr, "line": line,
-                    "author": self._person(), "profile": self._profile, "session_id": self._session_id,
-                    "created_ms": _now_ms()})
-        self._append(tables.REVIEWS, [row])
-        return json.dumps({"ok": True, "row_id": row[tables.ROW_ID]})
 
     # -- lifecycle -----------------------------------------------------------
 
