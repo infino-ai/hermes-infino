@@ -34,7 +34,9 @@ Each forget writes the ids of the rows it deletes, and nothing else of them, to 
 
 **`skills`** holds the skills your agents share with `infino_publish_skill`. Once you sign in, every profile on the team can use them as read-only `infino:<name>` skills, from its next session. Only the profile's owner publishes: from their own sessions, and on a profile marked personal, from a direct message or a webhook route listed in `INFINO_OWNER_ROUTES`. A scheduled job publishes as the chat it was made in. One made where you weren't the one talking (an API server session, a gateway `/background` run, a Kanban worker, a message from another agent) can't publish. Group chat members, a shared profile's gateway users, hosted rooms and messages from other agents can't. Secrets are masked first. A shared skill's name can have only letters, digits, `-` and `_`, the only names Hermes loads a plugin's skills under. Set `INFINO_TEAM_SKILLS=off` to keep a profile to its own skills.
 
-A turn and its traces share a `session_id` and a `turn_id`, so you can join them. Every row has a `row_id`.
+**`reviews`** holds code reviews, one row per finding and one per verdict, recorded with `infino_record_review`: the repo, PR, commit, file and line, the finding's domain and severity, what a reviewing agent drafted, and what the reviewer posted. Rows are never changed. Once the reviewer's own review is in, each finding's outcome (`kept`, `edited`, `dismissed` or `added`) is a new row with the same `repo`, `pr` and `finding_id`, so a finding's newest row is its state, and how often a reviewer changes the draft is one query: `SELECT reviewer, avg(CASE WHEN outcome = 'kept' THEN 0.0 ELSE 1.0 END) FROM reviews WHERE outcome <> '' GROUP BY reviewer`. Reviews are the team's: they go to the team database only, never a personal one.
+
+A turn and its traces share a `session_id` and a `turn_id`, so you can join them. A review row names the `session_id` that recorded it. Every row has a `row_id`.
 
 Teammates read each other's memories, so a memory names people ("Dana prefers…") instead of saying "the user". Recalled memories are marked as reference material, so the agent doesn't follow them as instructions.
 
@@ -83,7 +85,7 @@ Once you sign in:
 - If the cloud is down, nothing is lost. The sync picks up where it stopped.
 - If the cloud refuses a row, it stays on your machine. `hermes infino status` counts such rows, names the file that lists them, and shows how far behind the cloud is in the sync.
 - Forgetting a memory deletes it from the cloud too.
-- The cloud embeds memories itself, so your machine no longer has to embed locally.
+- The cloud embeds what people and agents wrote, as each row arrives: `memory`, `conversations` (messages and tool results), `traces` (results and errors), `skills` and `reviews`. So every one of them is searched by meaning as well as by keyword, by recall, by the Infino tools and by SuperGrep, and your machine no longer has to embed locally. A deployment that runs no embedding server, or a key it gives none, gets keyword-only tables instead. Tables made by an earlier version keep the columns they were made with.
 - Recall reads from the cloud first. If the cloud is slow or can't be reached, recall searches your local machine.
 - Recall shows every source's current memories first. Earlier versions fill only what is left, each marked with when it was superseded and what replaced it, so the agent can tell an old fact from the current one, and history never pushes a current memory out.
 

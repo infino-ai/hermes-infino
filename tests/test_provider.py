@@ -31,7 +31,7 @@ from .helpers import (DM, GROUP, SKILL_MD, TEAM_DB, WRITE_WAIT_S, agent_tool_cal
 
 # What a provider declares before it starts, which is what Hermes routes by:
 # every tool, the personal search included (it is shown only where offered).
-TOOLS = ("infino_remember", "infino_forget", "infino_publish_skill", "infino_personal_search")
+TOOLS = ("infino_remember", "infino_forget", "infino_publish_skill", "infino_record_review", "infino_personal_search")
 # A scheduled job's run, as Hermes's scheduler names its session.
 CRON_SESSION = "cron_a1b2c3_20261105_070000"
 # What a recall put in front of the model: the provider's own block, a personal line in it.
@@ -82,6 +82,7 @@ def test_the_tools_and_their_required_arguments():
     assert schemas["infino_remember"]["parameters"]["required"] == ["content"]
     assert schemas["infino_forget"]["parameters"]["properties"]["scope"]["enum"] == ["team", "personal"]
     assert schemas["infino_publish_skill"]["parameters"]["required"] == ["name"]
+    assert schemas["infino_record_review"]["parameters"]["required"] == ["repo", "pr"]
 
 
 def test_the_setup_fields_are_the_settings():
@@ -111,6 +112,41 @@ def test_a_tool_call_missing_its_argument_reports_it(mgr):
     m, _ = mgr
     out = call(m, "infino_remember")
     assert out["ok"] is False and "KeyError" in out["error"]
+
+
+# -- reviews ---------------------------------------------------------------------
+
+def test_a_recorded_finding_is_a_team_row_with_its_columns(home, tmp_path):
+    home.setenv("INFINO_AUTHOR", "twin")
+    m, _ = make_manager(tmp_path, agent_identity="twin-ekechinwokah", session_id="s7")
+    out = call(m, "infino_record_review", repo="infino-ai/infino", pr=1337, head_sha="94534fc", finding_id="f1",
+               path="src/a.rs", line=42, domain="correctness", severity="high", draft_text="off by one",
+               reviewer="ekechinwokah")
+    assert out["ok"] is True
+    [row] = local_rows(tmp_path, tables.REVIEWS)
+    assert row["row_id"] == out["row_id"]
+    assert (row["repo"], row["pr"], row["finding_id"], row["path"], row["line"], row["draft_text"], row["outcome"],
+            row["reviewer"], row["profile"], row["session_id"]) == (
+        "infino-ai/infino", 1337, "f1", "src/a.rs", 42, "off by one", "", "ekechinwokah", "twin-ekechinwokah", "s7")
+
+
+def test_an_outcome_is_a_new_row_and_the_draft_is_kept(mgr, tmp_path):
+    m, _ = mgr
+    call(m, "infino_record_review", repo="o/r", pr=1, finding_id="f1", draft_text="race on close")
+    call(m, "infino_record_review", repo="o/r", pr=1, finding_id="f1", outcome="edited", final_text="race on drop")
+    rows = local_rows(tmp_path, tables.REVIEWS)
+    assert [(r["outcome"], r["draft_text"], r["final_text"]) for r in rows] == [
+        ("", "race on close", ""), ("edited", "", "race on drop")]
+
+
+def test_a_review_with_an_unknown_outcome_or_verdict_is_refused(mgr, tmp_path):
+    m, _ = mgr
+    assert "outcome must be one of" in call(m, "infino_record_review", repo="o/r", pr=1, outcome="ignored")["error"]
+    assert "verdict_draft must be one of" in call(m, "infino_record_review", repo="o/r", pr=1,
+                                                  verdict_draft="lgtm")["error"]
+    assert "whole numbers" in call(m, "infino_record_review", repo="o/r", pr="one")["error"]
+    assert "repo is empty" in call(m, "infino_record_review", repo=" ", pr=1)["error"]
+    assert local_rows(tmp_path, tables.REVIEWS) == []
 
 
 # -- memory ----------------------------------------------------------------------

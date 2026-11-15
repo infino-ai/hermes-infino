@@ -151,6 +151,31 @@ def test_a_platform_with_no_embedding_server_gets_a_keyword_only_memory(home, pl
     assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["found by keyword"]
 
 
+def test_the_cloud_embeds_every_table_people_and_agents_write_text_to(home, platform, tmp_path):
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform))
+    m.local.append(tables.REVIEWS, [{"repo": "o/r", "pr": 1, "draft_text": "race on close"}])
+    m.sync(wait=True)
+    for table in (tables.MEMORY, tables.CONVERSATIONS, tables.TRACES, tables.SKILLS, tables.REVIEWS):
+        assert tables.EMBEDDING_COLUMN in m.client.column_names(TEAM_DB, table), table
+    assert [r["draft_text"] for r in platform.rows(TEAM_DB, tables.REVIEWS)] == ["race on close"]
+
+
+def test_a_platform_with_no_embedding_server_gets_keyword_only_tables(home, platform, tmp_path):
+    platform.no_embedding_server = True
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform))
+    m.local.append(tables.REVIEWS, [{"repo": "o/r", "pr": 1, "draft_text": "found by keyword"}])
+    m.sync(wait=True)
+    for table in (tables.CONVERSATIONS, tables.TRACES, tables.SKILLS, tables.REVIEWS):
+        assert tables.EMBEDDING_COLUMN not in m.client.column_names(TEAM_DB, table), table
+    assert [r["draft_text"] for r in platform.rows(TEAM_DB, tables.REVIEWS)] == ["found by keyword"]
+
+
+def test_reviews_are_never_made_in_a_personal_database(home, platform, tmp_path):
+    m = make_mirror(tmp_path, sign_in(tmp_path, platform, personal_database="mine"))
+    m.sync(wait=True)
+    assert tables.REVIEWS not in platform.databases.get(m.settings.personal_database, {})
+
+
 def test_without_a_personal_database_personal_transcripts_go_nowhere(m, platform):
     m.personal.append(tables.TRACES, [{"session_id": "mine", "kind": "model", "result": "private"}])
     m.sync(wait=True)

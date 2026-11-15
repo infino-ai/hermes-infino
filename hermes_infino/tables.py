@@ -10,6 +10,9 @@ everything the team's agents remember, say, do and share.
   from tool plumbing, while the results stay searchable.
 - `traces`: every model call and tool call.
 - `skills`: the team's shared skills, one row per published version.
+- `reviews`: code reviews, one row per finding or verdict, as a reviewing
+  agent drafted it and as the reviewer posted it, so how often a reviewer
+  changes the draft is a GROUP BY. In the team's database only.
 - `forgotten`: the ids of the rows a forget deleted from the cloud, so a
   machine whose rows a teammate forgot, every one, can tell that from a
   dropped table (`mirror.py`). Cloud only: nothing on this machine.
@@ -29,9 +32,12 @@ wrote the row, where `created_ms` (when the thing happened) is not.
 
 The same tables exist in two places: the local database (the engine's Python
 binding, under the profile's home), always; and the team's cloud database,
-once signed in. They differ in one column: locally, `memory.embedding` is a
-384-dimension vector this machine computes (`embed.py`); in the cloud it is
-the platform's embedding column, which the platform fills from `content`.
+once signed in. They differ in their embedding columns. In the cloud every
+table people or agents write text to has one, filled by the platform from
+that text as rows are appended, so `memory`, `conversations`, `traces`,
+`skills` and `reviews` are all searched by meaning there (hybrid: keyword +
+vector), by recall, the Infino tools and SuperGrep alike. Locally only
+`memory` has one, a 384-dimension vector this machine computes (`embed.py`).
 
 A person's own database, on this machine and in the cloud, has `PERSONAL`
 of them: their memory, and the conversations and traces kept personal.
@@ -49,7 +55,10 @@ TRACES = "traces"
 SKILLS = "skills"
 # Earlier versions of memories (see SUPERSEDED below).
 HISTORY = "memory_history"
-ALL = (MEMORY, CONVERSATIONS, TRACES, SKILLS, HISTORY)
+# Code reviews (see REVIEWS_SCHEMA below), and the outcomes a finding can have.
+REVIEWS = "reviews"
+REVIEW_OUTCOMES = ("kept", "edited", "dismissed", "added")
+ALL = (MEMORY, CONVERSATIONS, TRACES, SKILLS, HISTORY, REVIEWS)
 
 # The column the platform embeds, and the column it embeds from.
 EMBEDDING_COLUMN = "embedding"
@@ -129,6 +138,8 @@ CONVERSATIONS_SCHEMA = [
     {"name": "created_ms", "type": "i64"},
 ]
 CONVERSATIONS_INDEXES = {"fts": ["content", "tool_result"]}
+# Embedded from what was said and what tools returned.
+CONVERSATIONS_SCHEMA.append({"name": EMBEDDING_COLUMN, "type": "embedding", "source": ["content", "tool_result"]})
 
 TRACES_SCHEMA = [
     {"name": ROW_ID, "type": "utf8"},
@@ -154,6 +165,7 @@ TRACES_SCHEMA = [
     {"name": "created_ms", "type": "i64"},
 ]
 TRACES_INDEXES = {"fts": ["name", "result"]}
+TRACES_SCHEMA.append({"name": EMBEDDING_COLUMN, "type": "embedding", "source": ["result", "error"]})
 
 SKILLS_SCHEMA = [
     {"name": ROW_ID, "type": "utf8"},
@@ -166,11 +178,52 @@ SKILLS_SCHEMA = [
     {"name": "created_ms", "type": "i64"},      # the newest row of a name is its current version
 ]
 SKILLS_INDEXES = {"fts": ["description", "content"]}
+SKILLS_SCHEMA.append({"name": EMBEDDING_COLUMN, "type": "embedding", "source": ["description", "content"]})
 
-# `memory` without the embedding column, where the platform cannot fill one:
-# a deployment with no embedding server (create_table answers 400), or an
-# account it gives none (403). Recall is then keyword-only.
-MEMORY_SCHEMA_KEYWORD_ONLY = [f for f in MEMORY_SCHEMA if f["name"] != EMBEDDING_COLUMN]
+# Code reviews (the `infino_record_review` tool): one row per finding of a
+# review a reviewing agent drafted or the reviewer added, and one per verdict
+# (`finding_id` empty), with what the draft said and what the reviewer
+# posted. Rows are never changed: once the reviewer's own review is in, each
+# finding's outcome (kept, edited, dismissed or added) is a new row with the
+# same repo, pr and finding_id, so a finding's newest row is its state and
+# the override rate is `outcome <> ''` grouped by reviewer and week. Columns a
+# query groups by, where memory holds free text.
+REVIEWS_SCHEMA = [
+    {"name": ROW_ID, "type": "utf8"},
+    {"name": STORED, "type": "i64"},
+    {"name": "repo", "type": "utf8"},               # owner/name
+    {"name": "pr", "type": "i64"},
+    {"name": "head_sha", "type": "utf8"},           # the commit the review read
+    {"name": "diff_fingerprint", "type": "utf8"},   # the diff's, so a rebase with the same changes matches
+    {"name": "finding_id", "type": "utf8"},         # the finding within the review ("" for the verdict)
+    {"name": "path", "type": "utf8"},
+    {"name": "line", "type": "i64"},
+    {"name": "domain", "type": "utf8"},             # correctness, concurrency, durability, public API, ...
+    {"name": "severity", "type": "utf8"},
+    {"name": "draft_text", "type": "large_utf8"},   # what the agent drafted
+    {"name": "final_text", "type": "large_utf8"},   # what the reviewer posted
+    {"name": "verdict_draft", "type": "utf8"},      # approve | comment | request_changes
+    {"name": "verdict_final", "type": "utf8"},
+    {"name": "outcome", "type": "utf8"},            # REVIEW_OUTCOMES, or "" on the draft's rows
+    {"name": "reviewer", "type": "utf8"},           # whose review it is: their GitHub handle
+    {"name": "author", "type": "utf8"},             # who the turn that recorded it was for
+    {"name": "profile", "type": "utf8"},
+    {"name": "session_id", "type": "utf8"},         # the session that recorded it, in `conversations`
+    {"name": "created_ms", "type": "i64"},
+    {"name": EMBEDDING_COLUMN, "type": "embedding", "source": ["draft_text", "final_text"]},
+]
+REVIEWS_INDEXES = {"fts": ["draft_text", "final_text"]}
+
+
+
+def keyword_only(schema: list[dict]) -> list[dict]:
+    """A table's columns without its embedding column, for a deployment the
+    platform runs no embedding server on (create_table answers 400), or a key
+    it gives none (403): that table is then searched by keyword alone."""
+    return [f for f in schema if f["type"] != "embedding"]
+
+
+MEMORY_SCHEMA_KEYWORD_ONLY = keyword_only(MEMORY_SCHEMA)
 # The statuses create_table refuses an embedding column with, its message
 # saying "embedding": no embedding server on the deployment, or a worker
 # built without embedding columns (400); none for this account (403).
@@ -182,11 +235,12 @@ TEAM_TABLES = {
     TRACES: (TRACES_SCHEMA, TRACES_INDEXES),
     SKILLS: (SKILLS_SCHEMA, SKILLS_INDEXES),
     HISTORY: (HISTORY_SCHEMA, HISTORY_INDEXES),
+    REVIEWS: (REVIEWS_SCHEMA, REVIEWS_INDEXES),
 }
 # Tables a cloud database may lack without holding up the others: one that
 # cannot be made there (a key that may not create tables) keeps its own rows
 # on this machine, and every other table syncs as before (ensure_optional).
-OPTIONAL = (HISTORY,)
+OPTIONAL = (HISTORY, REVIEWS)
 # Tables the cloud databases have and this machine does not (no rows of
 # them are kept or pushed here): optional too, made as OPTIONAL are.
 CLOUD_ONLY = {FORGOTTEN: (FORGOTTEN_SCHEMA, FORGOTTEN_INDEXES)}
@@ -228,14 +282,7 @@ def ensure_all(client: InfinoClient, database: str, personal: bool = False) -> N
     for table, (schema, indexes) in (PERSONAL_TABLES if personal else TEAM_TABLES).items():
         if table in OPTIONAL:
             continue  # made on its own (ensure_optional): it never holds up these
-        try:
-            client.ensure_table(database, table, schema, indexes)
-        except InfinoError as e:
-            if table != MEMORY or e.status not in NO_EMBEDDING_STATUSES or "embedding" not in e.message:
-                raise
-            logger.warning("infino: %s.%s is made without its embedding column, so recall there is "
-                           "keyword-only: %s", database, MEMORY, e)
-            client.ensure_table(database, MEMORY, MEMORY_SCHEMA_KEYWORD_ONLY, MEMORY_INDEXES)
+        _ensure_table(client, database, table, schema, indexes)
         have = set(client.column_names(database, table))
         missing = [f for f in schema if f["type"] != "embedding" and f["name"] not in have]
         if not missing:
@@ -250,15 +297,28 @@ def ensure_all(client: InfinoClient, database: str, personal: bool = False) -> N
                                 f"pushed to {database}, and every row stays on this machine") from None
 
 
+def _ensure_table(client: InfinoClient, database: str, table: str, schema: list[dict], indexes: dict) -> None:
+    """Create a table unless it exists; keyword-only (`keyword_only`) where
+    the platform refuses its embedding column."""
+    try:
+        client.ensure_table(database, table, schema, indexes)
+    except InfinoError as e:
+        if e.status not in NO_EMBEDDING_STATUSES or "embedding" not in e.message or schema == keyword_only(schema):
+            raise
+        logger.warning("infino: %s.%s is made without its embedding column, so it is searched by keyword "
+                       "alone: %s", database, table, e)
+        client.ensure_table(database, table, keyword_only(schema), indexes)
+
+
 def ensure_optional(client: InfinoClient, database: str, table: str) -> None:
     """Create one of OPTIONAL in `database` unless it exists, with every
     column this version writes. Raises when it cannot be made: the caller
     keeps that table's rows on this machine, and the database's other tables
     are not held up. One of CLOUD_ONLY likewise."""
     schema, indexes = TEAM_TABLES[table] if table in TEAM_TABLES else CLOUD_ONLY[table]
-    client.ensure_table(database, table, schema, indexes)
+    _ensure_table(client, database, table, schema, indexes)
     have = set(client.column_names(database, table))
-    missing = [f for f in schema if f["name"] not in have]
+    missing = [f for f in schema if f["type"] != "embedding" and f["name"] not in have]
     if missing:
         try:
             client.add_columns(database, table, [{"name": f["name"], "type": f["type"], "nullable": True}
