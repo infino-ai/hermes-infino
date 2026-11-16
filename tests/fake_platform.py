@@ -53,7 +53,8 @@ class FakePlatform:
         self.rerank_statuses: list[int] = []  # the next reranked searches answer these statuses, in order
         self.rerank_delay_s = 0.0      # a reranked search answers after this long
         self.reranked: list[dict] = []  # each reranked search's body
-        self.hybrid_statuses: list[int] = []  # the next hybrid searches answer these statuses, in order
+        self.hybrid_statuses: list[int] = []  # the next hybrid searches of `memory` answer these, in order
+        self.hybrid_tables: list[str] = []  # the table of every hybrid search, in order
         self.failed_deletes = 0        # next N deletes answer 500
         self.refused_marker = None     # an append carrying a row with this text answers refused_status
         self.refused_status = 400
@@ -220,7 +221,9 @@ class FakePlatform:
         if op in ("hybrid_search", "bm25_search"):
             if op == "hybrid_search" and self.hybrid_refused:
                 return 400, {"error": "no embedding server"}, None
-            if op == "hybrid_search" and self.hybrid_statuses:
+            if op == "hybrid_search":
+                self.hybrid_tables.append(body["table_name"])
+            if op == "hybrid_search" and self.hybrid_statuses and body["table_name"] == "memory":
                 return self.hybrid_statuses.pop(0), {"error": "scripted"}, None
             schema = self.schemas.get((db, body["table_name"]), [])
             if op == "hybrid_search" and not any(f["name"] == body["vector_field"] for f in schema):
