@@ -87,8 +87,8 @@ def test_a_personal_database_adds_the_personal_sources(home, platform, tmp_path)
     for table in tables.PERSONAL:
         assert (f"{PERSONAL_DB}/personal_{table}", m.personal, table, PERSONAL_DB) in sources
     assert f"{PERSONAL_DB}/{mirror.PERSONAL_MEMORY}" in [s[0] for s in sources]  # the mark kept since before
-    # The person's database holds their memory and the conversations and traces kept personal.
-    assert set(platform.databases[PERSONAL_DB]) == {*tables.PERSONAL, *tables.CLOUD_ONLY}
+    # The person's database is made; its tables are made by their first loads.
+    assert platform.databases[PERSONAL_DB] == {}
     # Nothing in the person's own tables has a source that goes to the team's database.
     assert all(s.database == PERSONAL_DB for s in m.sources() if s.store is m.personal)
 
@@ -155,7 +155,7 @@ def test_rows_go_in_batches_and_the_mark_moves_with_each(m, platform, monkeypatc
     pushed = m.sync(wait=True, progress=lambda mark, n: seen.append((mark, n)))
     mark = m.mark_of(tables.CONVERSATIONS)
     assert pushed[mark] == ROWS
-    assert requests_to(platform, "append") == 3  # 3 + 3 + 1
+    assert len(platform.loads) == 3  # 3 + 3 + 1
     assert seen == [(mark, 3), (mark, 6), (mark, 7)]
     last = max(m.local.query_sql("SELECT stored_ms, row_id FROM conversations"),
                key=lambda r: (r[tables.STORED], r[tables.ROW_ID]))
@@ -207,6 +207,7 @@ def test_an_older_versions_personal_mark_outlasts_a_time_without_a_personal_data
     m = make_mirror(tmp_path, sign_in(tmp_path, platform, personal_database=PERSONAL_DB))
     m.personal.append(tables.MEMORY, [{tables.ROW_ID: "p", "content": "mine", "scope": "personal"}])
     [row] = m.personal.query_sql("SELECT stored_ms, row_id FROM memory")
+    make_tables(m.client, PERSONAL_DB, personal=True)  # an older version made it and pushed there
     m.client.append(PERSONAL_DB, tables.MEMORY, [{tables.ROW_ID: "p", "content": "mine", "scope": "personal"}])
     (m.dir / mirror.STATE_FILE).write_text(json.dumps({"marks": {mirror.PERSONAL_MEMORY: [row[tables.STORED], "p"]}}))
     # A while without the personal database: its syncs save their state.
@@ -226,6 +227,7 @@ def test_an_older_versions_personal_mark_is_not_taken_for_another_personal_datab
     # An older version kept one personal mark whichever database it named: it pushed the
     # early memory to the other personal database, then the late one to this one.
     make_tables(m.client, OTHER_PERSONAL_DB, personal=True)
+    make_tables(m.client, PERSONAL_DB, personal=True)
     m.client.append(OTHER_PERSONAL_DB, tables.MEMORY, [dict(early)])
     m.client.append(PERSONAL_DB, tables.MEMORY, [dict(late)])
     (m.dir / mirror.STATE_FILE).write_text(
@@ -262,7 +264,7 @@ def test_a_big_batch_is_cut_to_fit_one_append(m, platform, monkeypatch):
     monkeypatch.setattr(mirror, "PUSH_MAX_BYTES", 3_000)
     m.local.append(tables.CONVERSATIONS, [{"seq": i, "content": "x" * 1_000} for i in range(5)])
     m.sync(wait=True)
-    assert requests_to(platform, "append") == 3  # 2 + 2 + 1
+    assert len(platform.loads) == 3  # 2 + 2 + 1
     assert len(platform.rows(TEAM_DB, tables.CONVERSATIONS)) == 5
 
 
@@ -275,16 +277,16 @@ def test_one_row_larger_than_the_cap_still_goes(m, platform, monkeypatch):
 
 def test_an_append_that_reached_the_cloud_before_failing_is_not_sent_again(m, platform, monkeypatch):
     m.local.append(tables.CONVERSATIONS, conversation_rows(3))
-    real = m.client.append
+    real = m._load
 
     def times_out_after_storing(db, table, rows):
         real(db, table, rows)
         raise TimeoutError("the answer never came")
 
-    monkeypatch.setattr(m.client, "append", times_out_after_storing)
+    monkeypatch.setattr(m, "_load", times_out_after_storing)
     with pytest.raises(TimeoutError):
         m.sync(wait=True)
-    monkeypatch.setattr(m.client, "append", real)
+    monkeypatch.setattr(m, "_load", real)
     m.local.append(tables.CONVERSATIONS, conversation_rows(1))
     m.sync(wait=True)
     assert sorted(r["content"] for r in platform.rows(TEAM_DB, tables.CONVERSATIONS)) == ["m0", "m0", "m1", "m2"]
@@ -336,14 +338,14 @@ def test_a_failing_source_holds_up_neither_the_others_nor_the_forgets(m, platfor
     m.forget(tables.MEMORY, TEAM_DB, ["f"])
     m.local.append(tables.MEMORY, [{"content": "a new memory"}])
     m.local.append(tables.CONVERSATIONS, conversation_rows(2))
-    real = m.client.append
+    real = m._load
 
     def conversations_fail(db, table, rows):
         if table == tables.CONVERSATIONS:
             raise RuntimeError("conversations are down")
         real(db, table, rows)
 
-    monkeypatch.setattr(m.client, "append", conversations_fail)
+    monkeypatch.setattr(m, "_load", conversations_fail)
     with pytest.raises(RuntimeError):
         m.sync(wait=True)
     assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["a new memory"]  # forget applied too
@@ -352,22 +354,22 @@ def test_a_failing_source_holds_up_neither_the_others_nor_the_forgets(m, platfor
 
 def test_a_process_killed_mid_append_does_not_send_the_batch_twice(m, platform, monkeypatch):
     m.local.append(tables.CONVERSATIONS, conversation_rows(3))
-    real = m.client.append
+    real = m._load
 
     def killed_after_the_cloud_stored_it(db, table, rows):
         real(db, table, rows)
         raise KeyboardInterrupt  # not an Exception: nothing records an error
 
-    monkeypatch.setattr(m.client, "append", killed_after_the_cloud_stored_it)
+    monkeypatch.setattr(m, "_load", killed_after_the_cloud_stored_it)
     with pytest.raises(KeyboardInterrupt):
         m.sync(wait=True)
-    monkeypatch.setattr(m.client, "append", real)
+    monkeypatch.setattr(m, "_load", real)
     m.sync(wait=True)
     assert len(platform.rows(TEAM_DB, tables.CONVERSATIONS)) == 3
 
 
 def test_an_unanswered_append_is_still_checked_after_another_sources_append_is_cut_short(m, platform, monkeypatch):
-    real = m.client.append
+    real = m._load
 
     def stores_then_raises(table, error):
         def append(db, t, rows):
@@ -377,15 +379,15 @@ def test_an_unanswered_append_is_still_checked_after_another_sources_append_is_c
         return append
 
     m.local.append(tables.CONVERSATIONS, conversation_rows(3))
-    monkeypatch.setattr(m.client, "append", stores_then_raises(tables.CONVERSATIONS, TimeoutError("no answer")))
+    monkeypatch.setattr(m, "_load", stores_then_raises(tables.CONVERSATIONS, TimeoutError("no answer")))
     with pytest.raises(TimeoutError):
         m.sync(wait=True)
     # The next sync pushes memory first, and its process is killed mid-append.
     m.local.append(tables.MEMORY, [{"content": "saved after"}])
-    monkeypatch.setattr(m.client, "append", stores_then_raises(tables.MEMORY, KeyboardInterrupt()))
+    monkeypatch.setattr(m, "_load", stores_then_raises(tables.MEMORY, KeyboardInterrupt()))
     with pytest.raises(KeyboardInterrupt):
         m.sync(wait=True)
-    monkeypatch.setattr(m.client, "append", real)
+    monkeypatch.setattr(m, "_load", real)
     m.sync(wait=True)
     assert len(platform.rows(TEAM_DB, tables.CONVERSATIONS)) == 3
     assert len(platform.rows(TEAM_DB, tables.MEMORY)) == 1
@@ -409,16 +411,16 @@ def test_an_unanswered_batch_is_not_sent_again_when_a_late_commit_moves_the_mark
     m.sync(wait=True)
     [first] = m.local.rows_after(tables.CONVERSATIONS, None, 2 ** 62, 1)
     m.local.append(tables.CONVERSATIONS, conversation_rows(SMALL_BATCH))
-    real = m.client.append
+    real = m._load
 
     def times_out_after_storing(db, table, rows):
         real(db, table, rows)
         raise TimeoutError("the answer never came")
 
-    monkeypatch.setattr(m.client, "append", times_out_after_storing)
+    monkeypatch.setattr(m, "_load", times_out_after_storing)
     with pytest.raises(TimeoutError):
         m.sync(wait=True)
-    monkeypatch.setattr(m.client, "append", real)
+    monkeypatch.setattr(m, "_load", real)
     # A row committed slowly behind the first one moves the mark back before that unanswered batch.
     commit_late(m, tables.CONVERSATIONS, {tables.ROW_ID: "0-late", "session_id": "s", "role": "user",
                                           "content": "committed slowly", tables.STORED: first[tables.STORED]})
@@ -599,24 +601,24 @@ def failing_forgotten(m: Mirror, status: int = 503) -> dict:
     """Make the cloud fail every request about `forgotten` with `status`
     while the returned switch's "down" is true: a failure that may pass."""
     switch = {"down": True}
-    real_ensure, real_append, real_query = m.client.ensure_table, m.client.append, m.client.query_sql
+    real_ensure, real_load, real_query = m.client.ensure_table, m._load, m.client.query_sql
 
     def ensure(database, table, *a, **k):
         if switch["down"] and table == tables.FORGOTTEN:
             raise InfinoError(status, "unavailable")
         return real_ensure(database, table, *a, **k)
 
-    def append(database, table, rows):
+    def load(database, table, rows):
         if switch["down"] and table == tables.FORGOTTEN:
             raise InfinoError(status, "unavailable")
-        return real_append(database, table, rows)
+        return real_load(database, table, rows)
 
     def query(database, sql):
         if switch["down"] and f"FROM {tables.FORGOTTEN} " in sql:
             raise InfinoError(status, "unavailable")
         return real_query(database, sql)
 
-    m.client.ensure_table, m.client.append, m.client.query_sql = ensure, append, query
+    m.client.ensure_table, m._load, m.client.query_sql = ensure, load, query
     return switch
 
 
@@ -764,7 +766,7 @@ def test_nothing_is_pushed_while_a_cloud_table_lacks_a_column_it_cannot_get(home
     m.local.append(tables.MEMORY, [{"content": "kept for a chat", tables.CHAT: "telegram:-100"}])
     with pytest.raises(tables.OutdatedTable):
         m.sync(wait=True)
-    assert requests_to(platform, "append") == 0
+    assert platform.loads == []
     assert "has no chat" in m.last_error()
     platform.schema_patch_refused = False
     m._tables_failed_at = 0.0  # try again now, not after ENSURE_RETRY_S
@@ -817,7 +819,7 @@ def test_a_failed_batch_keeps_the_ones_before_it(m, platform, monkeypatch):
     monkeypatch.setattr(mirror, "PUSH_BATCH", SMALL_BATCH)
     m.local.append(tables.CONVERSATIONS, conversation_rows(ROWS))
     calls = []
-    real = m.client.append
+    real = m._load
 
     def second_fails(db, table, rows):
         calls.append(len(rows))
@@ -825,7 +827,7 @@ def test_a_failed_batch_keeps_the_ones_before_it(m, platform, monkeypatch):
             raise RuntimeError("network")
         real(db, table, rows)
 
-    monkeypatch.setattr(m.client, "append", second_fails)
+    monkeypatch.setattr(m, "_load", second_fails)
     with pytest.raises(RuntimeError):
         m.sync(wait=True)
     assert len(platform.rows(TEAM_DB, tables.CONVERSATIONS)) == SMALL_BATCH

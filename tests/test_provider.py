@@ -455,7 +455,7 @@ def test_a_running_process_picks_up_a_sign_in(home, platform, tmp_path, monkeypa
     p._checked_at -= provider_mod.SETTINGS_RECHECK_S  # half a minute later
     p.prefetch("anything")
     assert p._backend.signed_in
-    assert wait_for(lambda: tables.MEMORY in platform.databases.get("team-test", {}))
+    assert wait_for(lambda: "team-test" in platform.databases)  # its tables are made by their first loads
     call(m, "infino_remember", content="written after the sign-in")
     end_session(p)
     assert [r["content"] for r in platform.rows("team-test", tables.MEMORY)] == ["written after the sign-in"]

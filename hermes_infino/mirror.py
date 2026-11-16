@@ -516,11 +516,15 @@ class Mirror:
     def _forgotten(self, src: Source, ids: set[str]) -> set[str]:
         """The rows of `ids` in `src`'s database's `forgotten`: deleted from
         `src`'s table by a forget. A database that refused to make it has no
-        forget on record; one where that is not known yet raises
-        ForgottenUnknown (`_forgotten_kept`)."""
+        forget on record; one where that is not known yet, or that cannot be
+        read now, raises ForgottenUnknown (`_forgotten_kept`)."""
         if not ids or not self._forgotten_kept(src.database):
             return set()
-        return self._recorded(src.database, src.table, ids)
+        try:
+            return self._recorded(src.database, src.table, ids)
+        except InfinoError as e:
+            raise ForgottenUnknown(f"{src.database}.{tables.FORGOTTEN} cannot be read now, so whether rows were "
+                                   f"forgotten is not known: {e}") from e
 
     def _recorded(self, database: str, table: str, ids: set[str]) -> set[str]:
         """The rows of `ids` that `database`'s `forgotten` names for `table`:
@@ -835,11 +839,11 @@ class Mirror:
         what that load takes in is not sent again. A table not there yet has
         none of them."""
         loads.settle(self.client, src.database, src.table)
-        if src.table not in self.client.list_tables(src.database):
-            return list(rows)
-        ids = ", ".join(tables.sql_string(str(r[tables.ROW_ID])) for r in rows)
-        have = {str(r.get(tables.ROW_ID)) for r in self.client.query_sql(
-            src.database, f"SELECT {tables.ROW_ID} FROM {src.table} WHERE {tables.ROW_ID} IN ({ids})")}
+        have: set[str] = set()
+        if src.table in self.client.list_tables(src.database):
+            ids = ", ".join(tables.sql_string(str(r[tables.ROW_ID])) for r in rows)
+            have = {str(r.get(tables.ROW_ID)) for r in self.client.query_sql(
+                src.database, f"SELECT {tables.ROW_ID} FROM {src.table} WHERE {tables.ROW_ID} IN ({ids})")}
         have |= self._forgotten(src, {str(r[tables.ROW_ID]) for r in rows} - have)
         return [r for r in rows if str(r[tables.ROW_ID]) not in have]
 

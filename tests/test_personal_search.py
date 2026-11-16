@@ -16,7 +16,7 @@ from hermes_infino.client import InfinoClient
 from hermes_infino.provider import (MAX_PERSONAL_SEARCH_K, PERSONAL_RESULT_CELL_CHARS, PERSONAL_SEARCH_TOOL,
                                     InfinoMemoryProvider)
 
-from .helpers import (DM, GROUP, PERSONAL_DB, end_session, hook_ctx, in_session, local_rows, make_manager, requests_to,
+from .helpers import (DM, GROUP, PERSONAL_DB, end_session, hook_ctx, in_session, local_rows, make_manager, make_tables, requests_to,
                       wait_for)
 from .test_personal import personal, texts
 
@@ -114,6 +114,7 @@ def test_an_unknown_table_is_refused_by_name(home, tmp_path):
 def test_signed_in_it_searches_the_personal_cloud_database(env, platform, tmp_path):
     env.setenv("INFINO_PERSONAL_DATABASE", PERSONAL_DB)
     _, p = make_manager(tmp_path)
+    make_tables(InfinoClient("k", platform.url), PERSONAL_DB, personal=True)
     # A row only the cloud has: this person's work on another machine.
     platform.databases[PERSONAL_DB][tables.CONVERSATIONS].append(
         {tables.ROW_ID: "elsewhere", **conversation("laptop", PRIVATE)})
@@ -339,6 +340,7 @@ def test_a_row_written_here_since_the_last_sync_is_found_with_the_clouds(env, pl
     env.setenv("INFINO_PERSONAL_DATABASE", PERSONAL_DB)
     _, p = make_manager(tmp_path)
     monkeypatch.setattr(backend, "SYNC_DELAY_S", NEVER_S)
+    make_tables(InfinoClient("k", platform.url), PERSONAL_DB, personal=True)
     platform.databases[PERSONAL_DB][tables.CONVERSATIONS].append(
         {tables.ROW_ID: "elsewhere", **conversation("laptop", PRIVATE)})
     p._backend.append(tables.CONVERSATIONS, [conversation("here", PRIVATE)], personal=True)

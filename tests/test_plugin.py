@@ -699,7 +699,7 @@ def test_settings_come_from_the_tools_config_block(home, platform, tmp_path):
     # Run as a script, the launcher reads the environment Hermes started it with, not the config.
     assert config.load(tmp_path, from_config=False).team_database == "a-different-team"
     make_manager(tmp_path)
-    assert set(platform.databases[TEAM_DB]) == {*tables.ALL, *tables.CLOUD_ONLY}
+    assert platform.databases[TEAM_DB] == {}  # made; its tables by their first loads
 
 
 def test_an_unset_key_reference_keeps_the_profile_local(home, platform, tmp_path):
