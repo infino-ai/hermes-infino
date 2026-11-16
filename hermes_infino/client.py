@@ -8,6 +8,8 @@ only: the cloud needs nothing beyond Python itself.
 Every append is a commit on the platform, and a table takes one write at a
 time: a concurrent write gets 409 with `Retry-After`, and a database whose
 workers are still starting gets 503 with `Retry-After`. Both are retried here.
+Many rows at once go by a platform load job instead (`load`), as the Infino
+client's index sends a large write.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -34,6 +37,19 @@ MAX_RETRIES = 5
 DEFAULT_RETRY_AFTER_S = 1.0
 # Upper bound on any single wait, so a large Retry-After cannot stall a turn.
 MAX_RETRY_WAIT_S = 10.0
+# Seconds to wait for a load's rows file to upload.
+UPLOAD_TIMEOUT_S = 300.0
+# How often a load is asked how it stands, and how long it may take before the
+# wait gives up on it (it goes on on the platform; the caller treats its rows
+# as unsure).
+LOAD_POLL_S = 2.0
+LOAD_WAIT_S = 30 * 60.0
+# A load's states while it may still write the table, and those of one whose
+# rows landed.
+LIVE_LOAD_STATES = ("admitting", "pending", "running", "cancelling")
+LANDED_LOAD_STATES = ("succeeded", "synced")
+# What the uploads route answers on a platform that runs no load jobs.
+NO_LOADS_STATUSES = (404, 405, 501)
 
 
 class InfinoError(Exception):
@@ -43,6 +59,10 @@ class InfinoError(Exception):
         super().__init__(f"HTTP {status}: {message}")
         self.status = status
         self.message = message
+
+
+class LoadsUnsupported(InfinoError):
+    """The platform runs no load jobs: its uploads route is not there."""
 
 
 class InfinoClient:
@@ -128,6 +148,77 @@ class InfinoClient:
             params={"table": table},
             body={"data": rows},
         )
+
+    def load(self, database: str, table: str, rows: list[dict[str, Any]], *,
+             poll_s: Optional[float] = None, wait_s: Optional[float] = None) -> None:
+        """Append rows by a platform load job, as the Infino client's index
+        sends a large write: the rows as one NDJSON file, uploaded into the
+        database's storage (`POST /v1/hydrate/{db}/uploads`, then a PUT to the
+        session it opens, which carries no key), loaded into `table` with
+        `if_exists: append` (`POST /v1/hydrate/{db}`), and waited for
+        (`GET /v1/hydrate/{db}?table=`). The table keeps its columns and
+        indexes, and its rows land as sent. Raises LoadsUnsupported when the
+        platform runs no load jobs, InfinoError when a step is refused or the
+        load fails, and TimeoutError when it outlasts `wait_s` (LOAD_WAIT_S),
+        asking every `poll_s` (LOAD_POLL_S)."""
+        if not rows:
+            return
+        poll_s = LOAD_POLL_S if poll_s is None else poll_s
+        wait_s = LOAD_WAIT_S if wait_s is None else wait_s
+        data = "".join(json.dumps(r, default=str) + "\n" for r in rows).encode()
+        name = f"{table}-{uuid.uuid4().hex}.ndjson"
+        origin = "{0.scheme}://{0.netloc}".format(urllib.parse.urlsplit(self._url))
+        try:
+            opened = self._request("POST", f"/v1/hydrate/{_q(database)}/uploads",
+                                   body={"origin": origin, "files": [{"name": name, "size": len(data)}]})
+        except InfinoError as e:
+            if e.status in NO_LOADS_STATUSES:
+                raise LoadsUnsupported(e.status, e.message) from None
+            raise
+        files = opened.get("files") if isinstance(opened, dict) else None
+        prefix = opened.get("prefix") if isinstance(opened, dict) else None
+        if not isinstance(files, list) or len(files) != 1 or not isinstance(prefix, str):
+            raise InfinoError(0, f"the platform opened {len(files) if isinstance(files, list) else 0} "
+                                 "upload sessions for 1 file")
+        self._upload(files[0]["url"], data)
+        self._request("POST", f"/v1/hydrate/{_q(database)}", body={
+            "table": table, "source": {"kind": "prefix", "prefix": prefix}, "format": "ndjson",
+            "if_exists": "append"})
+        self._wait_for_load(database, table, prefix, poll_s, wait_s)
+
+    def _upload(self, url: str, data: bytes) -> None:
+        """PUT `data` to an upload session the platform opened; the session's
+        URL is its credential, so no key goes with it."""
+        req = urllib.request.Request(url, data=data, method="PUT", headers={"Content-Length": str(len(data))})
+        try:
+            with urllib.request.urlopen(req, timeout=max(self._timeout, UPLOAD_TIMEOUT_S)) as resp:
+                resp.read()
+        except urllib.error.HTTPError as e:
+            raise InfinoError(e.code, e.read().decode("utf-8", "replace")) from None
+
+    def _wait_for_load(self, database: str, table: str, prefix: str, poll_s: float, wait_s: float) -> None:
+        """Wait until the load of `table` from the upload at `prefix` has ended.
+        A table keeps one load record, whatever load made it, so a record of
+        another upload (`_loads_from`) is an earlier load's, read again until
+        this one's replaces it; so is none yet."""
+        deadline = time.monotonic() + wait_s
+        while True:
+            try:
+                record = self._request("GET", f"/v1/hydrate/{_q(database)}", params={"table": table})
+            except InfinoError as e:
+                if e.status != 404:
+                    raise
+                record = None
+            if isinstance(record, dict) and _loads_from(record, prefix):
+                state = str(record.get("state") or "")
+                if state in LANDED_LOAD_STATES:
+                    return
+                if state not in LIVE_LOAD_STATES:
+                    why = f": {record['error']}" if record.get("error") else ""
+                    raise InfinoError(0, f"the load of {table} ended {state or 'with no state'}{why}")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"the load of {table} from {prefix} had not ended after {wait_s:.0f} s")
+            time.sleep(poll_s)
 
     def delete(self, database: str, table: str, predicate: str) -> dict:
         return self._request(
@@ -245,6 +336,16 @@ def request_trial(url: str, database: str, timeout: float = REQUEST_TIMEOUT_S) -
     if not isinstance(out, dict) or not out.get("api_key"):
         raise InfinoError(0, f"no api_key in the trial response: {str(out)[:200]}")
     return out
+
+
+def _loads_from(record: dict, prefix: str) -> bool:
+    """Whether a load record is of the load from the upload at `prefix`: its
+    request's source prefix ends with it, trailing slashes aside (the platform
+    may store it resolved under the database's root), or it names none."""
+    request = record.get("request")
+    source = request.get("source") if isinstance(request, dict) else None
+    named = source.get("prefix") if isinstance(source, dict) else None
+    return not isinstance(named, str) or named.rstrip("/").endswith(prefix.rstrip("/"))
 
 
 def _q(segment: str) -> str:

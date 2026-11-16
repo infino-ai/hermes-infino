@@ -68,6 +68,14 @@ class FakePlatform:
         self.trial_status = None       # /v1/trial answers this status (501: no free accounts; 409: one per network)
         self.trial_without_key = False  # /v1/trial answers 200 with no api_key
         self.valid_keys = None         # a set: any other bearer key answers 401
+        # Load jobs: uploads kept by their prefix, each load's (db, table, rows),
+        # and each table's load record, as GET /v1/hydrate/{db}?table= answers it.
+        self.uploads: dict[str, bytes] = {}
+        self.loads: list[tuple[str, str, int]] = []
+        self.load_records: dict[tuple[str, str], dict] = {}
+        self.no_loads = False          # the uploads route answers 404 (a platform with no load jobs)
+        self.failed_loads = 0          # next N loads end failed, with no row landed
+        self.stale_load_reads = 0      # next N record reads answer an earlier load's record
         self.keys_seen: list[str] = []  # the bearer key of every request
         self._lock = threading.Lock()
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
@@ -114,10 +122,25 @@ class FakePlatform:
                     fake.requests.append((parsed.path, "{}"))
                     if self._refused_key():
                         return
+                    params = dict(urllib.parse.parse_qsl(parsed.query))
+                    parts = parsed.path.strip("/").split("/")
                     if parsed.path == "/v1/databases":
                         self._send(200, [{"name": n} for n in fake.databases])
+                    elif parts[:2] == ["v1", "hydrate"] and len(parts) == 3:
+                        self._send(*fake._load_record(urllib.parse.unquote(parts[2]), params["table"]))
                     else:
                         self._send(404, {"error": "no route"})
+
+            def do_PUT(self):
+                # An upload session's PUT: its URL is its credential, no key.
+                parsed = urllib.parse.urlparse(self.path)
+                length = int(self.headers.get("Content-Length") or 0)
+                data = self.rfile.read(length)
+                with fake._lock:
+                    fake.requests.append((parsed.path, "{}"))
+                    prefix = parsed.path.removeprefix("/upload/").rsplit("/", 1)[0] + "/"
+                    fake.uploads[prefix] = fake.uploads.get(prefix, b"") + data
+                self._send(200, {})
 
             def do_POST(self):
                 parsed = urllib.parse.urlparse(self.path)
@@ -157,6 +180,8 @@ class FakePlatform:
             self.databases[body["name"]] = {}
             return 200, {}, None
         op, db = parts[1], urllib.parse.unquote(parts[2])
+        if op == "hydrate":
+            return self._hydrate(db, parts[3:], body)
         if op == "delete" and params["table"] not in self.databases.get(db, {}):
             return 404, {"error": f"no table {params['table']} in database {db}"}, None
         tables = self.databases.setdefault(db, {})
@@ -252,6 +277,39 @@ class FakePlatform:
                 return 200, {"data": [{"n": len(rows)}]}, None
             return 200, {"data": rows}, None
         return 404, {"error": f"no route {op}"}, None
+
+    def _hydrate(self, db: str, rest: list[str], body: dict):
+        """The load routes: open an upload session, or load an upload into a
+        table by appending its NDJSON rows, as the append route takes them."""
+        if self.no_loads:
+            return 404, {"error": "no route hydrate"}, None
+        if rest == ["uploads"]:
+            prefix = f"uploads/{len(self.uploads) + len(self.loads)}-{len(self.requests)}/"
+            self.uploads[prefix] = b""
+            files = [{"name": f["name"], "url": f"{self.url}/upload/{prefix}{f['name']}"} for f in body["files"]]
+            return 200, {"prefix": prefix, "files": files}, None
+        table, prefix = body["table"], body["source"]["prefix"]
+        request = {"table": table, "source": body["source"], "if_exists": body.get("if_exists")}
+        if self.failed_loads > 0:
+            self.failed_loads -= 1
+            self.load_records[(db, table)] = {"state": "failed", "error": "scripted", "request": request}
+            return 202, {"job": f"hydrate/{db}/{table}", "state": "admitting"}, None
+        rows = [json.loads(line) for line in self.uploads[prefix].decode().splitlines() if line]
+        status, out, _ = self._route(["v1", "append", db], {"table": table}, {"data": rows})
+        if status != 200:
+            self.load_records[(db, table)] = {"state": "failed", "error": str(out), "request": request}
+        else:
+            self.loads.append((db, table, len(rows)))
+            self.load_records[(db, table)] = {"state": "succeeded", "request": request}
+        return 202, {"job": f"hydrate/{db}/{table}", "state": "admitting"}, None
+
+    def _load_record(self, db: str, table: str):
+        """A table's load record; an earlier load's while `stale_load_reads` lasts."""
+        if self.stale_load_reads > 0:
+            self.stale_load_reads -= 1
+            return 200, {"state": "succeeded", "request": {"source": {"kind": "prefix", "prefix": "uploads/earlier/"}}}
+        record = self.load_records.get((db, table))
+        return (200, record) if record is not None else (404, {"error": "no load of this table"})
 
     def _reranked(self, db: str, op: str, body: dict):
         """A search with `rerank`, as the platform answers it: refused where
