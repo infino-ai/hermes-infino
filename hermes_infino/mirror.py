@@ -212,12 +212,12 @@ def _parts(rows: list[dict]) -> list[list[dict]]:
 
 
 def _chunker(settings: config.Settings) -> Optional[chunks.Chunker]:
-    """The `chunk` command of the client INFINO_CHUNKER (or INFINO_CLIENT)
-    names, run with the Node Hermes keeps."""
-    if not settings.chunker:
+    """The Infino client's `chunk` command (INFINO_CLIENT), run with the
+    Node Hermes keeps."""
+    if not settings.client:
         return None
     from .mcp_launch import node_command
-    return chunks.client_chunker(node_command(), settings.chunker)
+    return chunks.client_chunker(node_command(), settings.client)
 
 
 def _raw_marks(state: dict) -> dict:

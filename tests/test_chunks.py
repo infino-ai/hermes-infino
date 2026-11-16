@@ -162,8 +162,6 @@ def test_a_client_without_the_chunk_command_fails_the_chunker(tmp_path):
         chunks.client_chunker(str(node), str(tmp_path / "cli.js"))([{"id": "x", "path": "a.txt", "text": "t"}])
 
 
-def test_the_chunker_setting_defaults_to_the_tools_client(home, tmp_path):
+def test_the_chunker_is_the_tools_client(home, tmp_path):
     home.setenv("INFINO_CLIENT", "/opt/client/dist/cli.js")
-    assert config.load(tmp_path).chunker == "/opt/client/dist/cli.js"
-    home.setenv("INFINO_CHUNKER", "/opt/supergrep/dist/cli.js")
-    assert config.load(tmp_path).chunker == "/opt/supergrep/dist/cli.js"
+    assert config.load(tmp_path).client == "/opt/client/dist/cli.js"

@@ -3,18 +3,18 @@
 A long message or tool result (a file read, a log, a test run) goes to the
 cloud as chunks: the rows of one message share its `row_id`, each holds one
 chunk of the long text in its own column, and `chunk` numbers them from 0.
-The chunks are cut by a client's `chunk` command (INFINO_CHUNKER, else
-INFINO_CLIENT) - SuperGrep's chunker, the one that cuts a repository's files
-for its index - so a tool
+The chunks are cut by the Infino client's `chunk` command (INFINO_CLIENT,
+the client the Infino tools run) - the chunker that cuts a repository's files
+for its index, in the client and in SuperGrep alike - so a tool
 result is cut where SuperGrep would cut the same text: markdown at its
 headings, logs at their records, other text in overlapping line windows.
 Each chunk is well inside what the platform's model embeds, so every chunk
 is embedded whole and found by its words and by its meaning.
 
 The local database keeps every message whole; only what goes to the cloud is
-cut. A message short enough is sent as it is. Where no client is set or it
-has no `chunk` command, text is sent whole, and the cloud embeds as much of
-it as its model reads.
+cut. A message short enough is sent as it is. Where no client is set, or it
+is a build from before the `chunk` command, text is sent whole, and the cloud
+embeds as much of it as its model reads.
 
 Rows that share a `row_id` are one row to the plugin: a forget by `row_id`
 deletes them all, and the sync's checks of what the cloud has ask by
@@ -88,16 +88,15 @@ def expand(table: str, rows: list[dict], chunker: Optional[Chunker]) -> list[dic
                 if isinstance(r.get(column), str) and len(r[column]) >= LONG_CHARS]
     cut: dict[str, list[str]] = {}
     if requests and chunker is None:
-        _warn_once("no-client", "infino: neither INFINO_CHUNKER nor INFINO_CLIENT is set, so long conversation text "
-                                "goes to the cloud whole (the cloud embeds as much of it as its model reads)")
+        _warn_once("no-client", "infino: INFINO_CLIENT is not set, so long conversation text goes to the cloud whole "
+                                "(the cloud embeds as much of it as its model reads)")
     elif requests:
         try:
             for c in chunker(requests):
                 cut.setdefault(str(c["id"]), []).append(str(c.get("content") or ""))
         except Exception as e:
-            _warn_once(f"failed:{type(e).__name__}", "infino: the client could not cut long text into chunks (set "
-                                                      "INFINO_CHUNKER to SuperGrep's dist/cli.js, which has a `chunk` "
-                                                      "command), so it goes whole: %s", e)
+            _warn_once(f"failed:{type(e).__name__}", "infino: the Infino client could not cut long text into chunks "
+                                                      "(a build from before its `chunk` command?), so it goes whole: %s", e)
             cut = {}
     out: list[dict] = []
     for i, r in enumerate(rows):

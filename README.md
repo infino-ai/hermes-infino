@@ -82,7 +82,7 @@ Once you sign in:
 - Every row is written to your machine first. It reaches the cloud a few seconds later, and Hermes sends whatever is left before it exits, waiting up to about ten seconds for the cloud. Anything still left goes with the next sync.
 - If the cloud is down, nothing is lost. The sync picks up where it stopped.
 - The cloud embeds `memory`, every message and tool result in `conversations`, and every call's arguments and result in `traces`, so all of them are found by meaning as well as by their words.
-- A long message or tool result is kept whole on your machine and goes to the cloud as chunks: rows that share the message's `row_id`, numbered by `chunk`, cut the way SuperGrep cuts a file for its index (markdown at its headings, other text in overlapping line windows), so each chunk is embedded whole and nothing past a length limit is dropped. The cut is made by the `chunk` command of the client `INFINO_CHUNKER` names.
+- A long message or tool result is kept whole on your machine and goes to the cloud as chunks: rows that share the message's `row_id`, numbered by `chunk`, cut the way SuperGrep cuts a file for its index (markdown at its headings, other text in overlapping line windows), so each chunk is embedded whole and nothing past a length limit is dropped. The cut is made by the Infino client's `chunk` command (the client `INFINO_CLIENT` names); a client built before that command sends long text whole.
 - If the cloud refuses a row, it stays on your machine. `hermes infino status` counts such rows, names the file that lists them, and shows how far behind the cloud is in the sync.
 - Forgetting a memory deletes it from the cloud too.
 - The cloud embeds memories itself, so your machine no longer has to embed locally.
@@ -304,7 +304,6 @@ The sign-in's URL and personal database go with its key. They apply only when th
 | `INFINO_TEAM_SKILLS` | `off` stops this profile loading the skills teammates publish (default on) |
 | `INFINO_PERSONAL_PROFILE` | `on` keeps this profile's conversations and traces out of the team database, and lets its gateway chats keep personal memory (default off). Any value other than `off`, `false`, `no` or `0` counts as `on`. |
 | `INFINO_PERSONAL_JOBS` | Scheduled jobs (names or ids, comma-separated) whose runs, and the chats their output is delivered to, stay out of the team database. On a profile other than the job's own, name the job, not its id. |
-| `INFINO_CHUNKER` | The `dist/cli.js` of a client with a `chunk` command (SuperGrep's), which cuts long conversation text into chunks before it goes to the cloud (default: `INFINO_CLIENT`). Without one that has the command, long text goes to the cloud whole. |
 | `INFINO_OWNER_ROUTES` | On a profile marked personal, the webhook routes (comma-separated) whose events are your own: their turns read and write your personal memory. Ignored on a shared profile. |
 | `INFINO_FLEET_API_KEY`, `INFINO_FLEET_TEAM_DATABASE`, `INFINO_FLEET_URL` | The key, team database and URL, written in the `env` block (see [Running a fleet](#running-a-fleet)). They come before every other setting of the same kind. |
 
