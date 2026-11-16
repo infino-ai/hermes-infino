@@ -39,6 +39,10 @@ first.
                              (default `infino`), whose instructions this plugin
                              hands the model; read from the environment only,
                              since it names the config block
+- INFINO_CHUNKER             the `dist/cli.js` of a client with a `chunk` command
+                             (SuperGrep's), which cuts long conversation text into
+                             chunks before it goes to the cloud; defaults to
+                             INFINO_CLIENT, the Infino tools' client
 - INFINO_TEAM_SKILLS         `off` stops this profile loading the skills its
                              teammates publish (default on)
 - INFINO_RANK_RECALL         `on` has the cloud rank what recall shows: each
@@ -111,6 +115,8 @@ RANK_RECALL_ENV = "INFINO_RANK_RECALL"
 PERSONAL_PROFILE_ENV = "INFINO_PERSONAL_PROFILE"
 PERSONAL_JOBS_ENV = "INFINO_PERSONAL_JOBS"
 OWNER_ROUTES_ENV = "INFINO_OWNER_ROUTES"
+CLIENT_ENV = "INFINO_CLIENT"
+CHUNKER_ENV = "INFINO_CHUNKER"
 
 DEFAULT_MCP_SERVER = "infino"
 # The settings a sign-in holds. The config block or the environment may set
@@ -282,6 +288,8 @@ class Settings:
     personal_jobs: tuple[str, ...] = ()
     # The webhook routes whose turns are the owner's own (on a personal profile only).
     owner_routes: tuple[str, ...] = ()
+    # The `dist/cli.js` whose `chunk` command cuts long text into chunks.
+    chunker: str = ""
 
     @property
     def signed_in(self) -> bool:
@@ -421,6 +429,7 @@ def load(home_dir: Optional[Path] = None, *, from_config: bool = True) -> Settin
         personal_profile=_personal_profile(home_dir, pick(PERSONAL_PROFILE_ENV)[0]),
         personal_jobs=_names(pick(PERSONAL_JOBS_ENV)[0]),
         owner_routes=_names(pick(OWNER_ROUTES_ENV)[0]),
+        chunker=pick(CHUNKER_ENV)[0] or pick(CLIENT_ENV)[0],
     )
 
 

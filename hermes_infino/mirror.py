@@ -97,7 +97,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
 
-from . import config, recall, tables
+from . import chunks, config, recall, tables
 from .client import InfinoClient, InfinoError
 from .local import LATE_COMMITS_FILE, LocalStore, append_line
 
@@ -185,6 +185,41 @@ def _fit(rows: list[dict]) -> list[dict]:
     return rows
 
 
+def _parts(rows: list[dict]) -> list[list[dict]]:
+    """`rows` in appends of at most PUSH_MAX_BYTES of JSON each, never
+    parting the chunks of one message (the rows that share a `row_id`): a
+    check of what the cloud has asks by `row_id`, so a message the cloud
+    has part of would read as there. A message larger than that goes alone."""
+    parts: list[list[dict]] = []
+    part: list[dict] = []
+    size = 0
+    i = 0
+    while i < len(rows):
+        j = i + 1
+        while j < len(rows) and rows[j].get(tables.ROW_ID) == rows[i].get(tables.ROW_ID):
+            j += 1
+        group = rows[i:j]
+        grown = sum(len(json.dumps(r, default=str)) for r in group)
+        if part and size + grown > PUSH_MAX_BYTES:
+            parts.append(part)
+            part, size = [], 0
+        part += group
+        size += grown
+        i = j
+    if part:
+        parts.append(part)
+    return parts
+
+
+def _chunker(settings: config.Settings) -> Optional[chunks.Chunker]:
+    """The `chunk` command of the client INFINO_CHUNKER (or INFINO_CLIENT)
+    names, run with the Node Hermes keeps."""
+    if not settings.chunker:
+        return None
+    from .mcp_launch import node_command
+    return chunks.client_chunker(node_command(), settings.chunker)
+
+
 def _raw_marks(state: dict) -> dict:
     """The marks a state holds, as written."""
     raw = state.get("marks", {})
@@ -238,6 +273,8 @@ class Mirror:
         self.local = local
         self.personal = personal
         self.client = client or InfinoClient(settings.api_key, settings.url)
+        # What cuts long conversation text into chunks before it goes up.
+        self.chunker: Optional[chunks.Chunker] = _chunker(settings)
         self.dir = config.state_dir(settings.home)
         # The cloud databases whose tables are right (ensure_cloud_tables);
         # why each of the others failed its last attempt, and when the last
@@ -707,7 +744,8 @@ class Mirror:
         return [r for r in rows if r.get("scope") != recall.PERSONAL]
 
     def _push(self, src: Source, rows: list[dict]) -> None:
-        """Append rows. A row the cloud refuses outright is set aside
+        """Append rows: a long message as its chunks (`chunks.expand`), each
+        append within PUSH_MAX_BYTES. A row the cloud refuses outright is set aside
         (REFUSED_FILE) rather than refused again on every sync, stalling the
         source: always for "too large" or "unprocessable"; for a plain 400
         only when other rows of the batch were accepted, since a 400 on every
@@ -715,7 +753,9 @@ class Mirror:
         if not rows:
             return
         refused: list[tuple[dict, InfinoError]] = []
-        accepted = self._push_finding_refused(src, rows, refused)
+        accepted = 0
+        for part in _parts(chunks.expand(src.table, rows, self.chunker)):
+            accepted += self._push_finding_refused(src, part, refused)
         for row, error in refused:
             if error.status != BAD_REQUEST or accepted:
                 self._set_aside(src, row, error)

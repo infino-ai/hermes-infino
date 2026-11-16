@@ -28,7 +28,7 @@ Each forget writes the ids of the rows it deletes, and nothing else of them, to 
 - `forgotten` lives in the same database as the rows. A database dropped and made again loses both, and every machine pushes all its rows again, forgotten ones included.
 - Where the cloud refuses to create `forgotten` (a key that may not create tables), forgets still delete, without that record.
 
-**`conversations`** logs every message of every session a person has with the agent, and who sent it. Tool calls and tool results have their own columns. A message stays in the log even after context compression or `/undo` removes it from the session. Scheduled jobs and subagents add no conversation rows; their model and tool calls are in `traces`.
+**`conversations`** logs every message of every session a person has with the agent, and who sent it. Tool calls and tool results have their own columns, kept whole (up to a million characters a cell, a bound only against a pathological value). A message stays in the log even after context compression or `/undo` removes it from the session. Scheduled jobs and subagents add no conversation rows; their model and tool calls are in `traces`.
 
 **`traces`** records every model call (model, provider, tokens, time) and every tool call (name, arguments, result, status, time). Secrets are masked the same way Hermes masks them for any memory plugin.
 
@@ -81,6 +81,8 @@ Once you sign in:
 
 - Every row is written to your machine first. It reaches the cloud a few seconds later, and Hermes sends whatever is left before it exits, waiting up to about ten seconds for the cloud. Anything still left goes with the next sync.
 - If the cloud is down, nothing is lost. The sync picks up where it stopped.
+- The cloud embeds `memory`, every message and tool result in `conversations`, and every call's arguments and result in `traces`, so all of them are found by meaning as well as by their words.
+- A long message or tool result is kept whole on your machine and goes to the cloud as chunks: rows that share the message's `row_id`, numbered by `chunk`, cut the way SuperGrep cuts a file for its index (markdown at its headings, other text in overlapping line windows), so each chunk is embedded whole and nothing past a length limit is dropped. The cut is made by the `chunk` command of the client `INFINO_CHUNKER` names.
 - If the cloud refuses a row, it stays on your machine. `hermes infino status` counts such rows, names the file that lists them, and shows how far behind the cloud is in the sync.
 - Forgetting a memory deletes it from the cloud too.
 - The cloud embeds memories itself, so your machine no longer has to embed locally.
@@ -302,6 +304,7 @@ The sign-in's URL and personal database go with its key. They apply only when th
 | `INFINO_TEAM_SKILLS` | `off` stops this profile loading the skills teammates publish (default on) |
 | `INFINO_PERSONAL_PROFILE` | `on` keeps this profile's conversations and traces out of the team database, and lets its gateway chats keep personal memory (default off). Any value other than `off`, `false`, `no` or `0` counts as `on`. |
 | `INFINO_PERSONAL_JOBS` | Scheduled jobs (names or ids, comma-separated) whose runs, and the chats their output is delivered to, stay out of the team database. On a profile other than the job's own, name the job, not its id. |
+| `INFINO_CHUNKER` | The `dist/cli.js` of a client with a `chunk` command (SuperGrep's), which cuts long conversation text into chunks before it goes to the cloud (default: `INFINO_CLIENT`). Without one that has the command, long text goes to the cloud whole. |
 | `INFINO_OWNER_ROUTES` | On a profile marked personal, the webhook routes (comma-separated) whose events are your own: their turns read and write your personal memory. Ignored on a shared profile. |
 | `INFINO_FLEET_API_KEY`, `INFINO_FLEET_TEAM_DATABASE`, `INFINO_FLEET_URL` | The key, team database and URL, written in the `env` block (see [Running a fleet](#running-a-fleet)). They come before every other setting of the same kind. |
 

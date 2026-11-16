@@ -247,11 +247,13 @@ def test_rows_from_every_message_shape(mgr, tmp_path):
     assert rows[1]["platform"] == "cli" and rows[1]["author"] == ""  # only the person's message names them
 
 
-def test_a_huge_cell_is_cut(mgr, tmp_path):
+def test_a_long_message_is_kept_whole_and_only_a_pathological_one_is_cut(mgr, tmp_path):
     _, p = mgr
     p.sync_turn("x" * (provider_mod.MAX_CELL_CHARS + 10), "ok", session_id="s1")
+    p.sync_turn("y" * (provider_mod.MAX_TEXT_CHARS + 10), "ok", session_id="s1")
     p._drain()
-    assert len(turn_rows(tmp_path)[0]["content"]) == provider_mod.MAX_CELL_CHARS
+    lengths = sorted(len(r["content"]) for r in turn_rows(tmp_path) if r["role"] == "user")
+    assert lengths == [provider_mod.MAX_CELL_CHARS + 10, provider_mod.MAX_TEXT_CHARS]
 
 
 def test_each_session_counts_its_own_messages(mgr, tmp_path):
