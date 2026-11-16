@@ -97,9 +97,12 @@ TEAM = recall.TEAM
 PERSONAL = recall.PERSONAL
 # Seconds a write waits for the local tables to exist after startup.
 READY_WAIT_S = 30.0
-# Longest single conversation cell, or memory, kept, so one huge message or
-# tool result cannot make an append too large.
+# Longest memory kept, so one huge memory cannot make an append too large.
 MAX_CELL_CHARS = 20_000
+# Longest conversation cell kept: a bound against a pathological value only.
+# A long message or tool result is kept whole on this machine and goes to the
+# cloud as chunks (chunks.py), each embedded whole.
+MAX_TEXT_CHARS = 1_000_000
 # Seconds between looks at the profile's sign-in, so a running process picks
 # up `hermes infino login` (or a key set in config) without a restart.
 SETTINGS_RECHECK_S = 30.0
@@ -241,9 +244,9 @@ def _user_entry_forms(text: str, names: tuple[str, ...]) -> list[str]:
     return forms
 
 
-def _clip(text: Any) -> str:
+def _clip(text: Any, limit: int = MAX_CELL_CHARS) -> str:
     s = text if isinstance(text, str) else json.dumps(text, default=str)
-    return s if len(s) <= MAX_CELL_CHARS else s[:MAX_CELL_CHARS]
+    return s if len(s) <= limit else s[:limit]
 
 
 def _scope(value: Any) -> Optional[str]:
@@ -1091,10 +1094,10 @@ class InfinoMemoryProvider(MemoryProvider):
             "turn_id": turn,
             "seq": seq,
             "role": role,
-            "content": _clip(content),
+            "content": _clip(content, MAX_TEXT_CHARS),
             "tool_name": tool_name,
-            "tool_args": _clip(tool_args),
-            "tool_result": _clip(tool_result),
+            "tool_args": _clip(tool_args, MAX_TEXT_CHARS),
+            "tool_result": _clip(tool_result, MAX_TEXT_CHARS),
             "author": author if role == "user" else "",
             "profile": self._profile,
             "platform": self._platform,

@@ -120,19 +120,21 @@ def test_a_transient_refusal_falls_back_once_and_tries_hybrid_again(team_local, 
     r = Recaller([cloud_source(team_local)], cloud)
     platform.hybrid_statuses = [503]
     assert "deploy freeze" in r.recall("deploy freeze")[0]
-    before = requests_to(platform, "hybrid_search")
+    before = platform.hybrid_tables.count(tables.MEMORY)
     r.recall("deploy freeze")
-    assert requests_to(platform, "hybrid_search") == before + 1
+    assert platform.hybrid_tables.count(tables.MEMORY) == before + 1
 
 
-def test_a_lasting_refusal_turns_the_database_keyword_only(team_local, cloud, platform):
+def test_a_lasting_refusal_turns_that_table_keyword_only(team_local, cloud, platform):
     cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploy freeze"}])
     r = Recaller([cloud_source(team_local)], cloud)
     platform.hybrid_statuses = [403]
     r.recall("deploy freeze")
-    before = requests_to(platform, "hybrid_search")
+    assert (TEAM_DB, tables.MEMORY) in r._keyword_only
+    assert (TEAM_DB, tables.HISTORY) not in r._keyword_only
+    before = platform.hybrid_tables.count(tables.MEMORY)
     assert "deploy freeze" in r.recall("deploy freeze")[0]
-    assert requests_to(platform, "hybrid_search") == before
+    assert platform.hybrid_tables.count(tables.MEMORY) == before  # memory is not asked hybrid again
 
 
 def test_an_unexpected_cloud_error_falls_back_to_this_machine(team_local, cloud, platform):
@@ -165,9 +167,9 @@ def test_a_400_about_the_query_does_not_turn_hybrid_off(team_local, cloud, platf
     r = Recaller([cloud_source(team_local)], cloud)
     platform.hybrid_statuses = [400]  # "scripted": nothing about vectors
     r.recall("deploy freeze")
-    before = requests_to(platform, "hybrid_search")
+    before = platform.hybrid_tables.count(tables.MEMORY)
     r.recall("deploy freeze")
-    assert requests_to(platform, "hybrid_search") == before + 1
+    assert platform.hybrid_tables.count(tables.MEMORY) == before + 1
 
 
 def test_personal_memory_shows_only_to_its_person(team_local, personal_local):
@@ -270,11 +272,11 @@ def test_a_worker_older_than_rerank_is_not_asked_again_and_hybrid_stays_on(team_
     r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True)
     assert "deploy freeze" in r.recall("deploy freeze")[0]
     asked = len(platform.reranked)
-    hybrid = requests_to(platform, "hybrid_search")
+    hybrid = platform.hybrid_tables.count(tables.MEMORY)
     assert "deploy freeze" in r.recall("deploy freeze")[0]
     assert len(platform.reranked) == asked  # not asked again
-    assert TEAM_DB not in r._keyword_only
-    assert requests_to(platform, "hybrid_search") == hybrid + 1  # the plain search is still hybrid
+    assert (TEAM_DB, tables.MEMORY) not in r._keyword_only
+    assert platform.hybrid_tables.count(tables.MEMORY) == hybrid + 1  # the plain search is still hybrid
     assert rerank_unavailable(InfinoError(400, "unknown field `rerank`, expected one of `table_name`, `k`"))
 
 
@@ -330,10 +332,11 @@ def test_a_keyword_only_database_is_ranked_too(team_local, cloud, platform):
     cloud.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploys deploys on Tuesday"},
                                           {"row_id": "b", "content": "deploys moved to Thursday"}])
     r = Recaller([cloud_source(team_local, (2 ** 62, ""))], cloud, rank=True)
-    r._keyword_only.add(TEAM_DB)
+    r._keyword_only.add((TEAM_DB, tables.MEMORY))
     block, _ = r.recall("deploys")
     assert lines(block)[0] == "- [team] deploys moved to Thursday"
-    assert all("field_name" in body for body in platform.reranked)  # bm25_search's body
+    # memory's ranked searches are bm25_search's (its body names `field_name`)
+    assert all("field_name" in body for body in platform.reranked if body["table_name"] == tables.MEMORY)
 
 
 def history(**row) -> dict:

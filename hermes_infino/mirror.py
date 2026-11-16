@@ -97,8 +97,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
 
-from . import config, recall, tables
-from .client import InfinoClient, InfinoError
+from . import chunks, config, recall, tables
+from .client import InfinoClient, InfinoError, LoadsUnsupported
 from .local import LATE_COMMITS_FILE, LocalStore, append_line
 
 logger = logging.getLogger(__name__)
@@ -144,6 +144,16 @@ PUSH_BATCH = 200
 # The most JSON one append carries: a conversation row can hold three 20,000
 # character cells, and a request that large risks the client's timeout.
 PUSH_MAX_BYTES = 2_000_000
+# A source with this many rows or more waiting past its mark sends them by one
+# platform load job rather than appends, as the Infino client's index sends a
+# large write: a load embeds its rows across the platform's hosts at once,
+# where appends take them a batch at a time; a few rows go faster by appends,
+# as a load takes about half a minute to start. A first sign-in's upload of a
+# machine's history goes this way.
+LOAD_JOB_MIN_ROWS = 700
+# The most rows, and the most JSON, one load carries.
+LOAD_MAX_ROWS = 20_000
+LOAD_MAX_BYTES = 64_000_000
 # Row ids per cloud delete.
 FORGET_BATCH = 100
 # The latest rows pushed that a table's loss is checked against (with the
@@ -175,14 +185,51 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _fit(rows: list[dict]) -> list[dict]:
-    """The leading rows whose JSON fits one append (PUSH_MAX_BYTES), at least one."""
+def _fit(rows: list[dict], max_bytes: Optional[int] = None) -> list[dict]:
+    """The leading rows whose JSON fits one append (PUSH_MAX_BYTES), or one
+    load (`max_bytes`), at least one."""
+    limit = PUSH_MAX_BYTES if max_bytes is None else max_bytes
     size = 0
     for i, r in enumerate(rows):
         size += len(json.dumps(r, default=str))
-        if size > PUSH_MAX_BYTES and i:
+        if size > limit and i:
             return rows[:i]
     return rows
+
+
+def _parts(rows: list[dict]) -> list[list[dict]]:
+    """`rows` in appends of at most PUSH_MAX_BYTES of JSON each, never
+    parting the chunks of one message (the rows that share a `row_id`): a
+    check of what the cloud has asks by `row_id`, so a message the cloud
+    has part of would read as there. A message larger than that goes alone."""
+    parts: list[list[dict]] = []
+    part: list[dict] = []
+    size = 0
+    i = 0
+    while i < len(rows):
+        j = i + 1
+        while j < len(rows) and rows[j].get(tables.ROW_ID) == rows[i].get(tables.ROW_ID):
+            j += 1
+        group = rows[i:j]
+        grown = sum(len(json.dumps(r, default=str)) for r in group)
+        if part and size + grown > PUSH_MAX_BYTES:
+            parts.append(part)
+            part, size = [], 0
+        part += group
+        size += grown
+        i = j
+    if part:
+        parts.append(part)
+    return parts
+
+
+def _chunker(settings: config.Settings) -> Optional[chunks.Chunker]:
+    """The Infino client's `chunk` command (INFINO_CLIENT), run with the
+    Node Hermes keeps."""
+    if not settings.client:
+        return None
+    from .mcp_launch import node_command
+    return chunks.client_chunker(node_command(), settings.client)
 
 
 def _raw_marks(state: dict) -> dict:
@@ -238,6 +285,11 @@ class Mirror:
         self.local = local
         self.personal = personal
         self.client = client or InfinoClient(settings.api_key, settings.url)
+        # What cuts long conversation text into chunks before it goes up.
+        self.chunker: Optional[chunks.Chunker] = _chunker(settings)
+        # Whether the platform runs load jobs; false once it answers that it
+        # does not (LoadsUnsupported), and rows go by appends from then on.
+        self.loads = True
         self.dir = config.state_dir(settings.home)
         # The cloud databases whose tables are right (ensure_cloud_tables);
         # why each of the others failed its last attempt, and when the last
@@ -648,12 +700,22 @@ class Mirror:
                 check = src.mark in unsure
                 try:
                     while True:
-                        rows = _fit(src.store.rows_after(src.table, marks.get(src.mark), until, PUSH_BATCH))
+                        upto = recheck.get(src.mark)
+                        # Many rows go by one load; never rows the cloud may
+                        # have some of already (a source unsure, or re-checked
+                        # up to a mark), which go by appends, each batch asked
+                        # about first: a load cannot be asked which of its
+                        # rows to skip, nor set aside a row the cloud refuses.
+                        by_load = (self.loads and not check and upto is None
+                                   and src.store.count_after(src.table, marks.get(src.mark), until)
+                                   >= LOAD_JOB_MIN_ROWS)
+                        rows = (_fit(src.store.rows_after(src.table, marks.get(src.mark), until, LOAD_MAX_ROWS),
+                                     LOAD_MAX_BYTES) if by_load
+                                else _fit(src.store.rows_after(src.table, marks.get(src.mark), until, PUSH_BATCH)))
                         if not rows:
                             break
                         first = (int(rows[0][tables.STORED]), str(rows[0][tables.ROW_ID]))
                         last = (int(rows[-1][tables.STORED]), str(rows[-1][tables.ROW_ID]))
-                        upto = recheck.get(src.mark)
                         kept = self._sendable(src, rows)
                         send = self._not_in_cloud(src, kept) if kept and (check or (upto and first <= upto)) else kept
                         check = False
@@ -665,7 +727,7 @@ class Mirror:
                         # not only those in that sync's first batch.
                         recheck[src.mark] = max(upto or last, last)
                         self._save_state(marks, in_flight=sorted(unsure | {src.mark}), recheck=recheck)
-                        self._push(src, send)
+                        self._push(src, send, by_load)
                         # Its unanswered batch was checked with this one, and this one went.
                         unsure.discard(src.mark)
                         # The mark moves after each accepted batch, so a failed
@@ -706,16 +768,29 @@ class Mirror:
             return rows
         return [r for r in rows if r.get("scope") != recall.PERSONAL]
 
-    def _push(self, src: Source, rows: list[dict]) -> None:
-        """Append rows. A row the cloud refuses outright is set aside
+    def _push(self, src: Source, rows: list[dict], by_load: bool = False) -> None:
+        """Append rows: a long message as its chunks (`chunks.expand`), each
+        append within PUSH_MAX_BYTES, or `by_load` all of them by one load job.
+        A row the cloud refuses outright is set aside
         (REFUSED_FILE) rather than refused again on every sync, stalling the
         source: always for "too large" or "unprocessable"; for a plain 400
         only when other rows of the batch were accepted, since a 400 on every
-        row says the table, not a row, is the trouble."""
+        row says the table, not a row, is the trouble. A load that fails
+        raises, as an append that fails does: the source is unsure, and the
+        next sync sends its rows by appends, asking the cloud which it has."""
         if not rows:
             return
+        if by_load and self.loads:
+            try:
+                self.client.load(src.database, src.table, chunks.expand(src.table, rows, self.chunker))
+                return
+            except LoadsUnsupported as e:
+                logger.info("infino: this platform runs no load jobs (%s); rows go by appends", e)
+                self.loads = False
         refused: list[tuple[dict, InfinoError]] = []
-        accepted = self._push_finding_refused(src, rows, refused)
+        accepted = 0
+        for part in _parts(chunks.expand(src.table, rows, self.chunker)):
+            accepted += self._push_finding_refused(src, part, refused)
         for row, error in refused:
             if error.status != BAD_REQUEST or accepted:
                 self._set_aside(src, row, error)

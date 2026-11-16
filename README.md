@@ -28,7 +28,7 @@ Each forget writes the ids of the rows it deletes, and nothing else of them, to 
 - `forgotten` lives in the same database as the rows. A database dropped and made again loses both, and every machine pushes all its rows again, forgotten ones included.
 - Where the cloud refuses to create `forgotten` (a key that may not create tables), forgets still delete, without that record.
 
-**`conversations`** logs every message of every session a person has with the agent, and who sent it. Tool calls and tool results have their own columns. A message stays in the log even after context compression or `/undo` removes it from the session. Scheduled jobs and subagents add no conversation rows; their model and tool calls are in `traces`.
+**`conversations`** logs every message of every session a person has with the agent, and who sent it. Tool calls and tool results have their own columns, kept whole (up to a million characters a cell, a bound only against a pathological value). A message stays in the log even after context compression or `/undo` removes it from the session. Scheduled jobs and subagents add no conversation rows; their model and tool calls are in `traces`.
 
 **`traces`** records every model call (model, provider, tokens, time) and every tool call (name, arguments, result, status, time). Secrets are masked the same way Hermes masks them for any memory plugin.
 
@@ -81,6 +81,9 @@ Once you sign in:
 
 - Every row is written to your machine first. It reaches the cloud a few seconds later, and Hermes sends whatever is left before it exits, waiting up to about ten seconds for the cloud. Anything still left goes with the next sync.
 - If the cloud is down, nothing is lost. The sync picks up where it stopped.
+- When 700 rows or more of a table are waiting, as when you first sign in on a machine with history, they go up as one load job, the way SuperGrep sends a large index: the platform embeds them across its hosts at once, where appends would take them a batch at a time. Fewer rows go as appends, which land in under a second. A load that fails sends nothing twice: the next sync sends its rows as appends, checking which ones the cloud already has.
+- The cloud embeds `memory` and its earlier versions in `memory_history`, every message and tool result in `conversations`, every call's arguments and result in `traces`, and every shared skill's description and text in `skills`, so all of them are found by meaning as well as by their words. Recall searches current memories and earlier versions both ways.
+- A long message or tool result is kept whole on your machine and goes to the cloud as chunks: rows that share the message's `row_id`, numbered by `chunk`, cut the way SuperGrep cuts a file for its index (markdown at its headings, other text in overlapping line windows), so each chunk is embedded whole and nothing past a length limit is dropped. The cut is made by the Infino client's `chunk` command (the client `INFINO_CLIENT` names); a client built before that command sends long text whole.
 - If the cloud refuses a row, it stays on your machine. `hermes infino status` counts such rows, names the file that lists them, and shows how far behind the cloud is in the sync.
 - Forgetting a memory deletes it from the cloud too.
 - The cloud embeds memories itself, so your machine no longer has to embed locally.
