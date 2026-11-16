@@ -122,8 +122,10 @@ def test_a_message_whose_chunks_reached_the_cloud_before_the_answer_is_not_sent_
     assert len(platform.rows(TEAM_DB, tables.CONVERSATIONS)) == 3
 
 
-def test_conversations_and_traces_are_embedded_in_the_cloud(m, platform):
-    for table, source in ((tables.CONVERSATIONS, ["content", "tool_result"]), (tables.TRACES, ["args", "result"])):
+def test_every_text_table_is_embedded_in_the_cloud(m, platform):
+    for table, source in ((tables.MEMORY, ["content"]), (tables.HISTORY, ["content"]),
+                          (tables.CONVERSATIONS, ["content", "tool_result"]), (tables.TRACES, ["args", "result"]),
+                          (tables.SKILLS, ["description", "content"])):
         [embedding] = [f for f in platform.schemas[(TEAM_DB, table)] if f["type"] == "embedding"]
         assert embedding["source"] == source
 
@@ -136,7 +138,7 @@ def test_a_platform_that_cannot_embed_gets_keyword_only_conversations(home, plat
     personal.ensure_tables(with_vectors=False, only=tables.PERSONAL)
     m = Mirror(sign_in(tmp_path, platform), team, personal)
     m.ensure_cloud_tables()
-    for table in (tables.MEMORY, tables.CONVERSATIONS, tables.TRACES):
+    for table in (tables.MEMORY, tables.HISTORY, tables.CONVERSATIONS, tables.TRACES, tables.SKILLS):
         assert all(f["type"] != "embedding" for f in platform.schemas[(TEAM_DB, table)])
 
 

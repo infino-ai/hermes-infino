@@ -81,7 +81,7 @@ Once you sign in:
 
 - Every row is written to your machine first. It reaches the cloud a few seconds later, and Hermes sends whatever is left before it exits, waiting up to about ten seconds for the cloud. Anything still left goes with the next sync.
 - If the cloud is down, nothing is lost. The sync picks up where it stopped.
-- The cloud embeds `memory`, every message and tool result in `conversations`, and every call's arguments and result in `traces`, so all of them are found by meaning as well as by their words.
+- The cloud embeds `memory` and its earlier versions in `memory_history`, every message and tool result in `conversations`, every call's arguments and result in `traces`, and every shared skill's description and text in `skills`, so all of them are found by meaning as well as by their words. Recall searches current memories and earlier versions both ways.
 - A long message or tool result is kept whole on your machine and goes to the cloud as chunks: rows that share the message's `row_id`, numbered by `chunk`, cut the way SuperGrep cuts a file for its index (markdown at its headings, other text in overlapping line windows), so each chunk is embedded whole and nothing past a length limit is dropped. The cut is made by the Infino client's `chunk` command (the client `INFINO_CLIENT` names); a client built before that command sends long text whole.
 - If the cloud refuses a row, it stays on your machine. `hermes infino status` counts such rows, names the file that lists them, and shows how far behind the cloud is in the sync.
 - Forgetting a memory deletes it from the cloud too.

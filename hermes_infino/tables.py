@@ -90,13 +90,14 @@ MEMORY_SCHEMA = [
 # (cosine) by itself and refuses a declaration for one.
 MEMORY_INDEXES = {"fts": [MEMORY_TEXT_COLUMN]}
 
-# `memory`'s columns, less its embedding (an earlier version is found by its
-# words, and is ranked for the question when ranking is on), with when it was
-# superseded, what superseded it, and the row it was.
+# `memory`'s columns, with when it was superseded, what superseded it, and the
+# row it was; in the cloud an earlier version is embedded as a memory is, so
+# recall finds it by meaning as well as by its words.
 HISTORY_SCHEMA = [f for f in MEMORY_SCHEMA if f["type"] != "embedding"] + [
     {"name": SUPERSEDED, "type": "i64"},
     {"name": SUPERSEDED_BY, "type": "large_utf8"},
     {"name": PRIOR_ROW_ID, "type": "utf8"},
+    {"name": EMBEDDING_COLUMN, "type": "embedding", "source": [MEMORY_TEXT_COLUMN], "nullable": False},
 ]
 HISTORY_INDEXES = {"fts": [MEMORY_TEXT_COLUMN]}
 
@@ -170,6 +171,7 @@ SKILLS_SCHEMA = [
     {"name": "author", "type": "utf8"},
     {"name": "profile", "type": "utf8"},
     {"name": "created_ms", "type": "i64"},      # the newest row of a name is its current version
+    {"name": EMBEDDING_COLUMN, "type": "embedding", "source": ["description", "content"], "nullable": False},
 ]
 SKILLS_INDEXES = {"fts": ["description", "content"]}
 
@@ -269,9 +271,17 @@ def ensure_optional(client: InfinoClient, database: str, table: str) -> None:
     keeps that table's rows on this machine, and the database's other tables
     are not held up. One of CLOUD_ONLY likewise."""
     schema, indexes = TEAM_TABLES[table] if table in TEAM_TABLES else CLOUD_ONLY[table]
-    client.ensure_table(database, table, schema, indexes)
+    try:
+        client.ensure_table(database, table, schema, indexes)
+    except InfinoError as e:
+        embedded = any(f["type"] == "embedding" for f in schema)
+        if not embedded or e.status not in NO_EMBEDDING_STATUSES or "embedding" not in e.message:
+            raise
+        logger.warning("infino: %s.%s is made without its embedding column, so it is searched by keyword "
+                       "only: %s", database, table, e)
+        client.ensure_table(database, table, keyword_only(schema), indexes)
     have = set(client.column_names(database, table))
-    missing = [f for f in schema if f["name"] not in have]
+    missing = [f for f in schema if f["type"] != "embedding" and f["name"] not in have]
     if missing:
         try:
             client.add_columns(database, table, [{"name": f["name"], "type": f["type"], "nullable": True}

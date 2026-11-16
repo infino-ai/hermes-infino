@@ -154,7 +154,8 @@ class Recaller:
         # Whether to ask the cloud to rank (INFINO_RANK_RECALL): a model then
         # reads the text of the memories it grades.
         self._rank = rank
-        self._keyword_only: set[str] = set()
+        # (database, table)s searched by keyword only: their vector leg was refused.
+        self._keyword_only: set[tuple[str, str]] = set()
         # Cloud databases whose deployment said it runs no triage pass.
         self._no_rerank: set[str] = set()
 
@@ -163,24 +164,17 @@ class Recaller:
         """The rows of `table` (current memories, or their history) in
         `database` for `query`, best first. With `rerank`, graded for the
         question by the platform's triage pass and returned in its order;
-        RerankUnavailable when the deployment cannot grade. The history has
-        no embedding column: it is searched by keyword."""
+        RerankUnavailable when the deployment cannot grade. Both tables are
+        searched hybrid; on a deployment that refuses the vector leg (it
+        cannot embed), by keyword from then on."""
         assert self._cloud is not None
         question = query if rerank else None
         projection = HISTORY_PROJECTION if table == tables.HISTORY else PROJECTION
-        if table == tables.HISTORY:
-            try:
-                return self._cloud.bm25_search(database, table, query, field=tables.MEMORY_TEXT_COLUMN, k=k,
-                                               projection=projection, rerank=question)
-            except InfinoError as e:
-                if rerank and rerank_unavailable(e):
-                    raise RerankUnavailable(str(e)) from e
-                raise
-        if database not in self._keyword_only:
+        if (database, table) not in self._keyword_only:
             try:
                 return self._cloud.hybrid_search(
-                    database, tables.MEMORY, query, text_field=tables.MEMORY_TEXT_COLUMN,
-                    vector_field=tables.EMBEDDING_COLUMN, k=k, projection=PROJECTION, rerank=question)
+                    database, table, query, text_field=tables.MEMORY_TEXT_COLUMN,
+                    vector_field=tables.EMBEDDING_COLUMN, k=k, projection=projection, rerank=question)
             except InfinoError as e:
                 if rerank and rerank_unavailable(e):
                     raise RerankUnavailable(str(e)) from e
@@ -190,14 +184,15 @@ class Recaller:
                 # `vector_field`) must never turn the database keyword-only.
                 if rerank or e.status not in NO_VECTOR_STATUSES:
                     raise
-                logger.info("infino: hybrid recall refused on %s (%s); using keyword search", database, e.status)
+                logger.info("infino: hybrid recall refused on %s.%s (%s); using keyword search", database, table,
+                            e.status)
                 # 403 holds for the table; a 400 only when it names the vector
                 # leg (any other 400 is about this query); 503 is transient.
                 if e.status == 403 or (e.status == 400 and any(w in e.message.lower() for w in NO_VECTOR_WORDS)):
-                    self._keyword_only.add(database)
+                    self._keyword_only.add((database, table))
         try:
             return self._cloud.bm25_search(
-                database, tables.MEMORY, query, field=tables.MEMORY_TEXT_COLUMN, k=k, projection=PROJECTION,
+                database, table, query, field=tables.MEMORY_TEXT_COLUMN, k=k, projection=projection,
                 rerank=question)
         except InfinoError as e:
             if rerank and rerank_unavailable(e):
