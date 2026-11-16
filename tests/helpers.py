@@ -222,6 +222,20 @@ def write_tools_setting(home_dir: Path, line: str) -> None:
     (home_dir / "config.yaml").write_text(f"mcp_servers:\n  infino:\n    command: hermes\n    env:\n      {line}\n")
 
 
+def make_tables(client, database: str, *names: str, personal: bool = False) -> None:
+    """Make `database` and the cloud tables `names` (every team or personal
+    table when none are named) as a table was made before tables were
+    loaded: by create_table, with the plugin's own columns and indexes."""
+    from hermes_infino import tables
+
+    client.ensure_database(database)
+    chosen = names or tuple(t for t in (tables.PERSONAL_TABLES if personal else tables.TEAM_TABLES)
+                            if t not in tables.OPTIONAL)
+    for name in chosen:
+        schema, indexes = tables.TEAM_TABLES[name] if name in tables.TEAM_TABLES else tables.CLOUD_ONLY[name]
+        client.ensure_table(database, name, schema, indexes)
+
+
 def requests_to(platform, route: str) -> int:
     """How many requests the platform got on a route (`append`, `hybrid_search`...)."""
     return sum(1 for path, _ in platform.requests if path.startswith(f"/v1/{route}"))

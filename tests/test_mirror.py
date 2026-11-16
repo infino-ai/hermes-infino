@@ -14,7 +14,7 @@ from hermes_infino.client import InfinoError
 from hermes_infino.local import LATE_COMMITS_FILE, PERSONAL_DB_DIR, LocalStore, arrow_schema
 from hermes_infino.mirror import Mirror
 
-from .helpers import PERSONAL_DB, TEAM_DB, requests_to, sign_in
+from .helpers import PERSONAL_DB, TEAM_DB, make_tables, requests_to, sign_in
 
 # A push batch small enough to see several batches in one sync.
 SMALL_BATCH = 3
@@ -108,7 +108,7 @@ def test_personal_transcripts_go_to_the_personal_database_only(home, platform, t
 def test_a_personal_database_that_cannot_be_made_holds_up_only_its_own_rows(home, platform, tmp_path):
     platform.refused_databases = {PERSONAL_DB}  # a key limited to other databases
     m = local_mirror(tmp_path, sign_in(tmp_path, platform, personal_database=PERSONAL_DB))
-    tables.ensure_all(m.client, TEAM_DB)
+    make_tables(m.client, TEAM_DB)
     m.client.append(TEAM_DB, tables.MEMORY, [{tables.ROW_ID: "old", "content": "forgotten"}])
     m.forget(tables.MEMORY, TEAM_DB, ["old"])
     m.forget(tables.MEMORY, PERSONAL_DB, ["mine-old"])
@@ -140,15 +140,6 @@ def test_a_failed_push_is_raised_before_a_database_out_of_reach(home, platform, 
     assert raised.value.status == 500 and "HTTP 500" in m.last_error()
     assert m.waiting()[PERSONAL_DB].status == 403
     assert list(m.waiting()) == [PERSONAL_DB]
-
-
-def test_a_platform_with_no_embedding_server_gets_a_keyword_only_memory(home, platform, tmp_path):
-    platform.no_embedding_server = True
-    m = make_mirror(tmp_path, sign_in(tmp_path, platform))
-    assert tables.EMBEDDING_COLUMN not in m.client.column_names(TEAM_DB, tables.MEMORY)
-    m.local.append(tables.MEMORY, [{"content": "found by keyword"}])
-    m.sync(wait=True)
-    assert [r["content"] for r in platform.rows(TEAM_DB, tables.MEMORY)] == ["found by keyword"]
 
 
 def test_without_a_personal_database_personal_transcripts_go_nowhere(m, platform):
@@ -234,7 +225,7 @@ def test_an_older_versions_personal_mark_is_not_taken_for_another_personal_datab
     [row] = m.personal.query_sql("SELECT stored_ms FROM memory WHERE row_id = 'late'")
     # An older version kept one personal mark whichever database it named: it pushed the
     # early memory to the other personal database, then the late one to this one.
-    tables.ensure_all(m.client, OTHER_PERSONAL_DB, personal=True)
+    make_tables(m.client, OTHER_PERSONAL_DB, personal=True)
     m.client.append(OTHER_PERSONAL_DB, tables.MEMORY, [dict(early)])
     m.client.append(PERSONAL_DB, tables.MEMORY, [dict(late)])
     (m.dir / mirror.STATE_FILE).write_text(

@@ -31,11 +31,18 @@ LATER_S = 0.01
 
 # -- signed in ----------------------------------------------------------------
 
-def test_team_tables_are_created(env, platform, tmp_path):
-    make_manager(tmp_path)
-    assert set(platform.databases[TEAM_DB]) == {*tables.ALL, *tables.CLOUD_ONLY}
-    embedding = [f for f in platform.schemas[(TEAM_DB, tables.MEMORY)] if f["name"] == "embedding"][0]
-    assert embedding == {"name": "embedding", "type": "embedding", "source": ["content"], "nullable": False}
+def test_team_tables_are_made_by_their_first_load(env, platform, tmp_path):
+    mgr, provider = make_manager(tmp_path)
+    # The database is there at once; a table only once rows load into it.
+    assert platform.databases[TEAM_DB] == {}
+    mgr.handle_tool_call("infino_remember", {"content": "The deploy freeze starts December 20"})
+    end_session(provider)
+    assert tables.MEMORY in platform.databases[TEAM_DB]
+    # The load declared no index or embedding: the platform chose them.
+    [load] = [r for r in platform.loads if r["table"] == tables.MEMORY]
+    assert load["if_exists"] == "append" and load["format"] == "parquet"
+    assert not {"fts", "embed", "no_embed", "no_fts"} & set(load)
+    assert "content" in load["text_columns"] and "chat" in load["text_columns"]
     # The local copy has every table; signed in, the cloud embeds, so it carries no vectors.
     assert set(local(tmp_path).list_tables()) == set(tables.ALL)
     assert local(tmp_path).has_vectors() is False
@@ -44,14 +51,20 @@ def test_team_tables_are_created(env, platform, tmp_path):
 def test_personal_database_holds_the_personal_tables_only(env, platform, tmp_path):
     # Personal memory, and personal conversations and traces; never skills.
     env.setenv("INFINO_PERSONAL_DATABASE", PERSONAL_DB)
-    make_manager(tmp_path)
-    assert set(platform.databases[PERSONAL_DB]) == {*tables.PERSONAL, *tables.CLOUD_ONLY}
+    mgr, provider = make_manager(tmp_path)
+    assert platform.databases[PERSONAL_DB] == {}  # made, and its tables by their first loads
+    mgr.handle_tool_call("infino_remember", {"content": "my standup notes go in the blue doc", "scope": "personal"})
+    end_session(provider)
+    assert set(platform.databases[PERSONAL_DB]) <= {*tables.PERSONAL, *tables.CLOUD_ONLY}
+    assert tables.MEMORY in platform.databases[PERSONAL_DB]
 
 
 def test_account_at_its_database_limit_still_gets_its_tables(env, platform, tmp_path):
     platform.databases[TEAM_DB] = {}       # the team database exists already...
     platform.database_limit = 1            # ...and the plan allows no more
-    make_manager(tmp_path)
+    mgr, provider = make_manager(tmp_path)
+    mgr.handle_tool_call("infino_remember", {"content": "The deploy freeze starts December 20"})
+    end_session(provider)
     assert tables.MEMORY in platform.databases[TEAM_DB]
 
 
@@ -91,13 +104,15 @@ def test_recall_falls_back_to_keyword_search(env, platform, tmp_path):
     assert "Acme renewal" in provider.prefetch("who owns the Acme renewal")
 
 
-def test_account_without_embedder_gets_keyword_only_memory(env, platform, tmp_path):
-    platform.no_embedder = True
+def test_a_table_the_platform_embeds_nothing_in_is_recalled_by_keyword(env, platform, tmp_path):
     mgr, provider = make_manager(tmp_path)
-    assert all(f["type"] != "embedding" for f in platform.schemas[(TEAM_DB, tables.MEMORY)])
     mgr.handle_tool_call("infino_remember", {"content": "Acme renewal is owned by support"})
     end_session(provider)
-    assert "Acme renewal" in provider.prefetch("who owns the Acme renewal")
+    platform.jobs[(TEAM_DB, tables.MEMORY)]["schema"].pop("embed")  # the platform chose no embedding
+    _, again = make_manager(tmp_path)
+    assert "Acme renewal" in again.prefetch("who owns the Acme renewal")
+    searches = [path for path, _ in platform.requests if path.endswith(f"/{TEAM_DB}") and "search" in path]
+    assert searches and all("bm25_search" in path for path in searches[-2:])
     hybrid_calls = sum(1 for p, _ in platform.requests if "/hybrid_search/" in p)
     provider.prefetch("Acme renewal again")
     assert sum(1 for p, _ in platform.requests if "/hybrid_search/" in p) == hybrid_calls  # not retried

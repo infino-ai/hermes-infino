@@ -38,6 +38,7 @@ def quick(monkeypatch):
     monkeypatch.setattr(mirror, "SETTLE_MS", 0)
     monkeypatch.setattr(backend, "SETTLE_MS", 0)
     monkeypatch.setattr(backend, "SYNC_DELAY_S", TEST_SYNC_DELAY_S)
+    monkeypatch.setattr(backend, "SYNC_MIN_INTERVAL_S", 0.0)
     backend._backends.clear()
     skills._loaded_at.clear()
     privacy._sessions.clear()  # what one test noted about its sessions is not another's

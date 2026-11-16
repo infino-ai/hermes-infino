@@ -1,9 +1,9 @@
 """The tables hermes-infino keeps in each team (and personal) database:
 everything the team's agents remember, say, do and share.
 
-- `memory`: what the team (or a person) should know. Its embedding column is
-  filled by the platform on append from `content`, so recall runs hybrid
-  (keyword + vector) search with the query embedded server-side.
+- `memory`: what the team (or a person) should know. Recall searches it by
+  keyword and, where the platform embeds it, by meaning, with the query
+  embedded server-side.
 - `conversations`: every message of every session, with the tool calls an
   assistant message made and each tool's result in their own columns, so
   the facts read from `content` come from what people and agents said, not
@@ -29,9 +29,12 @@ wrote the row, where `created_ms` (when the thing happened) is not.
 
 The same tables exist in two places: the local database (the engine's Python
 binding, under the profile's home), always; and the team's cloud database,
-once signed in. They differ in one column: locally, `memory.embedding` is a
-384-dimension vector this machine computes (`embed.py`); in the cloud it is
-the platform's embedding column, which the platform fills from `content`.
+once signed in. Locally, `memory.embedding` is a 384-dimension vector this
+machine computes (`embed.py`), and the indexes are the ones below. In the
+cloud a table is made by the first load of its rows (`loads.py`), and the
+platform chooses what it indexes and embeds from those rows: readers ask it
+(`loads.roles`) rather than assume the names here. A cloud table made before
+tables were loaded keeps the columns and indexes it was made with.
 
 A person's own database, on this machine and in the cloud, has `PERSONAL`
 of them: their memory, and the conversations and traces kept personal.
@@ -51,7 +54,8 @@ SKILLS = "skills"
 HISTORY = "memory_history"
 ALL = (MEMORY, CONVERSATIONS, TRACES, SKILLS, HISTORY)
 
-# The column the platform embeds, and the column it embeds from.
+# The local vector column, and the column it embeds; also what a cloud table
+# made before tables were loaded calls its embedding.
 EMBEDDING_COLUMN = "embedding"
 MEMORY_TEXT_COLUMN = "content"
 ROW_ID = "row_id"
@@ -167,15 +171,6 @@ SKILLS_SCHEMA = [
 ]
 SKILLS_INDEXES = {"fts": ["description", "content"]}
 
-# `memory` without the embedding column, where the platform cannot fill one:
-# a deployment with no embedding server (create_table answers 400), or an
-# account it gives none (403). Recall is then keyword-only.
-MEMORY_SCHEMA_KEYWORD_ONLY = [f for f in MEMORY_SCHEMA if f["name"] != EMBEDDING_COLUMN]
-# The statuses create_table refuses an embedding column with, its message
-# saying "embedding": no embedding server on the deployment, or a worker
-# built without embedding columns (400); none for this account (403).
-NO_EMBEDDING_STATUSES = (400, 403)
-
 TEAM_TABLES = {
     MEMORY: (MEMORY_SCHEMA, MEMORY_INDEXES),
     CONVERSATIONS: (CONVERSATIONS_SCHEMA, CONVERSATIONS_INDEXES),
@@ -183,9 +178,10 @@ TEAM_TABLES = {
     SKILLS: (SKILLS_SCHEMA, SKILLS_INDEXES),
     HISTORY: (HISTORY_SCHEMA, HISTORY_INDEXES),
 }
-# Tables a cloud database may lack without holding up the others: one that
-# cannot be made there (a key that may not create tables) keeps its own rows
-# on this machine, and every other table syncs as before (ensure_optional).
+# Tables a cloud database may lack without holding up the others: one that is
+# there without a column this version writes, which the key may not add,
+# keeps its own rows on this machine, and every other table syncs as before
+# (ensure_optional).
 OPTIONAL = (HISTORY,)
 # Tables the cloud databases have and this machine does not (no rows of
 # them are kept or pushed here): optional too, made as OPTIONAL are.
@@ -213,31 +209,23 @@ class OutdatedTable(Exception):
 
 
 def ensure_all(client: InfinoClient, database: str, personal: bool = False) -> None:
-    """Create the database and its tables unless they exist. Where the
-    platform cannot fill an embedding column (no embedding server on the
-    deployment, or none for the account), `memory` is created keyword-only.
+    """Create the database unless it exists, and make its tables that exist
+    right. A table that is not there yet is made by the first load of its
+    rows (`loads.py`), with what the platform chooses to index and embed.
 
     A table that exists must have every column this version writes: a row
-    pushed into a `memory` without its `chat` would read as the whole team's
-    memory. A missing column is added (nullable: the rows already there read
-    it as null). When the platform refuses that - a key that may not manage
-    the database - the table is refused by name, and the mirror pushes
-    nothing to the database until it is fixed: every row stays on this
-    machine meanwhile."""
+    loaded into a `memory` without its `chat` would read as the whole team's
+    memory, and a load whose columns the table lacks is refused. A missing
+    column is added (nullable: the rows already there read it as null). When
+    the platform refuses that - a key that may not manage the database - the
+    table is refused by name, and the mirror loads nothing into the database
+    until it is fixed: every row stays on this machine meanwhile."""
     client.ensure_database(database)
-    for table, (schema, indexes) in (PERSONAL_TABLES if personal else TEAM_TABLES).items():
-        if table in OPTIONAL:
-            continue  # made on its own (ensure_optional): it never holds up these
-        try:
-            client.ensure_table(database, table, schema, indexes)
-        except InfinoError as e:
-            if table != MEMORY or e.status not in NO_EMBEDDING_STATUSES or "embedding" not in e.message:
-                raise
-            logger.warning("infino: %s.%s is made without its embedding column, so recall there is "
-                           "keyword-only: %s", database, MEMORY, e)
-            client.ensure_table(database, MEMORY, MEMORY_SCHEMA_KEYWORD_ONLY, MEMORY_INDEXES)
-        have = set(client.column_names(database, table))
-        missing = [f for f in schema if f["type"] != "embedding" and f["name"] not in have]
+    have_tables = set(client.list_tables(database))
+    for table, (schema, _indexes) in (PERSONAL_TABLES if personal else TEAM_TABLES).items():
+        if table in OPTIONAL or table not in have_tables:
+            continue  # optional ones on their own (ensure_optional); a missing one is made by its first load
+        missing = _missing_columns(client, database, table, schema)
         if not missing:
             continue
         try:
@@ -247,18 +235,19 @@ def ensure_all(client: InfinoClient, database: str, personal: bool = False) -> N
             names = ", ".join(f["name"] for f in missing)
             raise OutdatedTable(f"{database}.{table} has no {names}, and adding it was refused ({e}). Add it as a "
                                 f"nullable column with a key that may manage {database}; until then nothing is "
-                                f"pushed to {database}, and every row stays on this machine") from None
+                                f"loaded into {database}, and every row stays on this machine") from None
 
 
 def ensure_optional(client: InfinoClient, database: str, table: str) -> None:
-    """Create one of OPTIONAL in `database` unless it exists, with every
-    column this version writes. Raises when it cannot be made: the caller
-    keeps that table's rows on this machine, and the database's other tables
-    are not held up. One of CLOUD_ONLY likewise."""
-    schema, indexes = TEAM_TABLES[table] if table in TEAM_TABLES else CLOUD_ONLY[table]
-    client.ensure_table(database, table, schema, indexes)
-    have = set(client.column_names(database, table))
-    missing = [f for f in schema if f["name"] not in have]
+    """Make one of OPTIONAL (or CLOUD_ONLY) in `database` right when it is
+    there: every column this version writes. One that is not there yet is
+    made by its first load. Raises OutdatedTable when a missing column cannot
+    be added: the caller keeps that table's rows on this machine, and the
+    database's other tables are not held up."""
+    schema = TEAM_TABLES[table][0] if table in TEAM_TABLES else CLOUD_ONLY[table][0]
+    if table not in client.list_tables(database):
+        return
+    missing = _missing_columns(client, database, table, schema)
     if missing:
         try:
             client.add_columns(database, table, [{"name": f["name"], "type": f["type"], "nullable": True}
@@ -268,3 +257,10 @@ def ensure_optional(client: InfinoClient, database: str, table: str) -> None:
                 raise
             raise OutdatedTable(f"{database}.{table} has no {', '.join(f['name'] for f in missing)}, and this key "
                                 f"may not add it: {e}") from e
+
+
+def _missing_columns(client: InfinoClient, database: str, table: str, schema: list[dict]) -> list[dict]:
+    """The columns of `schema` the cloud table lacks, the local embedding
+    aside (the platform makes its own)."""
+    have = set(client.column_names(database, table))
+    return [f for f in schema if f["type"] != "embedding" and f["name"] not in have]

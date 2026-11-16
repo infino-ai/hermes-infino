@@ -3,7 +3,13 @@
 Every row is written to a local database first (`local.py`). A sync pushes
 to the cloud the rows of each source past a mark - the (stored_ms, row_id) of
 the last row the cloud accepted - in that order, and moves the mark only
-after each batch is accepted. A source is one local table and the one cloud
+after each batch is accepted. A batch goes up as one load (`loads.py`): a
+file uploaded from this machine, then a load job that appends it to the
+table, making the table on its first load, and the sync waits for the job
+to end. A load job takes its table to itself while it runs, so a load costs
+tens of seconds, not a request's time: a batch is every row a source has
+past its mark, up to PUSH_BATCH rows (or PUSH_MAX_BYTES), one load per source
+per sync, and the rows written while a sync runs go with the next one. A source is one local table and the one cloud
 database it goes to: each of the team's tables to the team's database, and
 each of the person's own tables (their memory, and the conversations and
 traces kept personal) to their personal database - or nowhere, when they
@@ -40,25 +46,26 @@ rows, and the sync says why. Each database is
 apart: one that is not right holds up only its own sources, never the other
 database's, nor the forgets to it.
 
-A batch whose append was never answered may still have reached the cloud (a
-timeout after the platform committed it, or a process killed mid-append). A
+A batch whose load was never seen to end may still reach the cloud (a
+process killed while it waited, a job still running past the wait). A
 note is written before each append, naming its source with every other one
 still unsure, and that source is cleared once a batch of it is accepted, so
 the next sync of each first asks the cloud which of its first batch's rows it
 has, and sends only the rest. The note also re-checks the source up to the
 batch's last row (see below), so every row of that batch is asked about
-wherever the next sync's mark starts. (The platform's append is not
-idempotent by `row_id`; this check is how the plugin keeps from sending a
-batch twice.) The marks and notes are kept in STATE_FILE, written whole; one
+wherever the next sync's mark starts. Before it asks, it waits for any load still
+writing the table, so a batch still being taken in is not sent again. (A
+load is not idempotent by `row_id`; this check is how the plugin keeps from
+sending a batch twice.) The marks and notes are kept in STATE_FILE, written whole; one
 that is there but cannot be read (a power loss) has lost where the marks
 were, so every row stored by then is checked with the cloud the same way
 before it is sent.
 
-A row the cloud refuses outright (too large, malformed) is set aside in
+A row the cloud refuses outright (a load that failed on it) is set aside in
 REFUSED_FILE and the source goes on; a source the cloud is failing on stops
-without stopping the others, or the forgets. A worker too busy to take a
-batch (413, its memory over budget while other queries fill it) refuses no
-row: that is the sync's failure, and the rows go with a later one.
+without stopping the others, or the forgets. A load the platform could not
+finish (stopped, or another load of the table running) refuses no row: that
+is the sync's failure, and the rows go with a later one.
 
 A local commit slower than the settle window, or stamped behind its table's
 latest row (a clock put back), may have been passed by a mark before it was
@@ -66,7 +73,8 @@ visible (local.LATE_COMMITS_FILE notes it): the next sync moves the mark back
 before it and re-sends what the cloud lacks.
 
 A memory deleted locally (`infino_forget`, or Hermes replacing a built-in
-memory) is deleted in the cloud by its `row_id`s, from a small queue applied
+memory) is deleted in the cloud by its `row_id`s (every passage the platform
+cut the row into shares it), from a small queue applied
 after each sync's pushes: by id, so a memory saved again later is never
 deleted with it, and after the pushes, so a row pushed while it was being
 deleted is deleted too. A forget the cloud could not be asked about at the
@@ -81,6 +89,10 @@ they name it again, and fails no sync: a database the key does not reach is
 lock is held only to read and rewrite the file, never across a request to the
 cloud; a line that cannot be read (cut short by a crash) is taken off, since
 it can never be applied.
+
+A delete waits for the table's load to end: a load job is the table's only
+writer while it runs, so a forget whose table another machine is loading
+stays queued for the next sync.
 
 One sync runs at a time per profile (a file lock); the others skip.
 """
@@ -97,7 +109,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
 
-from . import config, recall, tables
+from . import config, loads, recall, tables
 from .client import InfinoClient, InfinoError
 from .local import LATE_COMMITS_FILE, LocalStore, append_line
 
@@ -139,13 +151,17 @@ GONE_STATUSES = (404, 410)
 # Rows stored this recently are left for the next sync (another process may
 # still be committing a row stamped just before them).
 SETTLE_MS = 2_000
-# Rows per cloud append.
-PUSH_BATCH = 200
-# The most JSON one append carries: a conversation row can hold three 20,000
-# character cells, and a request that large risks the client's timeout.
-PUSH_MAX_BYTES = 2_000_000
+# The most rows one load carries. A load job costs tens of seconds whatever
+# its size (measured on the platform: about 10 s to upload a small file, and
+# 10 to 40 s for its job), so a sync sends a source's rows in one load.
+PUSH_BATCH = 5_000
+# The most a load carries, measured as the rows' JSON: a conversation row
+# can hold three 20,000 character cells.
+PUSH_MAX_BYTES = 32_000_000
 # Row ids per cloud delete.
 FORGET_BATCH = 100
+# What a forget answers while a load is writing its table: it stays queued.
+TABLE_BUSY_STATUS = 409
 # The latest rows pushed that a table's loss is checked against (with the
 # first): a table is lost only when the cloud holds none of them.
 LOST_CHECK_ROWS = 32
@@ -412,6 +428,7 @@ class Mirror:
             state = self._state()
             marks = self.marks()
             lost = []
+            in_cloud = set(self.client.list_tables(database))
             for src in self.sources():
                 if src.database != database:
                     continue
@@ -425,6 +442,9 @@ class Mirror:
                 probes = self._sent_probes(src, mark)
                 if not probes:
                     continue  # nothing up to the mark was sent: nothing there to have lost
+                if src.table not in in_cloud:
+                    lost.append(src.mark)  # the table is gone, and its rows with it
+                    continue
                 ids = ", ".join(tables.sql_string(i) for i in sorted(probes))
                 found = self.client.query_sql(
                     src.database, f"SELECT count(*) AS n FROM {src.table} WHERE {tables.ROW_ID} IN ({ids})")
@@ -503,9 +523,12 @@ class Mirror:
         return self._recorded(src.database, src.table, ids)
 
     def _recorded(self, database: str, table: str, ids: set[str]) -> set[str]:
-        """The rows of `ids` that `database`'s `forgotten` names for `table`."""
+        """The rows of `ids` that `database`'s `forgotten` names for `table`:
+        none while no forget has made it (its first load does)."""
         out: set[str] = set()
         ordered = sorted(ids)
+        if ordered and tables.FORGOTTEN not in self.client.list_tables(database):
+            return out
         for start in range(0, len(ordered), FORGET_BATCH):
             found = self.client.query_sql(
                 database, f"SELECT {tables.ROW_ID} FROM {tables.FORGOTTEN} WHERE {tables.FORGOTTEN_FROM} = "
@@ -678,6 +701,8 @@ class Mirror:
                         if progress:
                             progress(src.mark, pushed[src.mark])
                 except Exception as e:
+                    if self._refused_to_make(src.database, src.table, e):
+                        continue  # its rows stay here; the others go on
                     # The rows stay local and the mark where the cloud stopped
                     # accepting: nothing is skipped, and the next sync starts there.
                     logger.info("infino: %s stopped at its last accepted batch: %s", src.mark, e)
@@ -696,6 +721,22 @@ class Mirror:
             self._save_state(marks, in_flight=sorted(unsure), recheck=recheck)
             return pushed
 
+    def _refused_to_make(self, database: str, table: str, error: Exception) -> bool:
+        """Whether `error` is cloud `database` refusing to make optional
+        `table` by its first load (a key that may not make tables there).
+        Then the table is refused for this process, as when it was made
+        apart (`_optional_made`): its rows stay on this machine, and nothing
+        else is held up."""
+        if not (isinstance(error, InfinoError) and error.status in OPTIONAL_REFUSED_STATUSES):
+            return False
+        if table not in tables.OPTIONAL and table not in tables.CLOUD_ONLY:
+            return False
+        logger.warning("infino: %s refuses to make %s, so its rows stay on this machine (asked again when Hermes "
+                       "next starts); everything else syncs: %s", database, table, error)
+        self._optional_refused.add((database, table))
+        self._optional_ready.discard((database, table))
+        return True
+
     def _sendable(self, src: Source, rows: list[dict]) -> list[dict]:
         """The rows of a batch its cloud database may have: never a personal
         memory from the team's own table (an older version's, not moved out
@@ -707,7 +748,7 @@ class Mirror:
         return [r for r in rows if r.get("scope") != recall.PERSONAL]
 
     def _push(self, src: Source, rows: list[dict]) -> None:
-        """Append rows. A row the cloud refuses outright is set aside
+        """Load rows. A row the cloud refuses outright is set aside
         (REFUSED_FILE) rather than refused again on every sync, stalling the
         source: always for "too large" or "unprocessable"; for a plain 400
         only when other rows of the batch were accepted, since a 400 on every
@@ -723,11 +764,12 @@ class Mirror:
                 raise error
 
     def _push_finding_refused(self, src: Source, rows: list[dict], refused: list) -> int:
-        """Append rows, halving a refused batch down to the rows refused; how
-        many were accepted. Failures other than refusals are raised, a busy
-        worker's 413 (OVER_BUDGET) among them."""
+        """Load rows, halving a refused batch down to the rows refused; how
+        many were accepted. Failures other than refusals are raised: a load
+        that did not finish, another load of the table running, a busy
+        worker's 413 (OVER_BUDGET)."""
         try:
-            self.client.append(src.database, src.table, rows)
+            self._load(src.database, src.table, rows)
             return len(rows)
         except InfinoError as e:
             if e.status not in REFUSED_STATUSES or OVER_BUDGET in e.message:
@@ -738,6 +780,10 @@ class Mirror:
             mid = len(rows) // 2
             return (self._push_finding_refused(src, rows[:mid], refused)
                     + self._push_finding_refused(src, rows[mid:], refused))
+
+    def _load(self, database: str, table: str, rows: list[dict]) -> None:
+        """Append `rows` to the cloud table by a load, and wait for it to end."""
+        loads.load(self.client, self.settings.url, database, table, rows)
 
     def _set_aside(self, src: Source, row: dict, error: InfinoError) -> None:
         logger.warning("infino: the cloud refused %s row %s; it stays on this machine: %s",
@@ -785,7 +831,12 @@ class Mirror:
 
     def _not_in_cloud(self, src: Source, rows: list[dict]) -> list[dict]:
         """The rows of a batch the cloud does not have, nor had and forgot
-        (in `forgotten`)."""
+        (in `forgotten`), once any load still writing the table has ended:
+        what that load takes in is not sent again. A table not there yet has
+        none of them."""
+        loads.settle(self.client, src.database, src.table)
+        if src.table not in self.client.list_tables(src.database):
+            return list(rows)
         ids = ", ".join(tables.sql_string(str(r[tables.ROW_ID])) for r in rows)
         have = {str(r.get(tables.ROW_ID)) for r in self.client.query_sql(
             src.database, f"SELECT {tables.ROW_ID} FROM {src.table} WHERE {tables.ROW_ID} IN ({ids})")}
@@ -821,10 +872,12 @@ class Mirror:
 
     def matching_rows(self, table: str, database: str, predicate: str) -> list[dict]:
         """The cloud rows matching `predicate`, whole, whichever machine pushed
-        them. Asked while a tool call waits, as `matching_ids` is."""
+        them: a row the platform cut into passages comes back as one, its
+        `content` its passages joined. Asked while a tool call waits, as
+        `matching_ids` is."""
         s = self.settings
         client = InfinoClient(s.api_key, s.url, timeout=FORGET_LOOKUP_TIMEOUT_S, retries=0)
-        return client.query_sql(database, f"SELECT * FROM {table} WHERE {predicate}")
+        return loads.whole_rows(client.query_sql(database, f"SELECT * FROM {table} WHERE {predicate}"))
 
     def forget(self, table: str, database: str, row_ids: list[str]) -> None:
         """Queue the cloud delete of rows by their ids."""
@@ -953,9 +1006,16 @@ class Mirror:
         return {str(r[tables.ROW_ID]) for r in matched if r.get(tables.ROW_ID)}
 
     def _delete_ids(self, database: str, table: str, ids: list[str]) -> None:
+        """Record `ids` in `forgotten`, then delete them, FORGET_BATCH a
+        request; never while a load is writing the table (it stays queued)."""
+        if not ids:
+            return
+        if loads.busy(self.client, database, table):
+            raise InfinoError(TABLE_BUSY_STATUS, f"a load is writing {database}.{table}; the forget waits for the "
+                                                 f"next sync")
+        self._note_forgotten(database, table, ids)
         for start in range(0, len(ids), FORGET_BATCH):
             chunk = ids[start:start + FORGET_BATCH]
-            self._note_forgotten(database, table, chunk)
             self.client.delete(database, table, f"{tables.ROW_ID} IN ({', '.join(map(tables.sql_string, chunk))})")
 
     def _note_forgotten(self, database: str, table: str, ids: list[str]) -> None:
@@ -972,12 +1032,16 @@ class Mirror:
         if not ids or not self._forgotten_kept(database):
             return
         try:
-            new = [i for i in ids if i not in self._recorded(database, table, set(ids))]
+            recorded = self._recorded(database, table, set(ids))
+            new = [i for i in ids if i not in recorded]
             now = _now_ms()
             for start in range(0, len(new), PUSH_BATCH):
-                self.client.append(database, tables.FORGOTTEN, [
+                self._load(database, tables.FORGOTTEN, [
                     {tables.FORGOTTEN_FROM: table, tables.ROW_ID: i, tables.FORGOTTEN_MS: now}
                     for i in new[start:start + PUSH_BATCH]])
         except InfinoError as e:
+            if tables.FORGOTTEN not in self.client.list_tables(database) and \
+                    self._refused_to_make(database, tables.FORGOTTEN, e):
+                return  # no record can be kept there: the delete goes ahead without one
             raise ForgottenUnknown(f"the ids a forget deletes could not be written to {database}."
                                    f"{tables.FORGOTTEN}, so it stays queued: {e}") from e

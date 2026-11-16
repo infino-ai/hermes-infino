@@ -15,7 +15,7 @@ from hermes_infino.local import PERSONAL_DB_DIR, LocalStore
 from hermes_infino.recall import Recaller
 
 from .helpers import (DM, GROUP, PERSONAL_DB, TEAM_DB, agent_tool_call, end_session, hermes_dispatch, in_session,
-                      local_rows, make_manager)
+                      local_rows, make_manager, make_tables)
 from .test_builtin import contents, turn, write_file
 
 
@@ -183,7 +183,7 @@ def test_infino_forget_follows_the_chain_in_the_cloud_whichever_machine_pushed_i
     p.on_memory_write("add", "memory", "standup is at ten")
     end_session(p)
     # A teammate's machine kept two earlier versions: nine, superseded by nine-thirty, superseded by ten.
-    tables.ensure_optional(InfinoClient("k", platform.url), TEAM_DB, tables.HISTORY)
+    make_tables(InfinoClient("k", platform.url), TEAM_DB, tables.HISTORY)
     platform.databases[TEAM_DB][tables.HISTORY] += [
         {"row_id": "t1", "stored_ms": 1, "content": "standup is at nine", "scope": "team", "chat": "",
          tables.SUPERSEDED: 1, tables.SUPERSEDED_BY: "standup is at nine-thirty", tables.PRIOR_ROW_ID: "x"},

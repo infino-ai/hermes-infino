@@ -6,13 +6,19 @@ table, 400 for a hybrid search the deployment cannot embed, 403 for an
 embedding column an account cannot have, 400 for one a deployment with no
 embedding server cannot, 404 for a delete in a database or table that does
 not exist, 413 for an append a busy worker's memory budget cannot take).
-Search is a naive keyword match:
+Rows are loaded as the platform loads them: a Parquet file put to an
+upload session, then a load job that appends it to the table, making the
+table on its first load with the roles a load would choose (a text index on
+`content`, else the first text column, and an embedding `emb` of `content`).
+A load ends at once, in the state scripted (`load_states`, else succeeded),
+and may cut each `content` into passages (`passages`). Search is a naive keyword match:
 these tests check the plugin's logic, not ranking. The real platform is
 exercised by the end-to-end test on a Hermes install.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import sqlite3
@@ -68,6 +74,17 @@ class FakePlatform:
         self.trial_without_key = False  # /v1/trial answers 200 with no api_key
         self.valid_keys = None         # a set: any other bearer key answers 401
         self.keys_seen: list[str] = []  # the bearer key of every request
+        # Loads: the files put to upload sessions, by URL path; each table's
+        # load record; the end state of the next loads, in order (else
+        # succeeded); tables a load is writing now (a load or delete of one is
+        # refused); how many passages each loaded `content` is cut into.
+        self.uploads: dict[str, bytes] = {}
+        self.jobs: dict[tuple[str, str], dict] = {}
+        self.load_states: list[str] = []
+        self.loading: set[tuple[str, str]] = set()
+        self.passages = 1
+        self.loads: list[dict] = []    # each load request, in order
+        self.indexes: dict[tuple[str, str], dict] = {}
         self._lock = threading.Lock()
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
@@ -115,8 +132,27 @@ class FakePlatform:
                         return
                     if parsed.path == "/v1/databases":
                         self._send(200, [{"name": n} for n in fake.databases])
+                    elif parsed.path.startswith("/v1/hydrate/"):
+                        db = urllib.parse.unquote(parsed.path.split("/")[3])
+                        table = dict(urllib.parse.parse_qsl(parsed.query)).get("table", "")
+                        job = fake.jobs.get((db, table))
+                        if (db, table) in fake.loading:
+                            job = {**(job or {}), "state": "running"}
+                        self._send(200, job) if job else self._send(404, {"error": f"no load job for {table}"})
                     else:
                         self._send(404, {"error": "no route"})
+
+            def do_PUT(self):
+                parsed = urllib.parse.urlparse(self.path)
+                length = int(self.headers.get("Content-Length") or 0)
+                data = self.rfile.read(length)
+                with fake._lock:
+                    fake.requests.append((parsed.path, "{}"))
+                    if self.headers.get("Authorization"):
+                        self._send(400, {"error": "an upload session takes no key"})
+                        return
+                    fake.uploads[parsed.path] = data
+                self._send(200, {})
 
             def do_POST(self):
                 parsed = urllib.parse.urlparse(self.path)
@@ -158,6 +194,10 @@ class FakePlatform:
         op, db = parts[1], urllib.parse.unquote(parts[2])
         if op == "delete" and params["table"] not in self.databases.get(db, {}):
             return 404, {"error": f"no table {params['table']} in database {db}"}, None
+        if op == "delete" and (db, params["table"]) in self.loading:
+            return 409, {"error": "a load is writing the table"}, None
+        if op == "hydrate":
+            return self._hydrate(db, parts[3:], body)
         tables = self.databases.setdefault(db, {})
         if op == "list_tables":
             return 200, list(tables), None
@@ -187,6 +227,7 @@ class FakePlatform:
                     return 400, {"error": f'indexes.vector names "{index["column"]}", an embedding column'}, None
             tables[body["table_name"]] = []
             self.schemas[(db, body["table_name"])] = body["schema"]
+            self.indexes[(db, body["table_name"])] = body.get("indexes") or {}
             return 200, {}, None
         if op == "append":
             if self.busy_appends > 0:
@@ -249,6 +290,73 @@ class FakePlatform:
                 return 200, {"data": [{"n": len(rows)}]}, None
             return 200, {"data": rows}, None
         return 404, {"error": f"no route {op}"}, None
+
+    def _hydrate(self, db: str, rest: list[str], body: dict):
+        """An upload opened, or a load: the uploaded Parquet file appended to
+        the table (made by its first load), the job ended at once."""
+        if rest == ["uploads"]:
+            upload = f"u{len(self.uploads) + len(self.loads)}"
+            files = [{"name": f["name"], "url": f"{self.url}/_storage/{urllib.parse.quote(db, safe='')}/{upload}/"
+                                               f"{urllib.parse.quote(f['name'])}"}
+                     for f in body["files"]]
+            return 200, {"upload": upload, "prefix": f"_source/{upload}/", "files": files}, None
+        table = body["table"]
+        self.loads.append(body)
+        if (db, table) in self.loading:
+            return 409, {"error": f"a load of {table} is running"}, {"Retry-After": "0"}
+        if self.busy_appends > 0:
+            self.busy_appends -= 1
+            return 409, {"error": "busy"}, {"Retry-After": "0"}
+        if self.failed_appends > 0:
+            self.failed_appends -= 1
+            return 500, {"error": "load error"}, None
+        if self.over_budget:
+            return 413, OVER_BUDGET, None
+        import pyarrow.parquet as pq
+
+        upload = body["source"]["prefix"].strip("/").split("/")[1]
+        rows: list[dict] = []
+        for path, data in self.uploads.items():
+            if path.startswith(f"/_storage/{urllib.parse.quote(db, safe='')}/{upload}/"):
+                rows += pq.read_table(io.BytesIO(data)).to_pylist()
+        if self.refused_marker and any(self.refused_marker in json.dumps(r) for r in rows):
+            return self.refused_status, {"error": "row refused"}, None
+        tables = self.databases.setdefault(db, {})
+        if table not in tables and table in self.refused_tables:
+            return 403, {"error": "this key may not create tables in the database"}, None
+        if table not in tables:
+            tables[table] = []
+            columns = list(rows[0]) if rows else []
+            text = [c for c in columns if c in body.get("text_columns", [])]
+            fts = ["content"] if "content" in text else text[:1]
+            self.schemas[(db, table)] = ([{"name": c, "type": "large_utf8" if c in text else "i64"} for c in columns]
+                                         + ([{"name": "emb", "type": "vector", "dim": 768}] if "content" in text else []))
+            settled = {"fts": [{"column": c, "analyzer": "standard"} for c in fts]}
+            if "content" in text:
+                settled["embed"] = {"column": "emb", "source": ["content"]}
+        else:
+            known = self.jobs.get((db, table), {}).get("schema")
+            indexes = self.indexes.get((db, table), {})
+            embedded = [f["name"] for f in self.schemas.get((db, table), []) if f["type"] == "embedding"]
+            settled = known or {"fts": [{"column": c, "analyzer": "standard"} for c in indexes.get("fts", [])],
+                                **({"embed": {"column": embedded[0], "source": ["content"]}} if embedded else {})}
+        target = tables[table]
+        start = len(target)
+        for r in rows:
+            content = r.get("content")
+            cut = self.passages if isinstance(content, str) and len(content) >= self.passages else 1
+            step = -(-len(content) // cut) if cut > 1 else 0
+            for i in range(cut):
+                passage = dict(r)
+                if cut > 1:
+                    passage["content"] = content[i * step:(i + 1) * step]
+                target.append({"_id": str(len(target)), **passage, "chunk": i})
+        state = self.load_states.pop(0) if self.load_states else "succeeded"
+        if state == "failed":
+            del target[start:]  # a failed load leaves none of its rows
+        self.jobs[(db, table)] = {"state": state, "schema": settled, "request": body,
+                                  **({"error": "scripted"} if state not in ("succeeded", "synced") else {})}
+        return 202, {"job": f"hydrate/{db}/{table}", "state": "admitting"}, None
 
     def _reranked(self, db: str, op: str, body: dict):
         """A search with `rerank`, as the platform answers it: refused where

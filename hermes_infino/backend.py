@@ -15,7 +15,11 @@ sign-in), the backend made for the new ones takes over and the old one is
 retired: its syncs stop, so no row goes where the settings no longer say.
 Writes land locally and return; when signed in they also schedule a sync,
 which runs on a background thread once the rows have settled
-(`mirror.SETTLE_MS`), at most one at a time. A write made while a sync runs,
+(`mirror.SETTLE_MS`), at most one at a time, and no sooner than
+SYNC_MIN_INTERVAL_S after the last one started: each sync is a load per
+table that has rows, tens of seconds each, so a busy session's rows go up in
+a few larger loads, not one per turn. Recall finds them on this machine
+until then, as it finds any row the cloud does not have yet. A write made while a sync runs,
 or a sync that found another process syncing, schedules one more; a sync
 that failed is tried again by itself (SYNC_RETRY_FIRST_S, doubling up to
 SYNC_RETRY_MAX_S), so an idle gateway's rows do not wait for its next write.
@@ -36,7 +40,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from . import config, embed, privacy, recall, tables
+from . import config, embed, loads, privacy, recall, tables
 from .builtin import ENTRY_DELIMITER
 from .chats import CHATS_JOIN
 from .client import InfinoClient
@@ -48,6 +52,11 @@ logger = logging.getLogger(__name__)
 # How long after a write its sync runs: past the settle window, so the write
 # is pushed by the sync it scheduled.
 SYNC_DELAY_S = SETTLE_MS / 1000 + 0.5
+# The least time between the starts of two background syncs. A sync loads
+# each table that has new rows, and a load job costs tens of seconds whatever
+# its size (measured on the platform: about 10 s to upload a small file, then
+# 10 to 40 s for its job), so the rows of a minute go up together.
+SYNC_MIN_INTERVAL_S = 60.0
 # The most a session's end waits for its rows to reach the cloud, once they
 # have settled. Within Hermes's own bounds: a CLI's exit gets 30 s before its
 # watchdog ends the process (HERMES_EXIT_WATCHDOG_S), and a gateway agent's
@@ -74,7 +83,7 @@ PERSONAL_SEARCH_TIMEOUT_S = recall.RECALL_TIMEOUT_S
 
 def _best(results: list[list[dict]], k: int) -> list[dict]:
     """The `k` best rows of several searches, each row once (at its best
-    score), best first."""
+    score: a row the platform cut into passages is one), best first."""
     best: dict[str, dict] = {}
     for rows in results:
         for r in rows:
@@ -100,6 +109,8 @@ class Backend:
         self._last_write = 0.0
         # A sync was asked for while one was pending or running.
         self._again = False
+        # When the last background sync started (None before the first).
+        self._sync_started: Optional[float] = None
         # The sync that tries again after a failed one, and how long it waited
         # (0 after a sync that succeeded).
         self._retry_timer: Optional[threading.Timer] = None
@@ -493,7 +504,10 @@ class Backend:
                     # The pending or running sync may have read its rows already: one more after it.
                     self._again = True
                     return
-                self._timer = threading.Timer(SYNC_DELAY_S if delay_s is None else delay_s, self._sync_quietly)
+                delay = SYNC_DELAY_S if delay_s is None else delay_s
+                if self._sync_started is not None:
+                    delay = max(delay, self._sync_started + SYNC_MIN_INTERVAL_S - time.monotonic())
+                self._timer = threading.Timer(delay, self._sync_quietly)
                 self._timer.daemon = True
                 self._timer.start()
                 return
@@ -507,6 +521,8 @@ class Backend:
             if self._successor is not None:  # retired while this waited to run
                 return
         skipped = failed = False
+        with self._timer_lock:
+            self._sync_started = time.monotonic()
         try:
             pushed = self.mirror.sync()
             skipped = pushed == {}  # another process holds the sync: it may not see these rows
@@ -665,7 +681,9 @@ class Backend:
         personal cloud database when there is one (every machine's rows), with
         this machine's rows the cloud does not have yet (written since the
         last sync), as recall reads memory; from this machine's copy alone
-        when there is no personal database or it does not answer."""
+        when there is no personal database or it does not answer. The cloud
+        table is searched over the columns the platform text-indexed when its
+        first load made it (those below for a table made before)."""
         schema, indexes = tables.PERSONAL_TABLES[table]
         columns = indexes["fts"]
         projection = [f["name"] for f in schema if f["type"] != "embedding"]
@@ -675,8 +693,10 @@ class Backend:
             return here
         client = InfinoClient(s.api_key, s.url, timeout=PERSONAL_SEARCH_TIMEOUT_S, retries=0)
         try:
+            roles = loads.roles(client, s.personal_database, table)
+            searched = list(roles.text) if roles is not None else columns
             cloud = _best([client.bm25_search(s.personal_database, table, query, field=c, k=k,
-                                              projection=projection + ["score"]) for c in columns], k)
+                                              projection=projection + ["score"]) for c in searched], k)
         except Exception as e:  # this machine's copy answers instead
             logger.info("infino: the personal database did not answer a search: %s", e)
             return here

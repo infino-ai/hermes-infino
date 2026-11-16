@@ -10,7 +10,7 @@ import pytest
 from hermes_infino import config, skills, tables
 from hermes_infino.client import InfinoClient
 
-from .helpers import SKILL_MD, TEAM_DB, local_rows, make_manager, requests_to, sign_in
+from .helpers import SKILL_MD, TEAM_DB, local_rows, make_manager, make_tables, requests_to, sign_in
 
 
 class Ctx:
@@ -28,7 +28,7 @@ class Ctx:
 
 def publish(platform, *rows: dict, team: str = TEAM_DB) -> None:
     c = InfinoClient("k", platform.url)
-    tables.ensure_all(c, team)
+    make_tables(c, team)
     c.append(team, tables.SKILLS, list(rows))
 
 

@@ -1,7 +1,9 @@
 """A small client for the Infino platform's data API.
 
-Only the routes the plugin uses: create a database and its tables, append
-rows, recall memory, delete, and request a free account. The agent's own
+Only the routes the plugin uses: create a database, load rows (an upload
+from this machine, then a load job that makes the table on its first load and
+appends to it after), recall memory, delete, and request a free account. The
+older create-table and append routes stay for tables made before. The agent's own
 retrieval is the Infino client's MCP server, not this. Standard library
 only: the cloud needs nothing beyond Python itself.
 
@@ -34,6 +36,8 @@ MAX_RETRIES = 5
 DEFAULT_RETRY_AFTER_S = 1.0
 # Upper bound on any single wait, so a large Retry-After cannot stall a turn.
 MAX_RETRY_WAIT_S = 10.0
+# Seconds to wait for one file's bytes to reach the storage.
+UPLOAD_TIMEOUT_S = 300.0
 
 
 class InfinoError(Exception):
@@ -192,6 +196,42 @@ class InfinoClient:
         return _rows(
             self._request("POST", f"/v1/query_sql/{_q(database)}", body={"query": sql}, want_json=True)
         )
+
+    # -- loads ---------------------------------------------------------------
+
+    def open_upload(self, database: str, origin: str, files: list[dict]) -> dict:
+        """`POST /v1/hydrate/{db}/uploads`: open an upload of files from this
+        machine into the database's storage. `files` are each file's name and
+        size; the answer carries the `prefix` a load then reads from, and one
+        session URL per file, which its bytes are put to (`put_upload`)."""
+        return self._request("POST", f"/v1/hydrate/{_q(database)}/uploads", body={"origin": origin, "files": files})
+
+    def put_upload(self, url: str, data: bytes) -> None:
+        """`PUT` one file's bytes to the session URL `open_upload` gave for it.
+        No key: the URL is itself the permission, and the key must not reach
+        the storage it points at."""
+        req = urllib.request.Request(url, data=data, method="PUT", headers={"Content-Length": str(len(data))})
+        try:
+            with urllib.request.urlopen(req, timeout=max(self._timeout, UPLOAD_TIMEOUT_S)) as resp:
+                resp.read()
+        except urllib.error.HTTPError as e:
+            raise InfinoError(e.code, e.read().decode("utf-8", "replace")) from None
+
+    def submit_load(self, database: str, request: dict) -> dict:
+        """`POST /v1/hydrate/{db}`: start a load job; its name and state."""
+        return self._request("POST", f"/v1/hydrate/{_q(database)}", body=request)
+
+    def load_job(self, database: str, table: str) -> Optional[dict]:
+        """`GET /v1/hydrate/{db}?table=`: the record of the load job that last
+        loaded `table` (its state, error, and the columns it indexed and
+        embedded); None when no load job ever loaded it."""
+        try:
+            out = self._request("GET", f"/v1/hydrate/{_q(database)}", params={"table": table})
+        except InfinoError as e:
+            if e.status == 404:
+                return None
+            raise
+        return out if isinstance(out, dict) else None
 
     # -- transport -----------------------------------------------------------
 

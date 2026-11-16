@@ -4,7 +4,10 @@ Memory comes from two sources, the team's and the person's own, each a local
 database and, signed in, the cloud database it is caught up into. Signed in,
 a source's cloud database is searched first - hybrid over its `memory`, the
 question embedded server-side; keyword search where the table has no
-embedding column - and this machine's rows the cloud does not have yet
+embedding column. The columns searched are the ones the platform chose to
+index and embed when the table's first load made it (`loads.roles`); a table
+made before tables were loaded keeps the names in `tables`. A row the
+platform cut into passages is one hit. Then this machine's rows the cloud does not have yet
 (written since the last sync) are added from the local database, so a memory
 saved a moment ago is recalled. When the cloud cannot be reached, or a source
 has no cloud database (personal memory without a personal database), the
@@ -53,7 +56,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
-from . import chats, tables
+from . import chats, loads, tables
 from .client import InfinoClient, InfinoError, rerank_unavailable
 from .local import LocalStore
 
@@ -76,6 +79,10 @@ NO_VECTOR_STATUSES = (400, 403, 503)
 NO_VECTOR_WORDS = ("embedding", "vector")
 # Threads for cloud searches, shared by every recall of the process.
 CLOUD_SEARCH_THREADS = 8
+# Seconds a table no load made yet is taken to have the names in `tables`
+# before the platform is asked again (its first load may make it meanwhile).
+# A table a load made keeps its roles: asked once.
+ROLES_RETRY_S = 60.0
 
 _pool = ThreadPoolExecutor(max_workers=CLOUD_SEARCH_THREADS, thread_name_prefix="infino-recall")
 # The heading the recalled block goes under in Hermes's context.
@@ -157,6 +164,32 @@ class Recaller:
         self._keyword_only: set[str] = set()
         # Cloud databases whose deployment said it runs no triage pass.
         self._no_rerank: set[str] = set()
+        # What each cloud table indexes and embeds, by (database, table): the
+        # roles its first load settled on, or None with when it was asked
+        # (a table no load made: the names in `tables`).
+        self._roles: dict[tuple[str, str], tuple[Optional[loads.Roles], float]] = {}
+
+    def _columns(self, database: str, table: str) -> tuple[str, Optional[str]]:
+        """The text column a search of `table` matches words in, and the
+        column it searches by meaning (None for keyword only): what the
+        platform chose for the table, or, for one no load made, `content`
+        and `embedding` as a table made before tables were loaded has them.
+        A failure to ask is answered with those names this once."""
+        key = (database, table)
+        known = self._roles.get(key)
+        if known is None or (known[0] is None and time.monotonic() - known[1] >= ROLES_RETRY_S):
+            assert self._cloud is not None
+            try:
+                known = (loads.roles(self._cloud, database, table), time.monotonic())
+                self._roles[key] = known
+            except Exception as e:
+                logger.info("infino: what %s.%s indexes could not be read (%s); searching it as made before",
+                            database, table, e)
+                known = (None, 0.0)
+        roles = known[0]
+        if roles is None:
+            return tables.MEMORY_TEXT_COLUMN, tables.EMBEDDING_COLUMN
+        return roles.text_column(tables.MEMORY_TEXT_COLUMN) or tables.MEMORY_TEXT_COLUMN, roles.embedding
 
     def search_cloud(self, database: str, query: str, k: int = RECALL_K, rerank: bool = False,
                      table: str = tables.MEMORY) -> list[dict]:
@@ -166,21 +199,26 @@ class Recaller:
         RerankUnavailable when the deployment cannot grade. The history has
         no embedding column: it is searched by keyword."""
         assert self._cloud is not None
+        return loads.one_per_row(self._search_cloud(database, query, k, rerank, table))
+
+    def _search_cloud(self, database: str, query: str, k: int, rerank: bool, table: str) -> list[dict]:
+        assert self._cloud is not None
         question = query if rerank else None
         projection = HISTORY_PROJECTION if table == tables.HISTORY else PROJECTION
+        text, vector = self._columns(database, table)
         if table == tables.HISTORY:
             try:
-                return self._cloud.bm25_search(database, table, query, field=tables.MEMORY_TEXT_COLUMN, k=k,
+                return self._cloud.bm25_search(database, table, query, field=text, k=k,
                                                projection=projection, rerank=question)
             except InfinoError as e:
                 if rerank and rerank_unavailable(e):
                     raise RerankUnavailable(str(e)) from e
                 raise
-        if database not in self._keyword_only:
+        if vector is not None and database not in self._keyword_only:
             try:
                 return self._cloud.hybrid_search(
-                    database, tables.MEMORY, query, text_field=tables.MEMORY_TEXT_COLUMN,
-                    vector_field=tables.EMBEDDING_COLUMN, k=k, projection=PROJECTION, rerank=question)
+                    database, tables.MEMORY, query, text_field=text,
+                    vector_field=vector, k=k, projection=PROJECTION, rerank=question)
             except InfinoError as e:
                 if rerank and rerank_unavailable(e):
                     raise RerankUnavailable(str(e)) from e
@@ -197,7 +235,7 @@ class Recaller:
                     self._keyword_only.add(database)
         try:
             return self._cloud.bm25_search(
-                database, tables.MEMORY, query, field=tables.MEMORY_TEXT_COLUMN, k=k, projection=PROJECTION,
+                database, tables.MEMORY, query, field=text, k=k, projection=PROJECTION,
                 rerank=question)
         except InfinoError as e:
             if rerank and rerank_unavailable(e):

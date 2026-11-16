@@ -14,7 +14,7 @@ from hermes_infino import backend, config, embed, mirror, recall, tables
 from hermes_infino.backend import Backend
 from hermes_infino.client import InfinoError
 
-from .helpers import PERSONAL_DB, TEAM_DB, fake_embed, personal_rows, sign_in, wait_for
+from .helpers import PERSONAL_DB, TEAM_DB, fake_embed, make_tables, personal_rows, sign_in, wait_for
 
 # How long the stand-in sync below takes after it has read its rows.
 SLOW_SYNC_S = 0.5
@@ -109,7 +109,7 @@ def an_older_versions_personal_memory(b: Backend, database: str, personal: bool 
     pushed to `database` (the team's, when there was no personal database)."""
     b.local.ensure_tables(with_vectors=False)
     b.local.append(tables.MEMORY, [dict(OLD_PERSONAL_MEMORY)])
-    tables.ensure_all(b.mirror.client, database, personal=personal)
+    make_tables(b.mirror.client, database, personal=personal)
     b.mirror.client.append(database, tables.MEMORY, [dict(OLD_PERSONAL_MEMORY)])
 
 

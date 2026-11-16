@@ -11,7 +11,7 @@ from hermes_infino.client import InfinoClient, InfinoError, _rows, rerank_unavai
 from hermes_infino.local import LocalStore
 from hermes_infino.recall import Recaller, Source
 
-from .helpers import TEAM_DB, requests_to
+from .helpers import TEAM_DB, make_tables, requests_to
 
 # Long enough that a few of them fill the block's character budget.
 LONG = 900
@@ -38,8 +38,8 @@ def personal_local(home, tmp_path) -> LocalStore:
 @pytest.fixture
 def cloud(platform) -> InfinoClient:
     c = InfinoClient("k", platform.url, retries=0)
-    tables.ensure_all(c, TEAM_DB)
-    tables.ensure_optional(c, TEAM_DB, tables.HISTORY)
+    make_tables(c, TEAM_DB)
+    make_tables(c, TEAM_DB, tables.HISTORY)
     return c
 
 
@@ -315,7 +315,7 @@ def test_a_ranked_recall_still_shows_only_what_the_chat_may_see(team_local, clou
 
 def test_a_ranked_recall_of_personal_memory_shows_only_its_person(team_local, personal_local, cloud, platform):
     platform.rerank_supported = True
-    tables.ensure_all(cloud, "dana-own", personal=True)
+    make_tables(cloud, "dana-own", personal=True)
     cloud.append("dana-own", tables.MEMORY, [
         {"row_id": "p1", "content": "deploy password hint is blue", "author": "dana", "scope": "personal"},
         {"row_id": "p2", "content": "deploy password hint is red", "author": "sam", "scope": "personal"}])
@@ -387,7 +387,7 @@ def test_the_grader_may_put_a_superseded_memory_first_within_the_history(team_lo
 
 def test_a_cloud_without_the_history_table_still_recalls(team_local, platform):
     c = InfinoClient("k", platform.url, retries=0)
-    tables.ensure_all(c, TEAM_DB)  # no history table there
+    make_tables(c, TEAM_DB)  # no history table there
     c.append(TEAM_DB, tables.MEMORY, [{"row_id": "a", "content": "deploy freeze"}])
     team_local.append(tables.HISTORY, [history(content="deploy freeze was in June")])
     block, n = Recaller([cloud_source(team_local, (2 ** 62, ""))], c).recall("deploy freeze")

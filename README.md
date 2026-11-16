@@ -26,7 +26,7 @@ Each forget writes the ids of the rows it deletes, and nothing else of them, to 
 
 - A forget made by a version older than this one writes nothing to `forgotten`, so a machine whose every pushed memory such a forget took pushes them back.
 - `forgotten` lives in the same database as the rows. A database dropped and made again loses both, and every machine pushes all its rows again, forgotten ones included.
-- Where the cloud refuses to create `forgotten` (a key that may not create tables), forgets still delete, without that record.
+- Where the cloud refuses to make `forgotten` (a key that may not create tables), forgets still delete, without that record.
 
 **`conversations`** logs every message of every session a person has with the agent, and who sent it. Tool calls and tool results have their own columns. A message stays in the log even after context compression or `/undo` removes it from the session. Scheduled jobs and subagents add no conversation rows; their model and tool calls are in `traces`.
 
@@ -79,11 +79,14 @@ Without an account, nothing leaves your machine. Each memory is embedded locally
 
 Once you sign in:
 
-- Every row is written to your machine first. It reaches the cloud a few seconds later, and Hermes sends whatever is left before it exits, waiting up to about ten seconds for the cloud. Anything still left goes with the next sync.
+- Every row is written to your machine first. A sync loads it into the cloud: your machine writes each table's new rows to a Parquet file, uploads it to your database's storage, and the platform loads the file into the table. A load takes tens of seconds, so a sync sends each table's rows in one load, and syncs start at most once a minute; rows written meanwhile go with the next one. Hermes sends whatever is left before it exits, waiting up to about ten seconds for the cloud. Anything still left goes with the next sync, or with `hermes infino sync`, which waits for its loads to finish.
+- Each cloud table is made by the first load of its rows, and the platform chooses what it indexes for keyword search and what it embeds for search by meaning, from those rows. Every later load keeps those choices. Recall and search ask the platform what each table has, rather than assuming column names.
+- The platform may cut a long message or tool result into passages, one row each, all with the same `row_id`. Recall and search show such a row once, and a forget deletes every passage of it.
+- While a load is writing a table, forgets for that table wait for the next sync.
 - If the cloud is down, nothing is lost. The sync picks up where it stopped.
 - If the cloud refuses a row, it stays on your machine. `hermes infino status` counts such rows, names the file that lists them, and shows how far behind the cloud is in the sync.
 - Forgetting a memory deletes it from the cloud too.
-- The cloud embeds memories itself, so your machine no longer has to embed locally.
+- The cloud embeds what it chose to embed itself, so your machine no longer has to embed locally.
 - Recall reads from the cloud first. If the cloud is slow or can't be reached, recall searches your local machine.
 - Recall shows every source's current memories first. Earlier versions fill only what is left, each marked with when it was superseded and what replaced it, so the agent can tell an old fact from the current one, and history never pushes a current memory out.
 
