@@ -209,7 +209,10 @@ def one_per_row(rows: list[dict]) -> list[dict]:
 
 def whole_rows(rows: list[dict], column: str = "content") -> list[dict]:
     """One row per `row_id`, its `column` the row's passages joined in
-    order: the row as this plugin wrote it, read back from the cloud."""
+    order: the row as this plugin wrote it, read back from the cloud, but
+    for the spaces the platform trimmed where it cut the passages (6 of
+    12,120 characters, measured on the platform). Exact for a row the
+    platform did not cut, which is any memory of one passage's length."""
     groups: dict[str, list[dict]] = {}
     order: list[str] = []
     loose: list[dict] = []

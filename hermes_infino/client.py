@@ -38,6 +38,10 @@ DEFAULT_RETRY_AFTER_S = 1.0
 MAX_RETRY_WAIT_S = 10.0
 # Seconds to wait for one file's bytes to reach the storage.
 UPLOAD_TIMEOUT_S = 300.0
+# Seconds to wait for the platform to open an upload or take a load: it reads
+# the table and the upload before it answers (an append's took 18 to 29 s,
+# measured on the platform), longer than a plain request.
+LOAD_REQUEST_TIMEOUT_S = 120.0
 
 
 class InfinoError(Exception):
@@ -204,7 +208,8 @@ class InfinoClient:
         machine into the database's storage. `files` are each file's name and
         size; the answer carries the `prefix` a load then reads from, and one
         session URL per file, which its bytes are put to (`put_upload`)."""
-        return self._request("POST", f"/v1/hydrate/{_q(database)}/uploads", body={"origin": origin, "files": files})
+        return self._request("POST", f"/v1/hydrate/{_q(database)}/uploads", body={"origin": origin, "files": files},
+                             timeout=max(self._timeout, LOAD_REQUEST_TIMEOUT_S))
 
     def put_upload(self, url: str, data: bytes) -> None:
         """`PUT` one file's bytes to the session URL `open_upload` gave for it.
@@ -219,7 +224,8 @@ class InfinoClient:
 
     def submit_load(self, database: str, request: dict) -> dict:
         """`POST /v1/hydrate/{db}`: start a load job; its name and state."""
-        return self._request("POST", f"/v1/hydrate/{_q(database)}", body=request)
+        return self._request("POST", f"/v1/hydrate/{_q(database)}", body=request,
+                             timeout=max(self._timeout, LOAD_REQUEST_TIMEOUT_S))
 
     def load_job(self, database: str, table: str) -> Optional[dict]:
         """`GET /v1/hydrate/{db}?table=`: the record of the load job that last
@@ -243,6 +249,7 @@ class InfinoClient:
         params: Optional[dict] = None,
         body: Optional[dict] = None,
         want_json: bool = True,
+        timeout: Optional[float] = None,
     ) -> Any:
         url = self._url + path
         if params:
@@ -257,7 +264,7 @@ class InfinoClient:
         for attempt in range(self._retries + 1):
             req = urllib.request.Request(url, data=data, method=method, headers=headers)
             try:
-                with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                with urllib.request.urlopen(req, timeout=timeout or self._timeout) as resp:
                     raw = resp.read()
                     return json.loads(raw) if raw else {}
             except urllib.error.HTTPError as e:
