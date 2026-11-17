@@ -71,6 +71,7 @@ import sys
 import threading
 import time
 from contextlib import suppress
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -300,6 +301,27 @@ def dependencies_missing() -> list[str]:
     return missing
 
 
+@dataclass
+class _LiveTurn:
+    """A session's running turn, its messages written as they happen
+    (`live_message`): the first `seq` it took, the messages written, and each
+    tool call's function by its id, which names a tool message's tool."""
+    start: int
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    called: dict[str, dict] = field(default_factory=dict)
+
+
+# The provider live writes go to (live.py): the one this process initialized
+# last, the agent's own (a one-shot run, a chat session). Hermes runs no
+# provider for a subagent; its messages go through its parent's, under the
+# subagent's own session.
+_live_provider: Optional["InfinoMemoryProvider"] = None
+
+
+def live_provider() -> Optional["InfinoMemoryProvider"]:
+    return _live_provider
+
+
 class InfinoMemoryProvider(MemoryProvider):
     def __init__(self) -> None:
         self._home: Optional[Path] = None
@@ -330,6 +352,9 @@ class InfinoMemoryProvider(MemoryProvider):
         # session_id -> the next `seq` of its messages; a session this process
         # has not stored yet continues from what the local database holds.
         self._next_seq: dict[str, int] = {}
+        # session_id -> its running turn, written as it happens (live_message).
+        self._live_turns: dict[str, _LiveTurn] = {}
+        self._live_lock = threading.Lock()
         self._writer: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._last_recall: Optional[RecallStatus] = None
@@ -350,6 +375,8 @@ class InfinoMemoryProvider(MemoryProvider):
         return config.config_schema()
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        global _live_provider
+        _live_provider = self
         home = kwargs.get("hermes_home")
         self._home = Path(home) if home else None
         self._bind(config.load(self._home))
@@ -1034,7 +1061,15 @@ class InfinoMemoryProvider(MemoryProvider):
             new = _turn_messages(messages, user_content)
         else:
             new = [{"role": "user", "content": user_content}, {"role": "assistant", "content": assistant_content}]
-        start = self._next_seq[session] if session in self._next_seq else self._stored_next_seq(session)
+        with self._live_lock:
+            live = self._live_turns.pop(session, None)
+        if live is not None and live.messages:
+            # The turn's first messages went as they happened (live_message),
+            # in its order: write the ones after them, numbered on from them.
+            new = new[len(live.messages):]
+            start = live.start + len(live.messages)
+        else:
+            start = self._next_seq[session] if session in self._next_seq else self._stored_next_seq(session)
         self._next_seq[session] = start + len(new)
         # The turn's id, as Hermes announced it when the turn started (traces.py).
         turn = turn_id_for(session, _started_with(user_content))
@@ -1053,6 +1088,41 @@ class InfinoMemoryProvider(MemoryProvider):
             self._run_write(self._append, tables.CONVERSATIONS, rows, personal)
         # What Hermes's background review wrote after the last turn.
         self._run_write(self._mirror_builtin, chat, by_agent)
+
+    def live_message(self, session: str, turn: str, message: dict[str, Any]) -> None:
+        """One message of a running turn (its prompt, a model reply, a tool's
+        result), written to `conversations` as it happens rather than when the
+        turn ends: the agent's work in progress is then in Infino, where another
+        agent reads it, and a subagent it starts (live.py). `sync_turn` writes
+        only the messages after these. Not in a gateway, which serves several
+        people's sessions from one process and writes each turn whole."""
+        if not self._writes_enabled or not self._settings or not session or self._gateway():
+            return
+        with self._live_lock:
+            live = self._live_turns.get(session)
+            if live is None or (message.get("role") == "user" and live.messages):
+                start = self._next_seq[session] if session in self._next_seq else self._stored_next_seq(session)
+                live = self._live_turns[session] = _LiveTurn(start=start)
+            seq = live.start + len(live.messages)
+            live.messages.append(message)
+            for c in message.get("tool_calls") or []:
+                live.called[str(c.get("id"))] = c.get("function") or {}
+            self._next_seq[session] = seq + 1
+            called, so_far = dict(live.called), list(live.messages)
+        author = (self._settings.author or self._author) if message.get("role") == "user" else ""
+        row = self._conversation_row(session, turn, seq, message, author, called)
+        if not (row["content"] or row["tool_name"]):
+            return
+        assert self._backend is not None
+        personal = self._backend.transcript_personal(session, so_far)
+        self._run_write(self._append, tables.CONVERSATIONS, [row], personal)
+
+    def push_now(self) -> None:
+        """Send what this process has written to the cloud now, after the
+        writes still running: a subagent about to start reads its parent's
+        session there."""
+        if self._backend is not None:
+            self._run_write(self._backend.schedule_sync, 0.0)
 
     def _stored_next_seq(self, session: str) -> int:
         """The next `seq` of a session this process has not stored yet: one

@@ -10,8 +10,10 @@ skills.
 def register(ctx) -> None:
     from .provider import InfinoMemoryProvider
     from .skills import register_team_skills
+    from .live import register_hooks as register_live_hooks
     from .traces import register_hooks
 
     ctx.register_memory_provider(InfinoMemoryProvider())  # a new instance per load
     register_hooks(ctx)
+    register_live_hooks(ctx)
     register_team_skills(ctx)
