@@ -48,10 +48,9 @@ echo "node $NODE_BIN"
 
 step "2. the Infino client (README step 1)"
 cd "$CR/work"
-git clone -q -b feat/local-database-mode https://github.com/infino-ai/ask-bench.git && ok "cloned" || { bad "clone"; exit 1; }
-( cd ask-bench/client && PATH=$NODE_BIN:$PATH npm ci > "$CR/npm-ci.log" 2>&1 && PATH=$NODE_BIN:$PATH npm run build > "$CR/npm-build.log" 2>&1 )
-CLIENT=$CR/work/ask-bench/client/dist/cli.js
-[ -f "$CLIENT" ] && ok "built the client" || { bad "no client"; tail -n 20 "$CR/npm-build.log"; exit 1; }
+PATH=$NODE_BIN:$PATH npm install --prefix "$HH/infino-client" @infino-ai/code-context@0.6.0 > "$CR/npm-install.log" 2>&1
+CLIENT=$HH/infino-client/node_modules/@infino-ai/code-context/dist/cli.js
+[ -f "$CLIENT" ] && ok "installed the client" || { bad "no client"; tail -n 20 "$CR/npm-install.log"; exit 1; }
 
 step "3. the plugin at $SHA (README step 2)"
 "$HERMES" plugins install https://github.com/infino-ai/hermes-infino/tree/main/hermes_infino --enable --yes-deps --ref "$SHA" > "$CR/plugin-install.log" 2>&1

@@ -51,7 +51,7 @@ flowchart LR
     T -->|"before you sign in"| L
   end
   subgraph cloud ["Infino Cloud"]
-    S["Infino servers<br/>search, SQL, ask"]
+    S["Infino servers<br/>search, SQL"]
   end
   subgraph storage ["Object storage"]
     B[("Infino's bucket, or yours:<br/>S3, GCS or Azure")]
@@ -106,18 +106,14 @@ A version older than this one does not know `memory_history` or `forgotten`. It 
 You need:
 
 - Hermes, installed with its installer: `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`. The plugin is tested on Hermes 0.22.6, 0.22.7 and 0.23.0.
-- Read access to the private repositories `infino-ai/hermes-infino` and `infino-ai/ask-bench`. Run `gh auth login`, then `gh auth setup-git`, so `git clone` in step 1 can use your GitHub sign-in. Hermes's installer in step 2 uses it too. It also reads a `GITHUB_TOKEN=<a token that can read them>` line in `~/.hermes/.env`, but `git clone` doesn't.
-
-**1. Build the Infino client.** It needs Node.js 22.19 or newer. Hermes's installer puts one in `~/.hermes/tools/`.
+**1. Install the Infino client.** The client is [SuperGrep](https://github.com/infino-ai/supergrep), published on npm as `@infino-ai/code-context`. It needs Node.js 22.19 or newer. Hermes's installer puts one in `~/.hermes/tools/`.
 
 ```bash
-git clone -b feat/local-database-mode https://github.com/infino-ai/ask-bench.git
-cd ask-bench/client
 export PATH="$(ls -d ~/.hermes/tools/node-*/bin | head -n 1):$PATH"
-npm ci && npm run build
+npm install --prefix ~/.hermes/infino-client @infino-ai/code-context@0.6.0
 ```
 
-This builds `ask-bench/client/dist/cli.js`.
+This installs the client at `~/.hermes/infino-client/node_modules/@infino-ai/code-context/dist/cli.js`.
 
 **2. Install the plugin.** Hermes installs its Python dependencies and makes it the memory provider.
 
@@ -125,12 +121,12 @@ This builds `ask-bench/client/dist/cli.js`.
 hermes plugins install https://github.com/infino-ai/hermes-infino/tree/main/hermes_infino --enable --yes-deps
 ```
 
-**3. Add the Infino tools**, with the full path to the client from step 1.
+**3. Add the Infino tools**, with the path to the client from step 1.
 
 ```bash
 hermes config set mcp_servers.infino.command hermes
 hermes config set mcp_servers.infino.args '["infino", "mcp"]'
-hermes config set mcp_servers.infino.env.INFINO_CLIENT /full/path/to/ask-bench/client/dist/cli.js
+hermes config set mcp_servers.infino.env.INFINO_CLIENT "$HOME/.hermes/infino-client/node_modules/@infino-ai/code-context/dist/cli.js"
 hermes config set mcp_servers.infino.connect_timeout 120
 ```
 
@@ -241,7 +237,7 @@ Hermes tells the plugin which chat a message came from. Any chat that isn't a di
 Hermes runs the Infino client as an MCP server, started with `hermes infino mcp` from the `mcp_servers.infino` entry in `config.yaml`. Its tools depend on whether you're signed in:
 
 - **Not signed in:** `search`, `find`, `sql` and `read`, over the database on your machine.
-- **Signed in:** `ask`, `search`, `find`, `sql` and `join_keys`, over your team's database in the cloud. `ask` is Infino's retrieval agent: give it a question, and it returns the rows that answer it, with where they came from.
+- **Signed in:** `search`, `find`, `sql` and `join_keys`, over your team's database in the cloud. The tools read only that database, and none of them writes to it.
 
 The Infino tools search the team database. Your personal data is searched with `infino_personal_search`, a tool of the plugin's own: keyword search over your personal memory, conversations and traces. The agent has it in your own sessions, and on a profile marked personal, but never in a group chat or on a shared profile. Once a session uses it, that session's conversation and traces stay personal. A memory the session saves still follows the memory rule: it's the team's unless it's about one person.
 
@@ -265,7 +261,7 @@ mcp_servers:
     command: hermes
     args: [infino, mcp]
     env:
-      INFINO_CLIENT: /path/to/client/dist/cli.js
+      INFINO_CLIENT: /home/agent/.hermes/infino-client/node_modules/@infino-ai/code-context/dist/cli.js
       INFINO_FLEET_TEAM_DATABASE: support-team
       INFINO_FLEET_API_KEY: ${INFINO_API_KEY}    # a reference; the key itself is in the profile's .env
     connect_timeout: 120

@@ -76,6 +76,8 @@ def test_signed_in_through_the_environment_starts_it_on_the_cloud(started, home,
     assert started["argv"][2:5] == ["mcp", "--db", f"{platform.url}/{TEAM_DB}"]
     assert started["argv"][-2:] == ["--embed-provider", "platform"]
     assert {k: started["env"][k] for k in mcp_launch.CLOUD_ENV} == mcp_launch.CLOUD_ENV
+    # The tools reach the team database only, and none of them writes.
+    assert started["env"]["CX_ACCOUNT_DATA"] == "database" and started["env"]["CX_READ_ONLY"] == "1"
     assert started["env"]["INFINO_API_KEY"] == "the-key" and "CX_LOCAL_DB" not in started["env"]
     assert not local.LocalStore.under(config.state_dir(tmp_path)).has_vectors()
 

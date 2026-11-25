@@ -9,6 +9,8 @@ Hermes starts one command for `mcp_servers.infino`:
         env:
           INFINO_CLIENT: <path to the client's dist/cli.js>
 
+The client is SuperGrep, published on npm as @infino-ai/code-context.
+
 `hermes infino mcp` (cli.py) runs `launch` inside Hermes's own environment,
 where the plugin's dependencies are installed; a standard Hermes install keeps
 that environment at a path that changes with its dependencies, so no fixed
@@ -46,10 +48,13 @@ from pathlib import Path
 
 # The client's settings for each mode: the doors over the tables the plugin
 # keeps, conversations the table a call reads when it names none; never the
-# client's own code index, and no answer tool (the agent answers).
+# client's own code index. Signed in, the client reaches the team database
+# only (CX_ACCOUNT_DATA), not every database the key may see, and offers no
+# tool that writes (CX_READ_ONLY): the plugin writes, the tools read.
 PRIMARY_TABLE = "conversations"
 LOCAL_ENV = {"CX_TABLE": PRIMARY_TABLE}
-CLOUD_ENV = {"CX_TABLE": PRIMARY_TABLE, "CX_REMOTE_SEARCH": "1", "CX_AUTO_INDEX": "0", "CX_ANSWER_TOOL": "0"}
+CLOUD_ENV = {"CX_TABLE": PRIMARY_TABLE, "CX_REMOTE_SEARCH": "1", "CX_AUTO_INDEX": "0",
+             "CX_ACCOUNT_DATA": "database", "CX_READ_ONLY": "1"}
 PACKAGE = "hermes_infino_launch"
 
 
