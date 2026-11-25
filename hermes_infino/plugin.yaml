@@ -7,7 +7,7 @@ homepage: "https://github.com/infino-ai/hermes-infino"
 # is pinned: the Infino client reads the same local folder with its own copy of
 # the engine (@infino-ai/infino), and the two move together.
 python_dependencies:
-  - "infino==0.11.15"
+  - "infino==0.11.32"
   - "pyarrow>=24,<25"
   - "numpy>=2.5,<3"
   - "onnxruntime>=1.31,<2"
