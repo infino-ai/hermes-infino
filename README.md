@@ -106,18 +106,15 @@ A version older than this one does not know `memory_history` or `forgotten`. It 
 You need:
 
 - Hermes, installed with its installer: `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`. The plugin is tested on Hermes 0.22.6, 0.22.7 and 0.23.0.
-- Read access to the private repositories `infino-ai/hermes-infino` and `infino-ai/ask-bench`. Run `gh auth login`, then `gh auth setup-git`, so `git clone` in step 1 can use your GitHub sign-in. Hermes's installer in step 2 uses it too. It also reads a `GITHUB_TOKEN=<a token that can read them>` line in `~/.hermes/.env`, but `git clone` doesn't.
 
-**1. Build the Infino client.** It needs Node.js 22.19 or newer. Hermes's installer puts one in `~/.hermes/tools/`.
+**1. Install the Infino client**, [`@infino-ai/code-context`](https://www.npmjs.com/package/@infino-ai/code-context) from npm. It needs Node.js 22.19 or newer. Hermes's installer puts one in `~/.hermes/tools/`.
 
 ```bash
-git clone -b feat/local-database-mode https://github.com/infino-ai/ask-bench.git
-cd ask-bench/client
 export PATH="$(ls -d ~/.hermes/tools/node-*/bin | head -n 1):$PATH"
-npm ci && npm run build
+npm install --prefix ~/.hermes/infino-client @infino-ai/code-context
 ```
 
-This builds `ask-bench/client/dist/cli.js`.
+The client is then `~/.hermes/infino-client/node_modules/@infino-ai/code-context/dist/cli.js`.
 
 **2. Install the plugin.** Hermes installs its Python dependencies and makes it the memory provider.
 
@@ -125,12 +122,12 @@ This builds `ask-bench/client/dist/cli.js`.
 hermes plugins install https://github.com/infino-ai/hermes-infino/tree/main/hermes_infino --enable --yes-deps
 ```
 
-**3. Add the Infino tools**, with the full path to the client from step 1.
+**3. Add the Infino tools**, with the path to the client from step 1.
 
 ```bash
 hermes config set mcp_servers.infino.command hermes
 hermes config set mcp_servers.infino.args '["infino", "mcp"]'
-hermes config set mcp_servers.infino.env.INFINO_CLIENT /full/path/to/ask-bench/client/dist/cli.js
+hermes config set mcp_servers.infino.env.INFINO_CLIENT ~/.hermes/infino-client/node_modules/@infino-ai/code-context/dist/cli.js
 hermes config set mcp_servers.infino.connect_timeout 120
 ```
 
