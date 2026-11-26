@@ -67,6 +67,8 @@ CATCH_UP_S = 60.0
 PERSONAL_PART = "-personal-"
 # Random bytes in that name (hex: twice as many characters).
 PERSONAL_RANDOM_BYTES = 4
+# Seconds `status` waits for the cloud to say how it searches memory.
+STATUS_TIMEOUT_S = 10.0
 # The longest database name the platform takes.
 MAX_DATABASE_NAME = 128
 # What a platform URL starts with (any case).
@@ -141,7 +143,7 @@ def _status(args) -> int:
         if b.local.has_vectors():
             vectors = "on (local model)"
         elif settings.signed_in:
-            vectors = "off (the cloud embeds)"
+            vectors = "off (signed in: recall searches the cloud)"
         else:  # local mode: the provider makes them when Hermes starts
             vectors = "not made yet (Hermes makes them when it starts)"
         print(f"   memory vectors {vectors}")
@@ -153,6 +155,7 @@ def _status(args) -> int:
     print(f"signed in        {settings.url} / {settings.team_database}"
           + (f" (personal: {settings.personal_database})" if settings.personal_database else "")
           + f", from the {settings.source}")
+    print(f"   memory search  {_cloud_memory_search(settings)}")
     marks = b.mirror.marks()
     for src in b.mirror.sources():
         try:
@@ -169,6 +172,32 @@ def _status(args) -> int:
     if refused:
         print(f"refused          {refused}; they stay here")
     return 0
+
+
+def _cloud_memory_search(settings) -> str:
+    """How the cloud searches the team's `memory`, as `status` says it. The
+    platform fills an embedding column only for an account it gives
+    embeddings to; for any other, `memory` is made without one
+    (tables.ensure_all) and recall there matches words, not meaning. Only
+    the cloud knows which, so this asks it; `status` still answers when the
+    cloud cannot."""
+    from . import tables
+
+    try:
+        client = InfinoClient(settings.api_key, settings.url, timeout=STATUS_TIMEOUT_S, retries=0)
+        if tables.MEMORY not in client.list_tables(settings.team_database):
+            return "not known yet (the first sync makes the table)"
+        names = client.column_names(settings.team_database, tables.MEMORY)
+    except InfinoError as e:
+        if e.status == 404:
+            return "not known yet (the first sync makes the table)"
+        return f"unknown (the platform refused: {e})"
+    except (OSError, HTTPException, JSONDecodeError) as e:
+        return f"unknown (could not reach the platform: {e})"
+    if tables.EMBEDDING_COLUMN in names:
+        return "keyword and vector (the cloud embeds memories)"
+    return ("keyword only: the platform gave this account no embeddings when the table was made, so recall "
+            "matches a memory's words, not its meaning")
 
 
 def _refused(b) -> str:
