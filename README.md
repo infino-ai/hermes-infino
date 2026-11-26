@@ -32,7 +32,7 @@ Each forget writes the ids of the rows it deletes, and nothing else of them, to 
 
 **`traces`** records every model call (model, provider, tokens, time) and every tool call (name, arguments, result, status, time). Secrets are masked the same way Hermes masks them for any memory plugin.
 
-**`skills`** holds the skills your agents share with `infino_publish_skill`. Once you sign in, every profile on the team can use them as read-only `infino:<name>` skills, from its next session. Only the profile's owner publishes: from their own sessions, and on a profile marked personal, from a direct message or a webhook route listed in `INFINO_OWNER_ROUTES`. A scheduled job publishes as the chat it was made in. One made where you weren't the one talking (an API server session, a gateway `/background` run, a Kanban worker, a message from another agent) can't publish. Group chat members, a shared profile's gateway users, hosted rooms and messages from other agents can't. Secrets are masked first. A shared skill's name can have only letters, digits, `-` and `_`, the only names Hermes loads a plugin's skills under. Set `INFINO_TEAM_SKILLS=off` to keep a profile to its own skills.
+**`skills`** holds the skills your agents share with `infino_publish_skill`. Once you sign in, every profile on the team can use them as read-only `infino:<name>` skills, from its next session. They don't show in `hermes skills list`, which lists installed skills; ask the agent for one by its name. Only the profile's owner publishes: from their own sessions, and on a profile marked personal, from a direct message or a webhook route listed in `INFINO_OWNER_ROUTES`. A scheduled job publishes as the chat it was made in. One made where you weren't the one talking (an API server session, a gateway `/background` run, a Kanban worker, a message from another agent) can't publish. Group chat members, a shared profile's gateway users, hosted rooms and messages from other agents can't. Secrets are masked first. A shared skill's name can have only letters, digits, `-` and `_`, the only names Hermes loads a plugin's skills under. Set `INFINO_TEAM_SKILLS=off` to keep a profile to its own skills.
 
 A turn and its traces share a `session_id` and a `turn_id`, so you can join them. Every row has a `row_id`.
 
@@ -106,6 +106,8 @@ A version older than this one does not know `memory_history` or `forgotten`. It 
 You need:
 
 - Hermes, installed with its installer: `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`. The plugin is tested on Hermes 0.22.6, 0.22.7 and 0.23.0.
+- To share memory with a team: an Infino API key and the name of your team's database. Ask your Infino contact, or a teammate who has them. Without a key, everything works on your machine alone.
+
 **1. Install the Infino client.** The client is [SuperGrep](https://github.com/infino-ai/supergrep), published on npm as `@infino-ai/code-context`. It needs Node.js 22.19 or newer. Hermes's installer puts one in `~/.hermes/tools/`.
 
 ```bash
@@ -132,11 +134,17 @@ hermes config set mcp_servers.infino.connect_timeout 120
 
 Hermes starts the tools inside its own environment, with the Node its installer keeps. To use another Node, set `INFINO_NODE` in the same `env` block.
 
-**4. Start `hermes`.** The first start downloads the embedding model in the background (about 90 MB, once). Until it's ready, recall uses keyword search.
+**4. Say who you are.** Teammates read each other's memories, and each memory names its author. The author is the profile's name unless you set one, so on a team where everyone uses the `default` profile, every memory is from "default". Set your name:
+
+```bash
+hermes config set INFINO_AUTHOR Dana
+```
+
+**5. Start `hermes`.** The first start downloads the embedding model in the background (about 90 MB, once). Until it's ready, recall uses keyword search.
 
 ## Signing in
 
-`hermes infino login` creates a free account, on a platform that offers them, or joins your team with a key a teammate gives you.
+`hermes infino login` creates a free account, on a platform that offers them, or joins your team with a key a teammate gives you. The default platform, `https://api.platform.infino.ws`, gives out no free accounts: sign in there with a key.
 
 ```bash
 hermes infino login                                         # create a free account, where the platform offers them
@@ -237,7 +245,7 @@ Hermes tells the plugin which chat a message came from. Any chat that isn't a di
 Hermes runs the Infino client as an MCP server, started with `hermes infino mcp` from the `mcp_servers.infino` entry in `config.yaml`. Its tools depend on whether you're signed in:
 
 - **Not signed in:** `search`, `find`, `sql` and `read`, over the database on your machine.
-- **Signed in:** `search`, `find`, `sql` and `join_keys`, over your team's database in the cloud. The tools read only that database, and none of them writes to it.
+- **Signed in:** `search`, `find`, `sql`, `join_keys` and `describe_columns`, over your team's database in the cloud. The tools read only that database, and none of them writes to it.
 
 The Infino tools search the team database. Your personal data is searched with `infino_personal_search`, a tool of the plugin's own: keyword search over your personal memory, conversations and traces. The agent has it in your own sessions, and on a profile marked personal, but never in a group chat or on a shared profile. Once a session uses it, that session's conversation and traces stay personal. A memory the session saves still follows the memory rule: it's the team's unless it's about one person.
 
