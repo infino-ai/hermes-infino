@@ -83,7 +83,7 @@ Once you sign in:
 - If the cloud is down, nothing is lost. The sync picks up where it stopped.
 - If the cloud refuses a row, it stays on your machine. `hermes infino status` counts such rows, names the file that lists them, and shows how far behind the cloud is in the sync.
 - Forgetting a memory deletes it from the cloud too.
-- The cloud embeds memories itself, so your machine no longer has to embed locally.
+- The cloud embeds memories itself, so your machine no longer has to embed locally. That needs embeddings turned on for your Infino account. Without them, the team's `memory` table is made without its embedding column the first time the plugin syncs, and recall in the cloud matches a memory's words, not its meaning. `hermes infino status` shows which (`memory search`). Ask for embeddings before you first sign in: a table made without the column keeps searching by keyword.
 - Recall reads from the cloud first. If the cloud is slow or can't be reached, recall searches your local machine.
 - Recall shows every source's current memories first. Earlier versions fill only what is left, each marked with when it was superseded and what replaced it, so the agent can tell an old fact from the current one, and history never pushes a current memory out.
 

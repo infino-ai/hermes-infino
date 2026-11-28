@@ -97,6 +97,46 @@ def test_status_shows_why_the_last_sync_stopped(home, platform, tmp_path, capsys
     assert "last sync        stopped: InfinoError: HTTP 500" in capsys.readouterr().out
 
 
+def _status_after_a_sync(tmp_path, platform, capsys) -> str:
+    m, _ = make_manager(tmp_path)
+    m.handle_tool_call("infino_remember", {"content": "deploys go out on Tuesdays"})
+    sign_in(tmp_path, platform)
+    assert run("sync") == 0
+    capsys.readouterr()
+    assert run("status") == 0
+    return capsys.readouterr().out
+
+
+def test_status_says_the_cloud_searches_memory_by_vector(home, platform, tmp_path, capsys):
+    out = _status_after_a_sync(tmp_path, platform, capsys)
+    assert "memory search  keyword and vector (the cloud embeds memories)" in out
+
+
+def test_status_says_when_the_cloud_searches_memory_by_keyword_only(home, platform, tmp_path, capsys):
+    # An account the platform gives no embeddings: `memory` is made without its
+    # embedding column, and status must not claim the cloud embeds.
+    platform.no_embedder = True
+    out = _status_after_a_sync(tmp_path, platform, capsys)
+    assert "memory search  keyword only" in out
+    assert "the cloud embeds" not in out
+
+
+def test_status_before_the_first_sync_does_not_guess_the_cloud_search(home, platform, tmp_path, capsys):
+    sign_in(tmp_path, platform)
+    capsys.readouterr()
+    assert run("status") == 0
+    assert "memory search  not known yet (the first sync makes the table)" in capsys.readouterr().out
+
+
+def test_status_still_answers_when_the_cloud_cannot_be_reached(home, tmp_path, capsys):
+    sign_in(tmp_path, SimpleNamespace(url=DEAD_URL))
+    capsys.readouterr()
+    assert run("status") == 0
+    out = capsys.readouterr().out
+    assert "memory search  unknown (could not reach the platform" in out
+    assert "rows not in" in out
+
+
 def test_sync_without_an_account_says_so(home, capsys):
     assert run("sync") == 0
     assert "Not signed in" in capsys.readouterr().out
